@@ -1,0 +1,38 @@
+# Sistem / runtime
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+Thumbs.db
+
+# Kredensial & env
+.env
+**/.env
+*.env
+!**/.env.example
+
+# Database & backup
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+Database/backups/
+Database/*.db
+
+# Runtime / state
+supervise_pids.json
+*.pid
+stats.jsonl
+hub_state*.json
+
+# Node / Dashboard
+**/node_modules/
+**/dist/
+**/.vite/
+**/*.tsbuildinfo
+**/.claude-replay.*
+
+# Editor
+.vscode/
+.idea/
+*.swp
