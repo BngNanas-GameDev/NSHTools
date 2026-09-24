@@ -1,17 +1,4 @@
 {
-  "date": "2026-09-23",
-  "entries": [
-    {
-      "nota": "ON202609230125",
-      "bahan": "Ac260gr",
-      "total_qty": 4,
-      "jenis": "BESAR",
-      "process_type": null,
-      "operator": "Rahmadi",
-      "machine": "Ricoh",
-      "files": [
-        "Fiandri01_Ac260gr 1s_KartuNama (uk.94x59mm) (1d25 = 100 KECIL) - (Glossy 2s+Potong Bleed 2mm+Box) TOTAL = 4 BESAR (1s) (m688079BL - ON202609230125).pdf"
-      ]
-    }
-  ]
+  "date": "2026-09-24",
+  "entries": []
 }

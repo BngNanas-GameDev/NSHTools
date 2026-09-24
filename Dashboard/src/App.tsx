@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from 'react'
-import { useHub, defaultHubUrl, type HubLogEntry, type WmaEntry, type NotaStatus, type ModuleState, type HubStep, type CommandResult, type SendCommandOpts, type KmaRoute, type KmaPrinter, type KmaRule, type KmaStats } from './hooks/useHub'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { useHub, defaultHubUrl, type HubLogEntry, type WmaEntry, type NotaStatus, type ModuleState, type HubStep, type CommandResult, type SendCommandOpts, type KmaRoute, type KmaPrinter, type KmaRule, type KmaStats, type KmmaTimer, type OutputFile } from './hooks/useHub'
 import { pushToast, onToast, type ToastItem } from './toast'
 
 // ─── Shared live-data helpers ───────────────────────────────────────────────
@@ -78,17 +78,26 @@ function PathBar({ fields, values, onChange, onSave, saving }: {
   onSave: () => void
   saving: boolean
 }) {
+  const [open, setOpen] = useState(true)
   return (
     <div className="card px-5 py-4">
       <SectionHeader
         label="Path Folder"
         action={
-          <button className="btn btn-primary btn-sm" onClick={onSave} disabled={saving}>
-            <Icon name="save" size={13} /> {saving ? 'Menyimpan…' : 'Simpan Path'}
-          </button>
+          <div className="flex items-center gap-1.5">
+            <button className="btn btn-primary btn-sm" onClick={onSave} disabled={saving}>
+              <Icon name="save" size={13} /> {saving ? 'Menyimpan…' : 'Simpan Path'}
+            </button>
+            <button className="btn btn-ghost btn-sm" title={open ? 'Sembunyikan path' : 'Tampilkan path'}
+              onClick={() => setOpen(o => !o)}>
+              <Icon name="chevronDown" size={14}
+                style={{ transform: open ? undefined : 'rotate(-90deg)', transition: 'transform 0.2s' } as any} />
+            </button>
+          </div>
         }
       />
-      <div className="grid gap-2.5 three-col" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+      {open && (
+      <div className="grid gap-2.5 three-col" style={{ gridTemplateColumns: `repeat(${fields.length > 3 ? 2 : fields.length}, 1fr)` }}>
         {fields.map(f => (
           <div key={f.key}>
             <div className="section-label mb-1">{f.label}</div>
@@ -102,6 +111,7 @@ function PathBar({ fields, values, onChange, onSave, saving }: {
           </div>
         ))}
       </div>
+      )}
     </div>
   )
 }
@@ -273,35 +283,6 @@ const ToastContainer = () => {
   )
 }
 
-// ─── Drawer ───────────────────────────────────────────────────────────────────
-
-const Drawer = ({ open, onClose, title, children, width = 480 }: {
-  open: boolean; onClose: () => void; title: string; children: React.ReactNode; width?: number
-}) => {
-  if (!open) return null
-  return (
-    <>
-      <div onClick={onClose} className="fixed inset-0 z-[100]"
-        style={{ background: '#00000070', backdropFilter: 'blur(2px)' }} />
-      <div className="animate-slide-in-right fixed right-0 top-0 bottom-0 flex flex-col overflow-hidden z-[101]"
-        style={{
-          width: `min(${width}px, 100vw)`,
-          background: 'var(--color-panel)',
-          borderLeft: '1px solid var(--color-border)',
-        }}>
-        {/* Header */}
-        <div className="flex items-center justify-between shrink-0 px-6 py-[18px]"
-          style={{ borderBottom: '1px solid var(--color-border)' }}>
-          <span className="font-bold" style={{ fontSize: 'var(--text-lg)' }}>{title}</span>
-          <button className="btn btn-ghost btn-sm" onClick={onClose}><Icon name="x" size={16} /></button>
-        </div>
-        {/* Body */}
-        <div className="flex-1 overflow-y-auto p-6">{children}</div>
-      </div>
-    </>
-  )
-}
-
 // ─── KPI Card ─────────────────────────────────────────────────────────────────
 
 const KpiCard = ({ label, value, unit, delta, status, icon }: {
@@ -394,19 +375,52 @@ const MODULE_HEALTH = [
   { name: 'KMA Router',   modKey: 'kma',  ctl: true,  desc: 'Routing file ke hotfolder printer' },
   { name: 'WMA Polling',  modKey: 'wma',  ctl: true,  desc: 'Agregasi entri nota' },
   { name: 'KMMA Tracker', modKey: 'kmma', ctl: true,  desc: 'Otomasi step KonsepMedia' },
-  { name: 'HUB WebSocket',modKey: null,   ctl: false, desc: 'Kanal real-time dashboard' },
-  { name: 'Log Writer',   modKey: null,   ctl: false, desc: 'Buffer log hub' },
 ]
 
-const PageRingkasan = ({ connected, logs, entries, statuses, modules, live, sendCommand, results }: {
+interface ModulTab { label: string; value: number | string; level: StatusLevel }
+
+const DASH_TABS: ModulTab[] = [
+  { label: 'Antrian Aktif', value: '—', level: 'accent' },
+  { label: 'Selesai', value: '—', level: 'success' },
+  { label: 'Menunggu Aksi', value: '—', level: 'warning' },
+  { label: 'Gagal', value: '—', level: 'danger' },
+]
+
+const ModulePowerButtons = ({ isOn, name, modKey, onCmd }: {
+  isOn: boolean
+  name: string
+  modKey: string | null
+  onCmd: (action: 'module_on' | 'module_off' | 'module_restart', modKey: string | null, label: string) => void
+}) => (
+  <div className="flex items-center gap-0.5 shrink-0">
+    {isOn ? (
+      <button title={`Matikan ${name}`} onClick={() => onCmd('module_off', modKey, name)}
+        className="rounded-md p-1.5 transition-colors hover:bg-white/5 cursor-pointer" style={{ color: 'var(--color-danger)' }}>
+        <Icon name="power" size={13} />
+      </button>
+    ) : (
+      <button title={`Hidupkan ${name}`} onClick={() => onCmd('module_on', modKey, name)}
+        className="rounded-md p-1.5 transition-colors hover:bg-white/5 cursor-pointer" style={{ color: 'var(--color-success)' }}>
+        <Icon name="power" size={13} />
+      </button>
+    )}
+    <button title={`Restart ${name}`} onClick={() => onCmd('module_restart', modKey, name)}
+      className="rounded-md p-1.5 transition-colors hover:bg-white/5 cursor-pointer" style={{ color: 'var(--color-accent)' }}>
+      <Icon name="refresh" size={13} />
+    </button>
+  </div>
+)
+
+const PageRingkasan = ({ connected, logs, entriesAll, statuses, modules, live, sendCommand, results, kmaRoutes }: {
   connected: boolean
   logs: HubLogEntry[]
-  entries: WmaEntry[]
+  entriesAll: WmaEntry[]
   statuses: Record<string, NotaStatus>
   modules: Record<string, ModuleState>
   live: boolean
   sendCommand: (action: string, opts?: SendCommandOpts) => string | null
   results: CommandResult[]
+  kmaRoutes: KmaRoute[]
 }) => {
   const pendingRef = useRef<Set<string>>(new Set())
 
@@ -435,27 +449,32 @@ const PageRingkasan = ({ connected, logs, entries, statuses, modules, live, send
     ts: l.ts, module: l.module, msg: l.msg, level: guessLevel(l.msg), key: `live-${i}-${l.ts}`,
   }))
 
-  const stVals = Object.values(statuses)
-  const okIn = entries.filter(e => statuses[e.nota]?.status === 'ok').length
-  const errIn = entries.filter(e => statuses[e.nota]?.status === 'error').length
-  const kpis = {
-    antrian: entries.length,
-    selesai: okIn,
-    tertunda: entries.length - okIn - errIn,
-    gagal: errIn,
-  }
-  const rate = kpis.antrian > 0 ? Math.round((kpis.selesai / kpis.antrian) * 100) : 0
-  const deltas = {
-    antrian: !connected ? 'hub offline' : `${kpis.tertunda} menunggu diproses`,
-    selesai: kpis.antrian > 0 ? `${rate}% tuntas` : 'belum ada data',
-    tertunda: kpis.tertunda > 0 ? `${kpis.tertunda} perlu tindakan` : 'antrean bersih',
-    gagal: kpis.gagal > 0 ? 'Butuh perhatian' : 'Aman',
+  // 4 tab pipeline WMA/KMMA dari tampilan SEHARIAN (.entries_all + status),
+  // bukan antrean live — agar tracker tetap hidup walau antrean kosong
+  const okAll = entriesAll.filter(e => statuses[e.nota]?.status === 'ok').length
+  const errAll = entriesAll.filter(e => statuses[e.nota]?.status === 'error').length
+  const manAll = entriesAll.filter(e => statuses[e.nota]?.status === 'manual').length
+  const pipeTabs: ModulTab[] = [
+    { label: 'Antrian Aktif', value: entriesAll.length - okAll - errAll - manAll, level: 'accent' },
+    { label: 'Selesai', value: okAll, level: 'success' },
+    { label: 'Menunggu Aksi', value: manAll, level: 'warning' },
+    { label: 'Gagal', value: errAll, level: 'danger' },
+  ]
+  // 4 tab KMA dari daftar file router (PENDING/SELESAI/SKIP/GAGAL)
+  const kmaLv = (kmaRoutes ?? []).map(r => kmaStatus(r.status).label)
+  const kmaTabs: ModulTab[] = [
+    { label: 'Antrian Aktif', value: kmaLv.filter(l => l === 'PENDING').length, level: 'accent' },
+    { label: 'Selesai', value: kmaLv.filter(l => l === 'SELESAI' || l === 'RICOH').length, level: 'success' },
+    { label: 'Menunggu Aksi', value: kmaLv.filter(l => l === 'SKIP').length, level: 'warning' },
+    { label: 'Gagal', value: kmaLv.filter(l => l === 'GAGAL').length, level: 'danger' },
+  ]
+  const tabsFor = (modKey: string | null): ModulTab[] => {
+    if (modKey === 'kma') return kmaTabs
+    if (modKey === 'wma' || modKey === 'kmma') return pipeTabs
+    return DASH_TABS // lite: belum ada backend
   }
 
   const health = MODULE_HEALTH.map(m => {
-    if (m.name === 'HUB WebSocket') {
-      return { ...m, status: (connected ? 'success' : 'danger') as StatusLevel, lastRun: connected ? 'sekarang' : '—', desc: connected ? m.desc : 'Menunggu koneksi hub' }
-    }
     const mod = m.modKey ? modules[m.modKey] : undefined
     if (!mod) return { ...m, status: 'muted' as StatusLevel, lastRun: '—', desc: 'Menunggu koneksi hub' }
     return { ...m, status: (mod.connected ? 'success' : 'danger') as StatusLevel, lastRun: mod.ts || '—' }
@@ -475,79 +494,63 @@ const PageRingkasan = ({ connected, logs, entries, statuses, modules, live, send
         </div>
       )}
 
-      {/* KPI grid: 4 → 2 → 1 cols */}
-      <div className="grid gap-4 kpi-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
-        <KpiCard label="Antrean Aktif"   value={kpis.antrian}  icon="layers"        status="accent"  delta={deltas.antrian} />
-        <KpiCard label="Selesai Hari Ini" value={kpis.selesai} icon="check"         status="success" delta={deltas.selesai} />
-        <KpiCard label="Menunggu Aksi"   value={kpis.tertunda}  icon="clock"         status="warning" delta={deltas.tertunda} />
-        <KpiCard label="Gagal / Error"   value={kpis.gagal}     icon="alertTriangle" status="danger"  delta={deltas.gagal} />
+      {/* Blok Modul: 4 kartu, tiap kartu 4 tab + tombol power */}
+      <div className="card p-5">
+        <SectionHeader label="Modul" action={
+          <span style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>
+            {health.filter(h => h.status === 'success').length}/{health.length} aktif
+          </span>
+        } />
+        <div className="grid gap-3 modul-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
+          {health.map((m, i) => (
+            <div key={i} className="rounded-lg p-3.5 flex flex-col gap-2.5" style={{ background: 'var(--color-bg)' }}>
+              <div className="flex items-center gap-2">
+                <StatusDot status={m.status} live={m.status === 'success'} />
+                <div className="flex-1 min-w-0">
+                  <div className="font-semibold truncate" style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text)' }}>{m.name}</div>
+                  <div className="truncate" style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>{m.lastRun}</div>
+                </div>
+                {m.ctl && (
+                  <ModulePowerButtons isOn={m.status === 'success'} name={m.name} modKey={m.modKey} onCmd={doModuleCommand} />
+                )}
+              </div>
+              <div className="grid grid-cols-2 gap-1.5">
+                {tabsFor(m.modKey).map((t, j) => (
+                  <div key={j} className="rounded-md px-2 py-1.5" style={{ background: 'var(--color-panel)' }}>
+                    <div style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>{t.label}</div>
+                    <div className="font-bold" style={{ fontSize: 'var(--text-md)', color: STATUS_COLOR[t.level] }}>{t.value}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
 
-      {/* Activity feed + module health */}
-      <div className="grid gap-4 two-col" style={{ gridTemplateColumns: '1fr 340px' }}>
-        {/* Activity feed */}
-        <div className="card overflow-hidden flex flex-col">
-          <div className="flex items-center justify-between shrink-0 px-5 py-4"
-            style={{ borderBottom: '1px solid var(--color-border)' }}>
-            <span className="section-label">Aktivitas Live</span>
-            <div className="flex items-center gap-1.5">
-              <StatusDot status={connected ? 'success' : 'danger'} live={connected} shake={!connected} />
-              <span style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>
-                {connected ? 'Live' : 'Offline'}
-              </span>
-            </div>
-          </div>
-          <div ref={feedRef} className="overflow-y-auto" style={{ maxHeight: 360 }}>
-            {feed.map((item, i) => (
-              <div key={i} className={`flex items-start gap-3 px-5 py-2.5 ${i === 0 ? 'animate-slide-in-top' : ''}`}
-                style={{ borderBottom: '1px solid var(--color-border-subtle)' }}>
-                <span className="font-mono shrink-0 pt-0.5"
-                  style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>{item.ts}</span>
-                <div className="rounded-full shrink-0 mt-[7px]"
-                  style={{ width: 4, height: 4, background: STATUS_COLOR[item.level] }} />
-                <span className="shrink-0 pt-0.5" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', minWidth: 72 }}>
-                  {item.module}
-                </span>
-                <span style={{ fontSize: 'var(--text-sm)', color: '#cbd5e1' }}>{item.msg}</span>
-              </div>
-            ))}
+      {/* Aktivitas Live (full width, di bawah blok Modul) */}
+      <div className="card overflow-hidden flex flex-col">
+        <div className="flex items-center justify-between shrink-0 px-5 py-4"
+          style={{ borderBottom: '1px solid var(--color-border)' }}>
+          <span className="section-label">Aktivitas Live</span>
+          <div className="flex items-center gap-1.5">
+            <StatusDot status={connected ? 'success' : 'danger'} live={connected} shake={!connected} />
+            <span style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>
+              {connected ? 'Live' : 'Offline'}
+            </span>
           </div>
         </div>
-
-        {/* Module health */}
-        <div className="card p-5 flex flex-col gap-3">
-          <SectionHeader label="Kesehatan Modul" />
-          {health.map((m, i) => (
-            <div key={i} className="flex items-start gap-2.5 rounded-lg px-2.5 py-2"
-              style={{ background: 'var(--color-bg)' }}>
-              <StatusDot status={m.status} live={m.status === 'success'} />
-              <div className="flex-1 min-w-0">
-                <div className="font-semibold" style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text)' }}>{m.name}</div>
-                <div style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>{m.desc}</div>
-              </div>
-              {m.ctl && (() => {
-                const isOn = m.status === 'success'
-                return (
-                <div className="flex items-center gap-0.5 shrink-0">
-                  {isOn ? (
-                    <button title={`Matikan ${m.name}`} onClick={() => doModuleCommand('module_off', m.modKey, m.name)}
-                      className="rounded-md p-1.5 transition-colors hover:bg-white/5 cursor-pointer" style={{ color: 'var(--color-danger)' }}>
-                      <Icon name="power" size={13} />
-                    </button>
-                  ) : (
-                    <button title={`Hidupkan ${m.name}`} onClick={() => doModuleCommand('module_on', m.modKey, m.name)}
-                      className="rounded-md p-1.5 transition-colors hover:bg-white/5 cursor-pointer" style={{ color: 'var(--color-success)' }}>
-                      <Icon name="power" size={13} />
-                    </button>
-                  )}
-                  <button title={`Restart ${m.name}`} onClick={() => doModuleCommand('module_restart', m.modKey, m.name)}
-                    className="rounded-md p-1.5 transition-colors hover:bg-white/5 cursor-pointer" style={{ color: 'var(--color-accent)' }}>
-                    <Icon name="refresh" size={13} />
-                  </button>
-                </div>
-                )
-              })()}
-              <span className="font-mono shrink-0" style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>{m.lastRun}</span>
+        <div ref={feedRef} className="overflow-y-auto" style={{ maxHeight: 420 }}>
+          {feed.map((item, i) => (
+            <div key={i} className={`flex items-start gap-3 px-5 py-2.5 ${i === 0 ? 'animate-slide-in-top' : ''}`}
+              style={{ borderBottom: '1px solid var(--color-border-subtle)' }}>
+              <span className="font-mono shrink-0 pt-0.5"
+                style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>{item.ts}</span>
+              <div className="rounded-full shrink-0 mt-[7px]"
+                style={{ width: 4, height: 4, background: STATUS_COLOR[item.level] }} />
+              <span className="shrink-0 pt-0.5" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', minWidth: 72 }}>
+                {item.module}
+              </span>
+              <span style={{ fontSize: 'var(--text-sm)', color: '#cbd5e1' }}>{item.msg}</span>
             </div>
           ))}
         </div>
@@ -558,80 +561,162 @@ const PageRingkasan = ({ connected, logs, entries, statuses, modules, live, send
 
 // ─── Page: NSH Lite ───────────────────────────────────────────────────────────
 
-// Modul Lite belum ada backend — antrean kosong sampai ada sumber data
-interface LiteRow {
-  id: string
-  nota: string
-  bahan: string
-  ukuran: string
-  qty: number
-  mesin: string
-  status: StatusLevel
-  statusLabel: string
+function fmtSize(n?: number): string {
+  if (n === undefined || n === null) return ''
+  if (n < 1024) return `${n} B`
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1048576).toFixed(1)} MB`
 }
-const NSH_DATA: LiteRow[] = []
 
-const ImposisiGrid = () => (
-  <div className="grid gap-1 rounded-lg p-3" style={{ gridTemplateColumns: 'repeat(4, 1fr)', background: 'var(--color-bg)' }}>
-    {Array.from({ length: 16 }).map((_, i) => (
-      <div key={i} className="flex items-center justify-center rounded-sm"
-        style={{
-          aspectRatio: '1/1.414',
-          background: i % 5 === 0 ? 'var(--color-accent-ghost)' : 'var(--color-panel)',
-          border: `1px solid ${i % 5 === 0 ? 'var(--color-accent-d)' : 'var(--color-border)'}`,
-        }}>
-        <span className="font-mono" style={{ fontSize: 8, color: 'var(--color-text-dim)' }}>{i + 1}</span>
-      </div>
-    ))}
-  </div>
-)
-
-const PageNshLite = ({ connected, sendCommand, results }: {
+// Watcher file OUTPUT lite: pilih batch -> kirim ke DEVELOP / RICOH (via hub).
+// Dipakai sebagai blok Hasil Impose tab NSH Lite.
+function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil Impose', subtitle }: {
   connected: boolean
   sendCommand: (action: string, opts?: SendCommandOpts) => string | null
   results: CommandResult[]
-}) => {
-  const [filter, setFilter]   = useState('semua')
-  const [search, setSearch]   = useState('')
-  const [sortCol, setSortCol] = useState('id')
-  const [sortDir, setSortDir] = useState<'asc'|'desc'>('desc')
-  const [page, setPage]       = useState(1)
-  const [drawer, setDrawer]   = useState<typeof NSH_DATA[0] | null>(null)
-  const PER = 5
-  const folders = useModuleFolders('lite', connected, sendCommand, results)
+  files: OutputFile[]
+  title?: string
+  subtitle?: string
+}) {
+  const [sel, setSel] = useState<Set<string>>(new Set())
+  const [loading, setLoading] = useState(false)
+  const [listErr, setListErr] = useState('')
+  const [operator, setOperator] = useState(() => {
+    try { return localStorage.getItem('nsh-operator') || '' } catch { return '' }
+  })
+  const pendingRef = useRef<Set<string>>(new Set())
 
-  // Lite menghasilkan: Selesai (=OK), Skip (badge sendiri), Error (=Gagal)
-  const FILTERS = [
-    { key: 'semua',   label: 'Semua',   count: NSH_DATA.length },
-    { key: 'success', label: 'Selesai', count: NSH_DATA.filter(r => r.status === 'success').length },
-    { key: 'violet',  label: 'Skip',    count: NSH_DATA.filter(r => r.status === 'violet').length },
-    { key: 'danger',  label: 'Gagal',   count: NSH_DATA.filter(r => r.status === 'danger').length },
-  ]
+  // files mengalir via push hub (event-driven); command hanya untuk refresh manual
+  const refresh = useCallback((quiet = false) => {
+    if (!connected) return
+    const id = sendCommand('list_output')
+    if (id) { pendingRef.current.add(id); if (!quiet) { setLoading(true); setListErr('') } }
+  }, [connected, sendCommand])
 
-  const filtered = NSH_DATA
-    .filter(r => filter === 'semua' || r.status === filter)
-    .filter(r => !search || r.nota.toLowerCase().includes(search.toLowerCase()) || r.bahan.toLowerCase().includes(search.toLowerCase()))
-    .sort((a, b) => {
-      const dir = sortDir === 'asc' ? 1 : -1
-      if (sortCol === 'qty') return (a.qty - b.qty) * dir
-      const av = String(a[sortCol as keyof typeof a] ?? '')
-      const bv = String(b[sortCol as keyof typeof b] ?? '')
-      return av.localeCompare(bv) * dir
-    })
+  useEffect(() => { refresh() }, [refresh])
 
-  const rows = filtered.slice((page - 1) * PER, page * PER)
-  const totalPages = Math.ceil(filtered.length / PER)
+  useEffect(() => {
+    for (const r of results ?? []) {
+      if (!pendingRef.current.has(r.id)) continue
+      pendingRef.current.delete(r.id)
+      if (r.action === 'list_output') {
+        setLoading(false)
+        if (!(r.ok && r.files)) setListErr(r.msg || 'gagal membaca OUTPUT')
+        else setListErr('')
+      } else if (r.action === 'move_output') {
+        if (r.ok) {
+          pushToast(r.msg, 'success')
+          setSel(new Set())
+          refresh()
+        } else {
+          pushToast(`Gagal pindah: ${r.msg}`, 'danger')
+        }
+      }
+    }
+  }, [results, refresh])
 
-  const handleSort = (col: string) => {
-    if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
-    else { setSortCol(col); setSortDir('asc') }
+  const toggle = (n: string) => setSel(p => { const s = new Set(p); if (s.has(n)) s.delete(n); else s.add(n); return s })
+  const toggleAll = () => setSel(p => (p.size === files.length && files.length > 0) ? new Set() : new Set(files.map(f => f.name)))
+
+  const pickOperator = (op: string) => {
+    setOperator(op)
+    try { localStorage.setItem('nsh-operator', op) } catch { /* abaikan */ }
   }
 
-  const SortArrow = ({ col }: { col: string }) => (
-    <span style={{ marginLeft: 4, opacity: sortCol === col ? 1 : 0.3 }}>
-      {sortCol === col && sortDir === 'desc' ? '↓' : '↑'}
-    </span>
+  const doMove = (dest: 'develop' | 'ricoh') => {
+    if (sel.size === 0) { pushToast('Pilih file dulu', 'warning'); return }
+    if (!operator) { pushToast('Pilih operator dulu (Nanas/Eric/Rahmadi)', 'warning'); return }
+    if (!connected) { pushToast('Hub offline — perintah tidak dikirim', 'warning'); return }
+    const id = sendCommand('move_output', { dest, files: [...sel], operator })
+    if (!id) { pushToast('Hub offline — perintah tidak dikirim', 'warning'); return }
+    pendingRef.current.add(id)
+    pushToast(`Memindah ${sel.size} file ke ${dest.toUpperCase()} (${operator})…`, 'accent')
+  }
+
+  return (
+    <div className="card overflow-hidden">
+      <div className="flex items-center gap-3 px-5 py-3.5" style={{ borderBottom: '1px solid var(--color-border)' }}>
+        <span className="section-label">{title}</span>
+        <span className="rounded-full px-1.5 font-bold" style={{ background: 'var(--color-border)', fontSize: 10 }}>{files.length}</span>
+        {subtitle && (
+          <span style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>{subtitle}</span>
+        )}
+        <button className="btn btn-ghost btn-sm ml-auto" title="Muat ulang" onClick={() => refresh()}>
+          <Icon name="refresh" size={13} />
+        </button>
+      </div>
+      {listErr && (
+        <div className="flex items-center gap-2.5 px-5 py-2.5"
+          style={{ borderBottom: '1px solid var(--color-border)', color: 'var(--color-warning-fg)', fontSize: 'var(--text-xs)' }}>
+          <Icon name="alertTriangle" size={14} />
+          <span className="flex-1">{listErr}</span>
+          <button className="btn btn-secondary btn-sm" onClick={() => refresh()}>Coba lagi</button>
+        </div>
+      )}
+      <div className="flex flex-col gap-3 px-5 py-4">
+      <div style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>
+        {loading ? 'Memuat…' : `${files.length} file PDF di OUTPUT siap kirim`}
+      </div>
+      <div className="flex flex-col gap-1.5 overflow-y-auto" style={{ maxHeight: 380 }}>
+        {files.length > 0 && (
+          <label className="flex items-center gap-2 cursor-pointer"
+            style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>
+            <input type="checkbox" checked={sel.size === files.length && files.length > 0} onChange={toggleAll} />
+            Pilih semua
+          </label>
+        )}
+        {files.map(f => (
+          <label key={f.name} className="flex items-center gap-2 rounded-lg px-2.5 py-2 cursor-pointer"
+            style={{ background: sel.has(f.name) ? 'var(--color-nav-active)' : 'var(--color-bg)' }}>
+            <input type="checkbox" checked={sel.has(f.name)} onChange={() => toggle(f.name)} />
+            <span className="font-mono truncate flex-1" title={f.name} style={{ fontSize: 'var(--text-xs)' }}>{f.name}</span>
+            <span className="font-mono shrink-0" style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>{fmtSize(f.size)}</span>
+          </label>
+        ))}
+        {files.length === 0 && !loading && (
+          <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-dim)' }}>
+            {connected ? 'Output kosong' : 'Hub offline'}
+          </div>
+        )}
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <button className="btn btn-primary btn-sm" disabled={sel.size === 0} onClick={() => doMove('develop')}>
+          <Icon name="send" size={13} /> DEVELOP ({sel.size})
+        </button>
+        <button className="btn btn-secondary btn-sm" disabled={sel.size === 0} onClick={() => doMove('ricoh')}>
+          <Icon name="send" size={13} /> RICOH ({sel.size})
+        </button>
+      </div>
+      <div>
+        <div className="section-label mb-1.5">Operator</div>
+        <div className="flex gap-1.5 flex-wrap">
+          {['Nanas', 'Eric', 'Rahmadi'].map(op => (
+            <button key={op} className="chip"
+              onClick={() => pickOperator(op)}
+              style={{
+                background: operator === op ? 'var(--color-nav-active)' : 'var(--color-panel)',
+                color:      operator === op ? 'var(--color-accent)'     : 'var(--color-text-secondary)',
+                border: `1px solid ${operator === op ? 'var(--color-accent-ghost)' : 'var(--color-border)'}`,
+              }}>{op}</button>
+          ))}
+        </div>
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>ke folder DEVELOP / RICOH (setelan KMA) • tercatat + Selesai di .54</div>
+      </div>
+    </div>
   )
+}
+
+// Modul Lite belum ada backend — antrean kosong sampai ada sumber data
+// (mock Lite dihapus — blok Hasil Impose live dari OUTPUT)
+
+const PageNshLite = ({ connected, sendCommand, results, outputFiles }: {
+  connected: boolean
+  sendCommand: (action: string, opts?: SendCommandOpts) => string | null
+  results: CommandResult[]
+  outputFiles: OutputFile[]
+}) => {
+  const folders = useModuleFolders('lite', connected, sendCommand, results)
 
   return (
     <div className="flex flex-col gap-4">
@@ -643,7 +728,7 @@ const PageNshLite = ({ connected, sendCommand, results }: {
           <span style={{ color: 'var(--color-text-secondary)' }}>— modul Lite belum ada backend</span>
         </div>
       )}
-      {/* Filters + search */}
+      {/* Path folder */}
       <PathBar
         fields={[
           { key: 'input_folder', label: 'INPUT' },
@@ -655,124 +740,9 @@ const PageNshLite = ({ connected, sendCommand, results }: {
         onSave={() => folders.save(folders.values)}
         saving={folders.saving}
       />
-      <div className="flex items-center gap-2 flex-wrap">
-        {FILTERS.map(f => (
-          <button key={f.key} className="chip"
-            onClick={() => { setFilter(f.key); setPage(1) }}
-            style={{
-              background: filter === f.key ? 'var(--color-nav-active)' : 'var(--color-panel)',
-              color:      filter === f.key ? 'var(--color-accent)'     : 'var(--color-text-secondary)',
-              border: `1px solid ${filter === f.key ? 'var(--color-accent-ghost)' : 'var(--color-border)'}`,
-            }}>
-            {f.label}
-            <span className="rounded-full px-1.5 font-bold"
-              style={{ background: 'var(--color-border)', fontSize: 10 }}>{f.count}</span>
-          </button>
-        ))}
-        <div className="relative ml-auto">
-          <Icon name="search" size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2"
-            style={{ color: 'var(--color-text-muted)' } as any} />
-          <input className="input pl-8" placeholder="Cari nota / bahan…" value={search}
-            onChange={e => { setSearch(e.target.value); setPage(1) }} style={{ width: 220 }} />
-        </div>
-      </div>
-
-      {/* Table card */}
-      <div className="card overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="data-table">
-            <thead>
-              <tr>
-                {[['id','File / Nota'],['bahan','Bahan'],['ukuran','Ukuran'],['qty','Qty'],['mesin','Mesin'],['status','Status']].map(([col, lbl]) => (
-                  <th key={col} onClick={() => handleSort(col)}>{lbl}<SortArrow col={col} /></th>
-                ))}
-                <th>Aksi</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row, i) => (
-                <tr key={row.id} className="animate-fade-rise" style={{ animationDelay: `${i * 40}ms` }}>
-                  <td>
-                    <div className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent)' }}>{row.id}</div>
-                    <div style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>{row.nota}</div>
-                  </td>
-                  <td><CategoryBadge label={row.bahan} /></td>
-                  <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)' }}>{row.ukuran}</span></td>
-                  <td><span className="font-mono font-semibold" style={{ fontSize: 'var(--text-sm)' }}>{row.qty.toLocaleString()}</span></td>
-                  <td style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>{row.mesin}</td>
-                  <td><Badge label={row.statusLabel} status={row.status} /></td>
-                  <td>
-                    <div className="flex gap-1.5">
-                      <button className="btn btn-ghost btn-sm" onClick={() => setDrawer(row)}><Icon name="eye" size={14} /></button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-              {rows.length === 0 && (
-                <tr><td colSpan={7}>
-                  <EmptyState icon="layers" title="Tidak ada data" description="Tidak ada entri yang cocok dengan filter saat ini" />
-                </td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-
-        {/* Pagination */}
-        {totalPages > 1 && (
-          <div className="flex items-center justify-between px-4 py-3"
-            style={{ borderTop: '1px solid var(--color-border)' }}>
-            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>
-              {(page - 1) * PER + 1}–{Math.min(page * PER, filtered.length)} dari {filtered.length}
-            </span>
-            <div className="flex gap-1">
-              {Array.from({ length: totalPages }).map((_, i) => (
-                <button key={i} onClick={() => setPage(i + 1)}
-                  className="btn btn-sm rounded-md"
-                  style={{
-                    minWidth: 32,
-                    background: page === i + 1 ? 'var(--color-nav-active)' : 'var(--color-panel)',
-                    color:      page === i + 1 ? 'var(--color-accent)'     : 'var(--color-text-secondary)',
-                    border: `1px solid ${page === i + 1 ? 'var(--color-accent-ghost)' : 'var(--color-border)'}`,
-                  }}>{i + 1}</button>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Detail drawer */}
-      <Drawer open={!!drawer} onClose={() => setDrawer(null)} title={`Detail: ${drawer?.nota}`}>
-        {drawer && (
-          <div className="flex flex-col gap-5">
-            <div className="grid grid-cols-2 gap-3">
-              {[['Nota ID', drawer.nota],['Bahan', drawer.bahan],['Ukuran', drawer.ukuran],['Qty', String(drawer.qty)],['Mesin', drawer.mesin]].map(([k, v]) => (
-                <div key={k} className="rounded-lg px-3.5 py-2.5" style={{ background: 'var(--color-bg)' }}>
-                  <div className="section-label mb-1">{k}</div>
-                  <div className="font-mono font-semibold" style={{ fontSize: 'var(--text-base)' }}>{v}</div>
-                </div>
-              ))}
-              <div className="rounded-lg px-3.5 py-2.5" style={{ background: 'var(--color-bg)' }}>
-                <div className="section-label mb-1">Status</div>
-                <Badge label={drawer.statusLabel} status={drawer.status} />
-              </div>
-            </div>
-
-            <div>
-              <SectionHeader label="Preview PDF" />
-              <div className="flex flex-col items-center justify-center gap-2 rounded-lg"
-                style={{ height: 180, border: '1px dashed var(--color-border)', background: 'var(--color-bg)', color: 'var(--color-text-dim)', fontSize: 'var(--text-xs)' }}>
-                <Icon name="download" size={32} />
-                <span>Preview PDF tidak tersedia</span>
-              </div>
-            </div>
-
-            <div>
-              <SectionHeader label="Grid Imposisi" />
-              <ImposisiGrid />
-            </div>
-          </div>
-        )}
-      </Drawer>
+      {/* Hasil Impose: file OUTPUT siap kirim */}
+      <OutputWatcher connected={connected} sendCommand={sendCommand} results={results} files={outputFiles}
+        title="Hasil Impose" subtitle="File di OUTPUT siap kirim ke DEVELOP / RICOH" />
     </div>
   )
 }
@@ -783,6 +753,7 @@ function kmaStatus(status: string): { label: string; level: StatusLevel } {
   if (status === 'ok' || status === 'done') return { label: 'SELESAI', level: 'success' }
   if (status === 'return') return { label: 'SKIP', level: 'violet' }
   if (status === 'error') return { label: 'GAGAL', level: 'danger' }
+  if (status === 'ricoh') return { label: 'RICOH', level: 'accent' }
   return { label: 'PENDING', level: 'warning' }
 }
 
@@ -809,6 +780,7 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
           { key: 'input_folder', label: 'INPUT' },
           { key: 'return_folder', label: 'RETURN' },
           { key: 'uda_folder', label: 'UDA' },
+          { key: 'ricoh_folder', label: 'RICOH (watcher, kosong=mati)' },
         ]}
         values={folders.values}
         onChange={folders.setValues}
@@ -824,7 +796,7 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
           <table className="data-table">
             <thead>
               <tr>
-                <th>Nama File</th><th>Bahan</th><th>Hotfolder</th><th>Waktu</th><th>Status</th><th>Pesan</th>
+                <th>Nama File</th><th>Bahan</th><th>Hotfolder</th><th>Waktu</th><th>Status</th><th>Mesin</th>
               </tr>
             </thead>
             <tbody>
@@ -840,7 +812,7 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
                   <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>→ {f.dest}</span></td>
                   <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>{f.ts}</span></td>
                   <td><Badge label={f.label} status={f.level} /></td>
-                  <td style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', maxWidth: 260 }}>{f.msg}</td>
+                  <td><span className="font-mono font-semibold" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent-fg)' }}>{f.machine ?? '—'}</span></td>
                 </tr>
               ))}
             </tbody>
@@ -848,29 +820,9 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
         </div>
       </div>
 
-      {/* Rules + printers */}
-      <div className="grid grid-cols-2 gap-4 two-col">
-        {/* Rules */}
-        <div className="card p-5">
-          <SectionHeader label="Aturan Routing" />
-          <div className="flex flex-col gap-1.5">
-            {rules.length === 0 && (
-              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-dim)' }}>Menunggu tabel ROUTE…</div>
-            )}
-            {rules.map((r, i) => (
-              <div key={i} className="flex items-center gap-2.5 rounded-lg px-3 py-2"
-                style={{ background: 'var(--color-bg)' }}>
-                <CategoryBadge label={r.category} />
-                <Icon name="chevronRight" size={14} style={{ color: 'var(--color-text-dim)' } as any} />
-                <span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent)' }}>{r.dest}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Printers */}
-        <div className="card p-5">
-          <SectionHeader label="Status Printer" />
+      {/* Status printer */}
+      <div className="card p-5">
+        <SectionHeader label="Status Printer" />
           <div className="flex flex-col gap-2.5">
             {printers.length === 0 && (
               <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-dim)' }}>Menunggu status printer…</div>
@@ -879,13 +831,15 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
               const ready = p.status === 'siap'
               const unknown = p.status !== 'siap' && p.status !== 'mati'
               const lvl: StatusLevel = ready ? 'success' : unknown ? 'muted' : 'danger'
+              const isRicoh = p.ip === 'RICOH'
+              const mCount = (st: string) => routes.filter(r => (r.machine ?? '') === (p.machine ?? '') && r.status === st).length
               return (
               <div key={i} className={`card card-accent-${lvl} px-4 py-3.5`}>
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
                     <Icon name="printer" size={16} style={{ color: 'var(--color-text-secondary)' } as any} />
                     <span className="font-bold font-mono" style={{ fontSize: 'var(--text-base)' }}>{p.ip}</span>
-                    <span className="section-label">{p.role}</span>
+                    <span className="section-label">{isRicoh ? 'WATCHER' : (p.machine || '')}</span>
                     {p.active && (
                       <span className="rounded font-bold"
                         style={{ fontSize: 10, background: 'var(--color-success-ghost)', color: 'var(--color-success-fg)', padding: '2px 6px' }}>
@@ -893,39 +847,46 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
                       </span>
                     )}
                   </div>
-                  <Badge label={ready ? 'SIAP' : unknown ? 'CEK' : 'MATI'} status={lvl} />
+                  <Badge label={ready ? 'SIAP' : unknown ? 'OFF' : 'MATI'} status={lvl} />
                 </div>
                 <div className="flex gap-4">
-                  {[['OK', stats.ok ?? 0, 'var(--color-success)'], ['RET', stats.ret ?? 0, 'var(--color-warning)'], ['DONE', stats.done ?? 0, 'var(--color-accent)']].map(([k, v, c]) => (
+                  {isRicoh ? (
+                    <div>
+                      <div className="section-label mb-0.5">FILE</div>
+                      <span className="font-mono font-bold" style={{ fontSize: 'var(--text-num-sm)', color: 'var(--color-accent)' }}>
+                        {mCount('ricoh').toLocaleString()}
+                      </span>
+                    </div>
+                  ) : (
+                    [['OK', mCount('ok') + mCount('done'), 'var(--color-success)'], ['RET', mCount('return'), 'var(--color-warning)'], ['ERR', mCount('error'), 'var(--color-danger)']].map(([k, v, c]) => (
                     <div key={k as string}>
                       <div className="section-label mb-0.5">{k}</div>
                       <span className="font-mono font-bold" style={{ fontSize: 'var(--text-num-sm)', color: c as string }}>
                         {Number(v).toLocaleString()}
                       </span>
                     </div>
-                  ))}
+                    ))
+                  )}
                 </div>
               </div>
               )
             })}
           </div>
         </div>
-      </div>
     </div>
   )
 }
 
 // ─── Page: WMA ────────────────────────────────────────────────────────────────
 
-const PageWma = ({ entries, statuses, live, sendCommand, results }: {
-  entries: WmaEntry[]
+const PageWma = ({ entriesAll = [], statuses = {}, verified = [], live, sendCommand, results }: {
+  entriesAll: WmaEntry[]
   statuses: Record<string, NotaStatus>
+  verified: string[]
   live: boolean
   sendCommand: (action: string, opts?: SendCommandOpts) => string | null
   results: CommandResult[]
 }) => {
-  const [selected, setSelected] = useState<Set<string>>(new Set())
-  const toggle = (id: string) => setSelected(p => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n })
   const pendingRef = useRef<Set<string>>(new Set())
 
   useEffect(() => {
@@ -933,97 +894,112 @@ const PageWma = ({ entries, statuses, live, sendCommand, results }: {
       if (!pendingRef.current.has(r.id)) continue
       pendingRef.current.delete(r.id)
       pushToast(r.ok ? `OK: ${r.action} — ${r.msg}` : `Gagal: ${r.action} — ${r.msg}`, r.ok ? 'success' : 'danger')
-      if (r.ok) setSelected(new Set())
     }
   }, [results])
 
-  const cards = entries.map(e => {
-    const st = statuses[e.nota]?.status
-    return {
-      id: `${e.nota}||${e.bahan ?? ''}`,
-      nota: e.nota,
-      bahan: e.bahan ?? '-',
-      kategori: (e.process_type || 'digital').toUpperCase(),
-      status: (st === 'ok' ? 'success' : st === 'error' ? 'danger' : 'warning') as StatusLevel,
-      statusLabel: st === 'ok' ? 'SELESAI' : st === 'error' ? 'GAGAL' : 'PENDING',
-    }
-  })
-
-  const doSend = () => {
-    if (selected.size === 0) return
+  const doVerify = (nota: string) => {
     if (!live) {
       pushToast('Hub offline — perintah tidak dikirim', 'warning')
       return
     }
-    const id = sendCommand('process_all')
+    const id = sendCommand('verify', { nota })
     if (!id) {
       pushToast('Hub offline — perintah tidak dikirim', 'warning')
       return
     }
     pendingRef.current.add(id)
-    pushToast(`Memproses ${selected.size} entri di KMMA…`, 'accent')
+  }
+
+  const isVerified = (nota: string) => verified.includes(nota)
+
+  // Kiri: belum diproses KMMA (Antrian) | Tengah: sudah diproses/gagal/manual/retry, belum verified (Menunggu Aksi) | Kanan: verified (Selesai)
+  const left = entriesAll.filter(e => !statuses[e.nota] && !isVerified(e.nota))
+  const mid = entriesAll.filter(e => {
+    const s = statuses[e.nota]?.status
+    return (s === 'ok' || s === 'error' || s === 'manual' || s === 'retry') && !isVerified(e.nota)
+  })
+  const right = entriesAll.filter(e => isVerified(e.nota))
+
+  const wmaReason = (nota: string): string | null => {
+    const m = statuses[nota]?.msg ?? ''
+    if (/tidak ada di km/i.test(m)) return 'Nota tidak ada di KM'
+    if (/bahan tidak sesuai/i.test(m)) return 'Bahan Tidak Sesuai'
+    if (/jumlah tidak sesuai/i.test(m)) return 'QTY tidak sesuai'
+    if (/tunggu 3 mnt|retry/i.test(m)) return 'Retry otomatis 3 mnt'
+    return null
+  }
+
+  const row = (e: WmaEntry, showVerify: boolean) => {
+    const reason = wmaReason(e.nota)
+    const tag = [e.sides ? e.sides.toUpperCase() : '', e.laminating ? e.laminating.toUpperCase() : ''].filter(Boolean).join('/')
+    return (
+    <div key={`${e.nota}||${e.bahan ?? ''}||${e.sides ?? ''}||${e.laminating ?? ''}`} className="rounded-lg px-3.5 py-2.5" style={{ background: 'var(--color-bg)' }}>
+      <div className="flex items-center gap-2 mb-1">
+        <span className="font-mono font-semibold truncate" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent)' }}>{e.nota}</span>
+        <span className="font-mono ml-auto shrink-0" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text)' }}>×{e.total_qty ?? 0}</span>
+      </div>
+      <div className="truncate mb-1" title={e.customer || e.bahan}
+        style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>
+        {e.customer || '—'}
+      </div>
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <CategoryBadge label={e.bahan ?? '-'} />
+        {tag && (
+          <span className="rounded font-mono font-semibold"
+            style={{ fontSize: 10, background: 'var(--color-panel)', color: 'var(--color-accent-fg)', padding: '2px 6px', border: '1px solid var(--color-border)' }}>
+            {tag}
+          </span>
+        )}
+        <span style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>{e.operator || '—'}</span>
+        {(reason || showVerify) && (
+          <div className="ml-auto flex items-center gap-1.5">
+            {reason && (
+              <div style={{ fontSize: 10, color: 'var(--color-warning-fg)' }}>{reason}</div>
+            )}
+            {showVerify && (
+              <button className="btn btn-primary btn-sm" onClick={() => doVerify(e.nota)}>
+                <Icon name="check" size={12} /> Verified
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+    )
+  }
+
+  const rack = (title: string, sub: string, level: StatusLevel, list: WmaEntry[], verifyBtn: boolean, empty: string) => (
+    <div className="card p-4 flex flex-col gap-2.5">
+      <div className="flex items-center gap-2">
+        <StatusDot status={level} live={live && level !== 'muted'} />
+        <span className="section-label">{title}</span>
+        <span className="rounded-full px-1.5 font-bold" style={{ background: 'var(--color-border)', fontSize: 10 }}>{list.length}</span>
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>{sub}</div>
+      <div className="flex flex-col gap-2 overflow-y-auto" style={{ maxHeight: 460 }}>
+        {list.length === 0 && (
+          <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-dim)' }}>{empty}</div>
+        )}
+        {list.map(e => row(e, verifyBtn))}
+      </div>
+    </div>
+  )
+
+  if (!live && entriesAll.length === 0) {
+    return (
+      <EmptyState
+        icon="layers"
+        title="Hub Offline"
+        description="Hubungkan ke hub untuk data WMA live"
+      />
+    )
   }
 
   return (
-    <div className="flex flex-col gap-4">
-      <div className="grid gap-3 three-col" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
-        {cards.length === 0 && (
-          <div className="rounded-xl px-5 py-8 text-center" style={{ background: 'var(--color-panel)', border: '1px solid var(--color-border)', gridColumn: '1 / -1', fontSize: 'var(--text-sm)', color: 'var(--color-text-muted)' }}>
-            {live ? 'Belum ada entri' : 'Hub offline — hubungkan untuk data live'}
-          </div>
-        )}
-        {cards.map((e, i) => {
-          const sel = selected.has(e.id)
-          return (
-            <div key={e.id} onClick={() => toggle(e.id)}
-              className="card px-[18px] py-4 cursor-pointer transition-all duration-150"
-              style={{
-                border: `1px solid ${sel ? 'var(--color-accent)' : 'var(--color-border)'}`,
-                background: sel ? 'var(--color-nav-active)' : 'var(--color-panel)',
-                animationDelay: `${i * 50}ms`,
-              }}>
-              <div className="flex items-start justify-between mb-2.5">
-                <div className="flex flex-col gap-1.5">
-                  <div className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent)' }}>{e.nota}</div>
-                  <CategoryBadge label={e.bahan} />
-                </div>
-                <div className="flex flex-col items-end gap-1.5">
-                  <Badge label={e.statusLabel} status={e.status} />
-                  <span className="rounded font-semibold"
-                    style={{ fontSize: 10, background: 'var(--color-panel)', color: 'var(--color-text-secondary)', padding: '2px 6px', border: '1px solid var(--color-border)' }}>
-                    {e.kategori}
-                  </span>
-                </div>
-              </div>
-              {sel && (
-                <div className="flex items-center gap-1.5 font-semibold"
-                  style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent)' }}>
-                  <Icon name="check" size={14} /> Dipilih
-                </div>
-              )}
-            </div>
-          )
-        })}
-      </div>
-
-      {/* Bulk bar */}
-      {selected.size > 0 && (
-        <div className="animate-slide-in-top fixed bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-4 rounded-xl px-5 py-3 z-50"
-          style={{
-            background: 'var(--color-panel)',
-            border: '1px solid var(--color-accent-ghost)',
-            boxShadow: 'var(--shadow-panel)',
-          }}>
-          <span style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>
-            <strong style={{ color: 'var(--color-text)' }}>{selected.size}</strong> entri dipilih
-          </span>
-          <button className="btn btn-primary btn-md"
-            onClick={doSend}>
-            <Icon name="send" size={14} /> Kirim ke KMMA
-          </button>
-          <button className="btn btn-ghost btn-sm" onClick={() => setSelected(new Set())}><Icon name="x" size={14} /></button>
-        </div>
-      )}
+    <div className="grid gap-4 wma-racks" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+      {rack('Antrian', 'Belum diproses KMMA', 'accent', left, false, live ? 'Antrean kosong' : 'Menunggu hub…')}
+      {rack('Menunggu Aksi', 'Sudah diproses — perlu verifikasi', 'warning', mid, true, 'Tidak ada yang menunggu')}
+      {rack('Selesai', 'Sudah diverifikasi', 'success', right, false, 'Belum ada yang selesai')}
     </div>
   )
 }
@@ -1094,34 +1070,58 @@ function kmmaStepsHeuristic(e: WmaEntry, st?: NotaStatus): Step[] {
   return steps
 }
 
-const PageKmma = ({ entries, statuses, details, live, sendCommand, results }: {
+const PageKmma = ({ entries, statuses, details, live, sendCommand, results, timer }: {
   entries: WmaEntry[]
   statuses: Record<string, NotaStatus>
   details: Record<string, HubStep[]>
   live: boolean
   sendCommand: (action: string, opts?: SendCommandOpts) => string | null
   results: CommandResult[]
+  timer: KmmaTimer | null
 }) => {
   const notas = [...new Set(entries.map(e => e.nota))]
-  const [nota, setNota]           = useState<string | null>(null)
+  const [openNota, setOpenNota]   = useState<string | null>(null)
   const [overrides, setOverrides] = useState<Record<string, number>>({})
   const pendingRef = useRef<Set<string>>(new Set())
 
-  const cur = (nota && notas.includes(nota) ? nota : notas[0]) ?? null
-  const entry = cur ? entries.find(e => e.nota === cur) : undefined
-  const st = cur ? statuses[cur] : undefined
-  const real = cur ? details[cur] : undefined
+  // Timer cycle: detik berjalan lokal, sinkron ulang tiap laporan KMMA (5 dtk)
+  const [nowTs, setNowTs] = useState(() => Date.now())
+  const recvRef = useRef<number>(0)
+  const baseRef = useRef<number>(0)
+  useEffect(() => {
+    if (timer) { recvRef.current = Date.now(); baseRef.current = timer.next_in }
+  }, [timer])
+  useEffect(() => {
+    const t = setInterval(() => setNowTs(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [])
+  const elapsed = Math.floor((nowTs - recvRef.current) / 1000)
+  const remain = timer ? Math.max(0, baseRef.current - elapsed) : null
+  const timerStale = !live || !timer || elapsed > 15
+  const mmss = remain === null ? '—'
+    : `${String(Math.floor(remain / 60)).padStart(2, '0')}:${String(remain % 60).padStart(2, '0')}`
+  const pct = timer && timer.interval > 0 && remain !== null
+    ? Math.min(100, Math.max(0, (remain / timer.interval) * 100)) : 0
 
-  const data = entry
-    ? {
-        bahan: entry.bahan ?? '—',
-        qty: entry.total_qty ?? 0,
-        operator: entry.operator || '—',
-        status: (st?.status === 'ok' ? 'success' : st?.status === 'error' ? 'danger' : 'warning') as StatusLevel,
-        statusLabel: st?.status === 'ok' ? 'SELESAI' : st?.status === 'error' ? 'ERROR' : 'PENDING',
-        steps: real?.length ? real.map(kmmaStepFromHub) : kmmaStepsHeuristic(entry, st),
-      }
-    : null
+  const open = openNota && notas.includes(openNota) ? openNota : (notas[0] ?? null)
+
+  const racks = notas.map(n => {
+    const rows = entries.filter(e => e.nota === n)
+    const first = rows[0]
+    const st = statuses[n]
+    const real = details[n]
+    const stName = st?.status
+    return {
+      nota: n,
+      customer: rows.map(r => r.customer).find(Boolean) || '—',
+      bahan: [...new Set(rows.map(r => r.bahan ?? '-'))].join(', '),
+      qty: rows.reduce((a, r) => a + (r.total_qty ?? 0), 0),
+      operator: rows.map(r => r.operator).find(Boolean) || '—',
+      status: (stName === 'ok' ? 'success' : stName === 'manual' ? 'warning' : stName === 'error' ? 'danger' : 'accent') as StatusLevel,
+      statusLabel: stName === 'ok' ? 'SELESAI' : stName === 'manual' ? 'MANUAL' : stName === 'error' ? 'ERROR' : 'ANTRI',
+      steps: real?.length ? real.map(kmmaStepFromHub) : kmmaStepsHeuristic(first, st),
+    }
+  })
 
   useEffect(() => {
     for (const r of results ?? []) {
@@ -1131,69 +1131,112 @@ const PageKmma = ({ entries, statuses, details, live, sendCommand, results }: {
     }
   }, [results])
 
-  const doCommand = (action: 'retry' | 'skip', qty?: string) => {
-    if (!live || !cur) {
+  const doCommand = (nota: string, action: 'retry' | 'skip', qty?: string) => {
+    if (!live || !nota) {
       pushToast('Hub offline — perintah tidak dikirim', 'warning')
       return
     }
     const id = action === 'skip'
-      ? sendCommand('skip', { nota: cur, reason: 'manual dari dashboard' })
-      : sendCommand('retry', { nota: cur, qty })
+      ? sendCommand('skip', { nota, reason: 'manual dari dashboard' })
+      : sendCommand('retry', { nota, qty })
     if (!id) {
       pushToast('Hub offline — perintah tidak dikirim', 'warning')
       return
     }
     pendingRef.current.add(id)
-    pushToast(`Perintah dikirim: ${action} ${cur}${qty ? ` (qty ${qty})` : ''}`, 'accent')
+    pushToast(`Perintah dikirim: ${action} ${nota}${qty ? ` (qty ${qty})` : ''}`, 'accent')
   }
 
-  if (!live || !data) {
+  if (!live) {
     return (
       <EmptyState
         icon="package"
-        title={live ? 'Belum ada nota' : 'Hub Offline'}
-        description={live
-          ? 'Belum ada entri nota dari WMA'
-          : 'Hubungkan ke hub untuk data KMMA live'}
+        title="Hub Offline"
+        description="Hubungkan ke hub untuk data KMMA live"
+      />
+    )
+  }
+  if (racks.length === 0) {
+    return (
+      <EmptyState
+        icon="package"
+        title="Belum ada nota"
+        description="Belum ada entri nota dari WMA"
       />
     )
   }
 
   return (
-    <div className="flex flex-col gap-4">
-      {/* Nota picker */}
-      <div className="flex gap-2 flex-wrap">
-        {notas.map(n => (
-          <button key={n} className="chip font-mono"
-            onClick={() => setNota(n)}
-            style={{
-              background: cur === n ? 'var(--color-nav-active)' : 'var(--color-panel)',
-              color:      cur === n ? 'var(--color-accent)'     : 'var(--color-text-secondary)',
-              border: `1px solid ${cur === n ? 'var(--color-accent-ghost)' : 'var(--color-border)'}`,
-            }}>{n}</button>
-        ))}
+    <div className="flex flex-col gap-2.5">
+      {/* Bar timer cycle 3 menit */}
+      <div className="card px-5 py-3.5 flex items-center gap-4 flex-wrap">
+        <StatusDot status={live && !timerStale ? 'success' : 'danger'} live={live && !timerStale} shake={!live} />
+        <div>
+          <div className="section-label mb-0.5">Timer Cycle KMMA</div>
+          <div className="font-mono font-bold" style={{ fontSize: 'var(--text-xl)', color: 'var(--color-text)' }}>{timerStale ? '—' : mmss}</div>
+        </div>
+        <div className="flex-1 min-w-[120px] h-1 rounded-full" style={{ background: 'var(--color-border)' }}>
+          <div className="h-1 rounded-full" style={{ width: `${pct}%`, background: 'var(--color-accent)', transition: 'width 1s linear' }} />
+        </div>
+        <span style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>
+          {timerStale ? 'menunggu KMMA…' : 'proses ulang tiap 3 menit'}
+        </span>
       </div>
+      {racks.map(r => {
+        const isOpen = open === r.nota
+        return (
+        <div key={r.nota} className="card overflow-hidden">
+          {/* Rak nota: Pelanggan | NOTA | Bahan | qty | Operator */}
+          <button onClick={() => setOpenNota(isOpen ? null : r.nota)}
+            className="w-full text-left cursor-pointer transition-colors hover:bg-white/[0.02]">
+            <div className="flex items-center gap-x-5 gap-y-2 flex-wrap px-5 py-3.5">
+              <div className="min-w-0" style={{ flex: '2 1 180px' }}>
+                <div className="section-label mb-0.5">Pelanggan</div>
+                <div className="font-bold truncate" title={r.customer}
+                  style={{ fontSize: 'var(--text-base)', color: 'var(--color-text)' }}>{r.customer}</div>
+              </div>
+              <div className="min-w-0" style={{ flex: '1 1 150px' }}>
+                <div className="section-label mb-0.5">Nota</div>
+                <div className="font-mono font-semibold truncate"
+                  style={{ fontSize: 'var(--text-sm)', color: 'var(--color-accent)' }}>{r.nota}</div>
+              </div>
+              <div className="min-w-0" style={{ flex: '1 1 150px' }}>
+                <div className="section-label mb-0.5">Bahan</div>
+                <div className="truncate" title={r.bahan}
+                  style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>{r.bahan}</div>
+              </div>
+              <div>
+                <div className="section-label mb-0.5">Qty</div>
+                <div className="font-mono font-semibold" style={{ fontSize: 'var(--text-sm)' }}>{r.qty.toLocaleString()}</div>
+              </div>
+              <div>
+                <div className="section-label mb-0.5">Operator</div>
+                <div style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>{r.operator}</div>
+              </div>
+              <div className="ml-auto flex items-center gap-2.5 shrink-0">
+                <Badge label={r.statusLabel} status={r.status} />
+                <Icon name="chevronDown" size={16}
+                  style={{ color: 'var(--color-text-muted)', transform: isOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.2s' } as any} />
+              </div>
+            </div>
+          </button>
 
-      {/* Header strip */}
-      <div className="card px-5 py-4 flex items-center gap-6 flex-wrap">
-        {[['Nota', cur], ['Bahan', data.bahan], ['Qty', data.qty.toLocaleString()], ['Operator', data.operator]].map(([k, v]) => (
-          <div key={k as string}>
-            <div className="section-label mb-0.5">{k}</div>
-            <div className="font-mono font-semibold" style={{ fontSize: 'var(--text-base)', color: 'var(--color-text)' }}>{String(v)}</div>
-          </div>
-        ))}
-        <div className="ml-auto"><Badge label={data.statusLabel} status={data.status} /></div>
-      </div>
-
-      {/* Timeline */}
-      <div className="card px-6 py-5">
-        <SectionHeader label="Alur Produksi" />
-        <div className="flex flex-col">
-          {data.steps.map((step, i) => {
-            const isLast = i === data.steps.length - 1
-            const pct = step.status === 'done' ? '100%' : step.status === 'active' ? '50%' : '0%'
-            const key = `${cur}-${i}`
-            const qty = overrides[key] ?? step.qty
+          {/* Dropdown: Alur Produksi */}
+          {isOpen && (
+          <div className="px-6 py-5" style={{ borderTop: '1px solid var(--color-border)' }}>
+            <SectionHeader label="Alur Produksi" action={
+              r.statusLabel === 'MANUAL' ? (
+                <button className="btn btn-secondary btn-sm" onClick={() => doCommand(r.nota, 'skip')}>
+                  <Icon name="skip" size={13} /> Lewati Permanen
+                </button>
+              ) : undefined
+            } />
+            <div className="flex flex-col">
+              {r.steps.map((step, i) => {
+                const isLast = i === r.steps.length - 1
+                const pct = step.status === 'done' ? '100%' : step.status === 'active' ? '50%' : '0%'
+                const key = `${r.nota}-${i}`
+                const qty = overrides[key] ?? step.qty
 
             return (
               <div key={i} className="flex gap-4">
@@ -1251,10 +1294,10 @@ const PageKmma = ({ entries, statuses, details, live, sendCommand, results }: {
                           <input className="input font-mono" type="number" value={qty}
                             onChange={e => setOverrides(p => ({ ...p, [key]: +e.target.value }))}
                             style={{ width: 80, padding: '4px 8px', fontSize: 'var(--text-xs)' }} />
-                          <button className="btn btn-ghost btn-sm"
-                            onClick={() => doCommand('retry', String(qty))}>
-                            <Icon name="save" size={13} />
-                          </button>
+                            <button className="btn btn-ghost btn-sm"
+                              onClick={() => doCommand(r.nota, 'retry', String(qty))}>
+                              <Icon name="save" size={13} />
+                            </button>
                         </div>
                       ) : (
                         <span className="font-mono font-semibold" style={{ fontSize: 'var(--text-sm)' }}>
@@ -1267,11 +1310,11 @@ const PageKmma = ({ entries, statuses, details, live, sendCommand, results }: {
                   {(step.status === 'active' || step.status === 'error') && (
                     <div className="flex gap-2 mt-2.5">
                       <button className="btn btn-success btn-sm"
-                        onClick={() => doCommand('retry')}>
+                        onClick={() => doCommand(r.nota, 'retry')}>
                         <Icon name="refresh" size={13} /> Simpan Ulang
                       </button>
                       <button className="btn btn-secondary btn-sm"
-                        onClick={() => doCommand('skip')}>
+                        onClick={() => doCommand(r.nota, 'skip')}>
                         <Icon name="skip" size={13} /> Lewati Permanen
                       </button>
                     </div>
@@ -1280,8 +1323,12 @@ const PageKmma = ({ entries, statuses, details, live, sendCommand, results }: {
               </div>
             )
           })}
+          </div>
+          </div>
+          )}
         </div>
-      </div>
+        )
+      })}
     </div>
   )
 }
@@ -1430,7 +1477,7 @@ const PagePengaturan = ({ hubUrl, logCap, onApply }: {
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
 
 const NAV: { id: Page; icon: string; label: string }[] = [
-  { id: 'ringkasan',  icon: 'dashboard', label: 'Ringkasan'   },
+  { id: 'ringkasan',  icon: 'dashboard', label: 'HOME'        },
   { id: 'nshlite',   icon: 'layers',    label: 'NSH Lite'    },
   { id: 'kma',       icon: 'router',    label: 'KMA'         },
   { id: 'wma',       icon: 'workflow',  label: 'WMA'         },
@@ -1440,7 +1487,7 @@ const NAV: { id: Page; icon: string; label: string }[] = [
 ]
 
 const PAGE_TITLE: Record<Page, string> = {
-  ringkasan: 'Ringkasan', nshlite: 'NSH Lite', kma: 'KMA Router',
+  ringkasan: 'HOME', nshlite: 'NSH Lite', kma: 'KMA Router',
   wma: 'WMA', kmma: 'KMMA', log: 'Log Monitor', pengaturan: 'Pengaturan',
 }
 
@@ -1472,12 +1519,35 @@ export default function App() {
     try { return parseInt(localStorage.getItem('nsh-log-cap') || '200', 10) || 200 }
     catch { return 200 }
   })
-  const [search,    setSearch]    = useState('')
   const [mobileNav, setMobileNav] = useState(false)
 
   const hub = useHub(hubUrl, logCap)
   const connStatus: ConnStatus =
     hub.conn === 'open' ? 'connected' : hub.conn === 'connecting' ? 'connecting' : 'disconnected'
+
+  const hubPendingRef = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    for (const r of hub.results ?? []) {
+      if (!hubPendingRef.current.has(r.id)) continue
+      hubPendingRef.current.delete(r.id)
+      pushToast(r.ok ? `OK: ${r.action} — ${r.msg}` : `Gagal: ${r.action} — ${r.msg}`, r.ok ? 'success' : 'danger')
+    }
+  }, [hub.results])
+
+  const doHubRestart = () => {
+    if (!connected) {
+      pushToast('Hub offline — tidak bisa restart', 'warning')
+      return
+    }
+    if (!window.confirm('Restart HUB? Semua koneksi putus ±3 detik lalu tersambung otomatis. Modul supervisi ikut nyala lagi.')) return
+    const id = hub.sendCommand('hub_restart')
+    if (!id) {
+      pushToast('Hub offline — perintah tidak dikirim', 'warning')
+      return
+    }
+    hubPendingRef.current.add(id)
+    pushToast('Perintah restart HUB dikirim…', 'accent')
+  }
 
   const applySettings = (url: string, cap: number) => {
     setHubUrl(url)
@@ -1503,25 +1573,35 @@ export default function App() {
       }}>
       {/* Logo */}
       <div className="flex items-center gap-2.5 shrink-0 px-3.5 py-5"
-        style={{ borderBottom: '1px solid var(--color-border-subtle)' }}>
-        <div className="flex items-center justify-center rounded-[8px] shrink-0"
-          style={{ width: 28, height: 28, background: 'linear-gradient(135deg, var(--color-accent), var(--color-accent-d))' }}>
-          <Icon name="printer" size={15} style={{ color: 'var(--color-bg)', strokeWidth: 2.5 } as any} />
-        </div>
-        {(!collapsed || mobile) && (
-          <div className="overflow-hidden">
-            <div className="font-extrabold leading-tight tracking-tight whitespace-nowrap"
-              style={{ fontSize: 'var(--text-md)', color: 'var(--color-text)', letterSpacing: '-0.02em' }}>
-              NSH HUB
-            </div>
-            <div className="section-label whitespace-nowrap">Print Monitor</div>
-          </div>
-        )}
-        {!mobile && (
-          <button className="btn btn-ghost btn-sm ml-auto p-1 shrink-0"
-            onClick={() => setCollapsed(c => !c)}>
-            <Icon name={collapsed ? 'chevronRight' : 'chevronLeft'} size={14} />
+        style={{
+          borderBottom: '1px solid var(--color-border-subtle)',
+          ...(collapsed && !mobile ? { justifyContent: 'center', paddingLeft: 0, paddingRight: 0 } : {}),
+        }}>
+        {(collapsed && !mobile) ? (
+          <button className="btn btn-ghost btn-sm" title="Buka menu"
+            onClick={() => setCollapsed(false)}>
+            <Icon name="menu" size={18} />
           </button>
+        ) : (
+          <>
+            <div className="flex items-center justify-center rounded-[8px] shrink-0"
+              style={{ width: 28, height: 28, background: 'linear-gradient(135deg, var(--color-accent), var(--color-accent-d))' }}>
+              <Icon name="printer" size={15} style={{ color: 'var(--color-bg)', strokeWidth: 2.5 } as any} />
+            </div>
+            <div className="overflow-hidden">
+              <div className="font-extrabold leading-tight tracking-tight whitespace-nowrap"
+                style={{ fontSize: 'var(--text-md)', color: 'var(--color-text)', letterSpacing: '-0.02em' }}>
+                NSH HUB
+              </div>
+              <div className="section-label whitespace-nowrap">Print Monitor</div>
+            </div>
+            {!mobile && (
+              <button className="btn btn-ghost btn-sm ml-auto p-1 shrink-0" title="Sembunyikan menu"
+                onClick={() => setCollapsed(true)}>
+                <Icon name="chevronLeft" size={14} />
+              </button>
+            )}
+          </>
         )}
       </div>
 
@@ -1596,17 +1676,22 @@ export default function App() {
             {PAGE_TITLE[page]}
           </h1>
 
-          {/* Search */}
-          <div className="relative flex-1 max-w-sm ml-2">
-            <Icon name="search" size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2"
-              style={{ color: 'var(--color-text-muted)' } as any} />
-            <input className="input pl-8"
-              placeholder="Cari nota, file, bahan…"
-              value={search} onChange={e => setSearch(e.target.value)}
-              style={{ height: 36, fontSize: 'var(--text-sm)' }} />
-          </div>
-
           <div className="flex items-center gap-4 ml-auto">
+            {/* HUB WebSocket + Log Writer (pindah dari Kesehatan Modul) */}
+            <div className="hidden md:flex items-center gap-3">
+              <span className="flex items-center gap-1.5" title="Kanal real-time dashboard">
+                <StatusDot status={connected ? 'success' : 'danger'} live={connected} shake={!connected} />
+                <span style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>HUB WebSocket</span>
+              </span>
+              <button className="btn btn-ghost btn-sm" title="Restart HUB" onClick={doHubRestart}
+                style={{ color: 'var(--color-warning-fg)' }}>
+                <Icon name="refresh" size={13} /> Restart HUB
+              </button>
+              <span className="flex items-center gap-1.5" title="Buffer log hub">
+                <StatusDot status={connected ? 'success' : 'danger'} live={connected} shake={!connected} />
+                <span style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>Log Writer</span>
+              </span>
+            </div>
             <LiveClock />
             {/* Avatar */}
             <div className="flex items-center justify-center rounded-full cursor-pointer"
@@ -1619,11 +1704,11 @@ export default function App() {
         {/* Page content */}
         <main className="flex-1 overflow-y-auto page-content" style={{ padding: 'var(--spacing-page)' }}>
           <div key={page} className="animate-fade-rise" style={{ minHeight: '100%' }}>
-            {page === 'ringkasan'  && <PageRingkasan connected={connected} logs={hub.logs} entries={hub.entries} statuses={hub.statuses} modules={hub.modules} live={connected} sendCommand={hub.sendCommand} results={hub.results} />}
-            {page === 'nshlite'   && <PageNshLite connected={connected} sendCommand={hub.sendCommand} results={hub.results} />}
+            {page === 'ringkasan'  && <PageRingkasan connected={connected} logs={hub.logs} entriesAll={hub.entriesAll} statuses={hub.statuses} modules={hub.modules} live={connected} sendCommand={hub.sendCommand} results={hub.results} kmaRoutes={hub.kma.routes} />}
+            {page === 'nshlite'   && <PageNshLite connected={connected} sendCommand={hub.sendCommand} results={hub.results} outputFiles={hub.outputFiles} />}
             {page === 'kma'       && <PageKma connected={connected} routes={hub.kma.routes} printers={hub.kma.printers} rules={hub.kma.rules} stats={hub.kma.stats} sendCommand={hub.sendCommand} results={hub.results} />}
-            {page === 'wma'       && <PageWma entries={hub.entries} statuses={hub.statuses} live={connected} sendCommand={hub.sendCommand} results={hub.results} />}
-            {page === 'kmma'      && <PageKmma entries={hub.entries} statuses={hub.statuses} details={hub.details} live={connected} sendCommand={hub.sendCommand} results={hub.results} />}
+            {page === 'wma'       && <PageWma entriesAll={hub.entriesAll} statuses={hub.statuses} verified={hub.verified} live={connected} sendCommand={hub.sendCommand} results={hub.results} />}
+            {page === 'kmma'      && <PageKmma entries={hub.entries} statuses={hub.statuses} details={hub.details} live={connected} sendCommand={hub.sendCommand} results={hub.results} timer={hub.kmmaTimer} />}
             {page === 'log'       && <PageLog logs={hub.logs} live={connected} />}
             {page === 'pengaturan'&& <PagePengaturan hubUrl={hubUrl} logCap={logCap} onApply={applySettings} />}
           </div>

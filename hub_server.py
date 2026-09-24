@@ -17,7 +17,15 @@ import threading
 import time
 from pathlib import Path
 import http.server
+import logging
+import shutil
+import urllib.request
 import websockets
+
+# Bunyi "opening handshake failed" = klien non-WS mengetuk port WS
+# (mis. browser dibuka ke http://localhost:8765). Bising tapi tak berbahaya —
+# redam agar konsol hub tetap bersih. Error handler kita sendiri tetap tampil.
+logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
 
 # ══════════════════════════════════════════════════════════════
 # CONFIG
@@ -35,6 +43,7 @@ PID_FILE = BASE_DIR / "supervise_pids.json"
 # - kmma : --watch --hub (event-driven + WebSocket role 'kmma')
 MANAGED_MODULES = ("lite", "kma", "wma", "kmma")
 MODULE_ACTIONS = ("module_on", "module_off", "module_restart")
+FORWARD_ACTIONS = ("retry", "skip", "process_all")
 
 
 def _default_modules(ws_port):
@@ -206,6 +215,50 @@ def stop_all_modules():
         pass
 
 
+def _write_relauncher(hub_pid, py_exe, script, args):
+    """Tulis .bat sekali-pakai: tunggu PID hub mati → start hub baru
+    (console "NSH Hub Server") → hapus diri. Return path .bat."""
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix=f"nsh_hub_relaunch_{hub_pid}_", suffix=".bat")
+    inner = subprocess.list2cmdline([py_exe, script] + [str(a) for a in args])
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("@echo off\n")
+        f.write(f"set HPID={hub_pid}\n")
+        f.write(":wait_hub\n")
+        f.write('tasklist /FI "PID eq %HPID%" 2>nul | findstr /R "\\<%HPID%\\>" >nul\n')
+        f.write("if %errorlevel%==0 (ping -n 2 127.0.0.1 >nul & goto wait_hub)\n")
+        f.write("ping -n 3 127.0.0.1 >nul\n")
+        f.write(f'cd /d "{BASE_DIR}"\n')
+        f.write(f"start \"NSH Hub Server\" {inner}\n")
+        f.write('del "%~f0"\n')
+    return path
+
+
+def handle_hub_restart():
+    """Restart hub via relauncher eksternal (anti-mati-total):
+    1) tulis .bat yang menunggu PID hub hilang lalu start hub baru,
+    2) hentikan modul supervisi, 3) keluar — relauncher menyalakan gantinya.
+    Dashboard/modul reconnect otomatis."""
+    try:
+        script = os.path.abspath(sys.argv[0])
+        bat = _write_relauncher(os.getpid(), sys.executable, script, sys.argv[1:])
+        subprocess.Popen(["cmd", "/c", bat], cwd=str(BASE_DIR),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+    except Exception as e:
+        return False, f"gagal siapkan relaunch: {e}"
+
+    def _do():
+        try:
+            if SUPERVISE:
+                stop_all_modules()
+        finally:
+            os._exit(0)
+    threading.Timer(1.0, _do).start()  # jeda: biarkan balasan terkirim dulu
+    return True, "HUB restart ~5 detik (dashboard reconnect otomatis)"
+
+
 # ══════════════════════════════════════════════════════════════
 # FOLDER CONFIG (dashboard ↔ lite.json / route.json)
 # ══════════════════════════════════════════════════════════════
@@ -218,9 +271,15 @@ FOLDER_FILES = {
 }
 FOLDER_KEYS = {
     "lite": ["input_folder", "output_folder", "uda_folder"],
-    "kma": ["input_folder", "return_folder", "uda_folder"],
+    "kma": ["input_folder", "return_folder", "uda_folder", "ricoh_folder"],
+}
+# boleh kosong (= fitur mati; watcher RICOH off bila kosong)
+FOLDER_OPTIONAL = {
+    "lite": [],
+    "kma": ["ricoh_folder"],
 }
 FOLDER_ACTIONS = ("get_folders", "set_folders")
+OUTPUT_ACTIONS = ("list_output", "move_output")
 
 
 def _folders_path(module):
@@ -251,13 +310,17 @@ def handle_folders_command(action, module, folders=None):
     if not isinstance(folders, dict):
         return False, "folders kosong", {}
     keys = FOLDER_KEYS[module]
+    optional = FOLDER_OPTIONAL.get(module, [])
     cleaned = {k: str(folders.get(k, "")).strip().strip('"').strip("'")
                for k in keys}
-    if any(not v for v in cleaned.values()):
+    required = [k for k in keys if k not in optional]
+    if any(not cleaned[k] for k in required):
         return False, "semua path wajib diisi", _read_folders_file(module)
     if not os.path.isdir(cleaned["input_folder"]):
         return False, f"INPUT tidak ada: {cleaned['input_folder']}", _read_folders_file(module)
     for k in keys[1:]:
+        if not cleaned[k]:
+            continue  # opsional kosong = fitur mati
         try:
             os.makedirs(cleaned[k], exist_ok=True)
         except Exception as e:
@@ -280,7 +343,200 @@ def handle_folders_command(action, module, folders=None):
     except Exception:
         pass
     add_log("HUB", f"folders {module} disimpan — restart modul agar berlaku")
-    return True, "tersimpan — restart modul agar berlaku", cleaned
+    return True, "tersimpan — modul restart otomatis", cleaned
+
+
+OPERATORS = ("Nanas", "Eric", "Rahmadi")
+
+
+def _resolve_machine(dest):
+    """Mesin untuk catatan move: DEVELOP 1/2 ikut printer aktif, RICOH tetap."""
+    if dest == "ricoh":
+        return "Ricoh"
+    for p in kma_cache.get("printers", []) or []:
+        if p.get("active"):
+            ip = p.get("ip", "")
+            if ip.endswith(".157"):
+                return "Develop 1"
+            if ip.endswith(".158"):
+                return "Develop 2"
+    return "Develop 1"
+
+
+def _push_moves_to_watcher(items, operator):
+    """Tandai Selesai (bukan verified) di watcher .54 per nama file.
+    items = [(filename, machine)]. Return (updated, matched, total, err)."""
+    try:
+        today = datetime.date.today().isoformat()
+        yest = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        by_name = {}
+        for d in (today, yest):
+            try:
+                _, data = _watcher_api(
+                    "GET", f"/api/files?date_from={d}&date_to={d}", timeout=5)
+                rows = data if isinstance(data, list) else (data.get("value") or [])
+                for r in rows:
+                    if r.get("filename") and r.get("id") and r["filename"] not in by_name:
+                        by_name[r["filename"]] = r["id"]
+            except Exception:
+                pass
+        matched = [(fname, machine) for fname, machine in items if fname in by_name]
+        ok_n = 0
+        err = ""
+        for fname, machine in matched:
+            try:
+                st, _ = _watcher_api("POST", f"/api/files/{by_name[fname]}",
+                                     {"status": "done", "operator": operator,
+                                      "machine_name": machine}, timeout=4)
+                if 200 <= st < 300:
+                    ok_n += 1
+                else:
+                    err = f"HTTP {st}"
+            except Exception as e:
+                err = str(e)[:80]
+        return ok_n, len(matched), len(items), err
+    except Exception as e:
+        return 0, 0, len(items), str(e)[:80]
+
+
+output_cache = []  # snapshot terakhir OUTPUT lite (didorong ke dashboard)
+output_cache_ts = 0.0
+
+
+def _snapshot_output():
+    """Baca OUTPUT lite sekarang. Return (ok, files). Dipakai command + watcher."""
+    try:
+        lite_cfg = _read_folders_file("lite")
+        raw_out = (lite_cfg.get("output_folder") or "").strip()
+        if not raw_out:
+            return False, []
+        outdir = os.path.realpath(raw_out)
+        if not os.path.isdir(outdir):
+            return False, []
+        files = []
+        try:
+            names = sorted(os.listdir(outdir))
+        except OSError:
+            return False, []
+        for n in names:
+            if not n.lower().endswith(".pdf"):
+                continue
+            try:
+                st = os.stat(os.path.join(outdir, n))
+                files.append({"name": n, "size": st.st_size, "ts": int(st.st_mtime)})
+            except OSError:
+                pass
+        return True, files
+    except Exception:
+        return False, []
+
+
+def _output_watcher():
+    """Thread: awasi OUTPUT lite (snapshot 3 dtk, andal di drive jaringan),
+    siarkan output_update bila berubah. Dashboard event-driven penuh."""
+    global output_cache, output_cache_ts
+    last = ""
+    while True:
+        try:
+            ok, files = _snapshot_output()
+            if ok:
+                sig = json.dumps(files, ensure_ascii=False)
+                if sig != last:
+                    last = sig
+                    output_cache = files
+                    output_cache_ts = time.time()
+                    # dari thread: wajib via threadsafe (bukan broadcast biasa)
+                    broadcast_threadsafe(json.dumps({"type": "output_update", "files": files},
+                                                    ensure_ascii=False))
+        except Exception:
+            pass
+        time.sleep(3)
+
+
+def handle_output_command(action, msg):
+    """KONSUMSI di hub. list_output: daftar PDF di OUTPUT lite.
+    move_output: pindahkan ke DEVELOP (input KMA) / RICOH (ricoh KMA) +
+    catat operator/mesin ke DB + tandai Selesai (bukan verified) di watcher .54.
+    Validasi ketat: src harus di dalam OUTPUT lite, dst hanya 2 folder KMA.
+    Return (ok, msg, files)."""
+    try:
+        lite_cfg = _read_folders_file("lite")
+        raw_out = (lite_cfg.get("output_folder") or "").strip()
+        if not raw_out:
+            return False, "OUTPUT lite belum dikonfigurasi", []
+        outdir = os.path.realpath(raw_out)
+        if not os.path.isdir(outdir):
+            return False, "OUTPUT lite tak ada", []
+        if action == "list_output":
+            ok, files = _snapshot_output()
+            if ok:
+                global output_cache, output_cache_ts
+                output_cache = files
+                output_cache_ts = time.time()
+                return True, "ok", files
+            return False, "OUTPUT lite tak ada/tak terbaca", []
+        if action == "move_output":
+            dest = (msg.get("dest") or "").strip().lower()
+            names = msg.get("files") or []
+            operator = (msg.get("operator") or "").strip()
+            if operator not in OPERATORS:
+                return False, "pilih operator dulu (Nanas/Eric/Rahmadi)", []
+            kma_cfg = _read_folders_file("kma")
+            destmap = {"develop": kma_cfg.get("input_folder", ""),
+                       "ricoh": kma_cfg.get("ricoh_folder", "")}
+            raw_dst = (destmap.get(dest, "") or "").strip()
+            if not raw_dst:
+                return False, f"tujuan {dest or '?'} belum dikonfigurasi", []
+            dstdir = os.path.realpath(raw_dst)
+            if not os.path.isdir(dstdir):
+                return False, f"tujuan {dest} tak ada: {raw_dst}", []
+            if not isinstance(names, list) or not names:
+                return False, "tak ada file dipilih", []
+            moved, failed = [], []
+            for n in names:
+                if not isinstance(n, str) or not n or n != os.path.basename(n):
+                    failed.append(f"{n}: nama tak valid")
+                    continue
+                src = os.path.realpath(os.path.join(outdir, n))
+                if not src.startswith(outdir + os.sep) or not os.path.isfile(src):
+                    failed.append(f"{n}: tak ada di OUTPUT")
+                    continue
+                dst = os.path.join(dstdir, n)
+                if os.path.exists(dst):
+                    failed.append(f"{n}: sudah ada di tujuan")
+                    continue
+                try:
+                    shutil.move(src, dst)
+                    moved.append({"name": n})
+                except OSError as e:
+                    failed.append(f"{n}: {e}")
+            add_log("HUB", f"output -> {dest}: {len(moved)} pindah"
+                           + (f", {len(failed)} gagal" if failed else ""))
+            if not moved:
+                return False, "; ".join(failed) or "tak ada yang pindah", []
+            machine = _resolve_machine(dest)
+            try:
+                db = _hub_db()
+                if db is not None:
+                    for m in moved:
+                        db.output_move_add(ts(), m["name"], dest, machine, operator)
+            except Exception:
+                pass
+            upd, matched, total, werr = _push_moves_to_watcher(
+                [(m["name"], machine) for m in moved], operator)
+            res = f"{len(moved)} file -> {dest.upper()} [{machine} • {operator}]"
+            if failed:
+                res += f" ({len(failed)} gagal: " + "; ".join(failed)[:120] + ")"
+            if matched == 0:
+                res += " (.54: tak ada baris cocok)"
+            elif upd == matched:
+                res += f" (.54: {upd} Selesai)"
+            else:
+                res += f" (.54: {upd}/{matched}" + (f" — {werr}" if werr else "") + ")"
+            return True, res, moved
+        return False, f"aksi tak dikenal: {action}", []
+    except Exception as e:
+        return False, f"error: {e}", []
 
 
 def refresh_supervised_status():
@@ -299,6 +555,9 @@ def refresh_supervised_status():
 clients = {}
 log_history = []
 entries_cache = []
+entries_all_cache = {}  # (nota,bahan) -> entry terlihat hari ini (tak dihapus KMMA)
+verified_cache = set()  # nota terverifikasi (tombol Verified WMA)
+kmma_timer_cache = None  # {next_in, interval} hitung mundur siklus KMMA
 status_cache = {}
 module_status = {}  # role → {"connected": bool, "ts": "..."}
 step_cache = {}  # nota → [{name, machine, material, sdm, qty, status, msg}]
@@ -532,6 +791,7 @@ def start_http_server(port):
 # WEBSOCKET HANDLER
 # ══════════════════════════════════════════════════════════════
 async def handler(connection):
+    global kmma_timer_cache
     role = "dashboard"
     client_id = ""
     ws = connection
@@ -552,6 +812,10 @@ async def handler(connection):
                         "type": "init",
                         "logs": list(log_history),
                         "entries": entries_cache,
+                        "entries_all": list(entries_all_cache.values()),
+                        "verified": sorted(verified_cache),
+                        "kmma_timer": kmma_timer_cache,
+                        "output_files": list(output_cache),
                         "status": status_cache,
                         "modules": module_status,
                         "steps": step_cache,
@@ -571,6 +835,31 @@ async def handler(connection):
                 entries_cache.extend(entries_list)
                 add_log("WMA", f"{len(entries_list)} entries baru")
                 broadcast(json.dumps({"type": "entries", "entries": entries_list}))
+                # gabung ke tampilan seharian (tak ikut terhapus KMMA) + persist.
+                # Varian basi per nota dibuang (mis. bahan terkoreksi saat re-parse),
+                # kecuali nota berstatus final ok/error (riwayat dipertahankan).
+                try:
+                    batch_keys = {(e.get("nota"), e.get("bahan"),
+                                   e.get("sides") or "",
+                                   e.get("laminating") or "") for e in entries_list}
+                    batch_notas = {k[0] for k in batch_keys}
+                    for k in list(entries_all_cache.keys()):
+                        if k[0] in batch_notas and k not in batch_keys:
+                            _s = status_cache.get(k[0], {}).get("status")
+                            if _s not in ("ok", "error"):
+                                del entries_all_cache[k]
+                    for e in entries_list:
+                        entries_all_cache[(e.get("nota"), e.get("bahan"),
+                                           e.get("sides") or "",
+                                           e.get("laminating") or "")] = e
+                    db = _hub_db()
+                    if db is not None:
+                        db.wma_seen_upsert(datetime.date.today().isoformat(), entries_list)
+                    broadcast(json.dumps({"type": "entries_all",
+                                          "entries": list(entries_all_cache.values())},
+                                         ensure_ascii=False))
+                except Exception:
+                    pass
 
             elif msg_type == "status":
                 nota = msg.get("nota", "")
@@ -585,6 +874,13 @@ async def handler(connection):
                     "msg": smsg,
                     "ts": ts(),
                 }))
+                # antrean live: nota yang sudah diproses KMMA keluar dari entries
+                # (cermin filter WMA; entries_all/seen tak tersentuh utk kolom Tengah)
+                if nota and st in ("ok", "error"):
+                    kept = [e for e in entries_cache if e.get("nota") != nota]
+                    if len(kept) != len(entries_cache):
+                        entries_cache[:] = kept
+                        broadcast(json.dumps({"type": "entries", "entries": entries_cache}))
 
             # ── dashboard → modul commands ──
             elif msg_type == "command":
@@ -599,6 +895,43 @@ async def handler(connection):
                         "action": action,
                         "module": msg.get("module", ""),
                         "folders": current,
+                        "ok": bool(ok),
+                        "msg": res,
+                    }, ensure_ascii=False))
+                elif action in OUTPUT_ACTIONS:
+                    # KONSUMSI di hub (watcher + pindah file OUTPUT lite).
+                    ok, res, files = handle_output_command(action, msg)
+                    await _safe_send(ws, json.dumps({
+                        "type": "command_result",
+                        "id": msg.get("id", ""),
+                        "action": action,
+                        "files": files,
+                        "ok": bool(ok),
+                        "msg": res,
+                    }, ensure_ascii=False))
+                elif action == "verify":
+                    # KONSUMSI di hub (tombol Verified WMA), jangan teruskan.
+                    ok, res = _mark_verified(msg.get("nota", ""))
+                    add_log("HUB", f"verify {msg.get('nota', '')} -> {res}")
+                    await _safe_send(ws, json.dumps({
+                        "type": "command_result",
+                        "id": msg.get("id", ""),
+                        "action": action,
+                        "nota": msg.get("nota", ""),
+                        "ok": bool(ok),
+                        "msg": res,
+                    }, ensure_ascii=False))
+                elif action == "hub_restart":
+                    # KONSUMSI di hub (tombol Restart HUB). Hanya peran dashboard.
+                    if role != "dashboard":
+                        ok, res = False, "hanya dashboard boleh restart HUB"
+                    else:
+                        ok, res = handle_hub_restart()
+                    add_log("HUB", f"hub_restart ({role}) -> {res}")
+                    await _safe_send(ws, json.dumps({
+                        "type": "command_result",
+                        "id": msg.get("id", ""),
+                        "action": action,
                         "ok": bool(ok),
                         "msg": res,
                     }, ensure_ascii=False))
@@ -625,7 +958,17 @@ async def handler(connection):
                         "msg": res,
                     }, ensure_ascii=False))
                 else:
-                    broadcast(json.dumps(msg), roles=["kmma", "kma"])
+                    if action in FORWARD_ACTIONS:
+                        broadcast(json.dumps(msg), roles=["kmma", "kma"])
+                    else:
+                        add_log("HUB", f"aksi tak dikenal dari {role}: {action}")
+                        await _safe_send(ws, json.dumps({
+                            "type": "command_result",
+                            "id": msg.get("id", ""),
+                            "action": action,
+                            "ok": False,
+                            "msg": f"aksi tak dikenal: {action}",
+                        }, ensure_ascii=False))
 
             # ── modul → dashboard command results ──
             elif msg_type == "command_result":
@@ -649,6 +992,15 @@ async def handler(connection):
                         "nota": nota,
                         "steps": steps,
                     }))
+
+            # ── KMMA: hitung mundur timer siklus ──
+            elif msg_type == "kmma_timer":
+                try:
+                    kmma_timer_cache = {"next_in": max(0, int(msg.get("next_in", 0))),
+                                        "interval": max(1, int(msg.get("interval", 180)))}
+                except Exception:
+                    kmma_timer_cache = {"next_in": 0, "interval": 180}
+                broadcast(json.dumps({"type": "kmma_timer_update", **kmma_timer_cache}))
 
             elif msg_type == "heartbeat":
                 pass
@@ -701,6 +1053,187 @@ async def _kma_sweeper():
             pass
 
 
+def _hub_db():
+    """DB pusat (sekali init). Return modul db atau None."""
+    global _DBH_READY
+    try:
+        sys.path.insert(0, str(BASE_DIR / "Database"))
+        import db as nshdb
+        if not _DBH_READY:
+            nshdb.init_db()
+            _DBH_READY = True
+        return nshdb
+    except Exception:
+        return None
+
+
+_DBH_READY = False
+
+
+def _preload_wma_from_db():
+    """Muat entri terlihat + verifikasi hari ini (restart hub tak hilang).
+    entries_cache (antrean live KMMA) disusun ulang = terlihat hari ini
+    minus nota yang sudah diproses KMMA. statuses dipulihkan best-effort
+    dari kmma_state agar kolom Menunggu Aksi tetap terisi."""
+    try:
+        db = _hub_db()
+        if db is None:
+            return
+        today = datetime.date.today().isoformat()
+        for e in db.wma_seen_day(today):
+            entries_all_cache[(e.get("nota"), e.get("bahan"), e.get("sides") or "",
+                               e.get("laminating") or "")] = e
+        try:
+            # WMA simpan ke wma_entries walau hub sedang mati/offline —
+            # gabung agar tak ada yang hilang dari kolom.
+            for e in db.wma_all(today):
+                entries_all_cache.setdefault(
+                    (e.get("nota"), e.get("bahan"), e.get("sides") or "",
+                     e.get("laminating") or ""), e)
+        except Exception:
+            pass
+        for n in db.wma_verified_all():
+            verified_cache.add(n)
+        proc = set()
+        st_map = {}
+        for _st in ("completed", "skip_forever", "skipped"):
+            try:
+                rows = db.kmma_by_status(_st)
+            except Exception:
+                rows = {}
+            proc.update(rows.keys())
+            for _n, _info in rows.items():
+                st_map[_n] = _st
+        entries_cache.clear()
+        entries_cache.extend(
+            e for e in entries_all_cache.values() if e.get("nota") not in proc)
+        for _n, _st in st_map.items():
+            if _n in status_cache:
+                continue
+            try:
+                _info = db.kmma_get(_n) or {}
+            except Exception:
+                _info = {}
+            _reason = (_info.get("reason") or "").strip()
+            if _st == "skipped":
+                # retry menunggu timer: status sendiri agar tak jadi hantu Antrian
+                status_cache[_n] = {
+                    "status": "retry",
+                    "msg": "tunggu 3 mnt",
+                    "ts": _info.get("updated_at") or "",
+                }
+                continue
+            status_cache[_n] = {
+                "status": "ok" if _st == "completed" else "error",
+                "msg": _reason or ("selesai" if _st == "completed" else _st),
+                "ts": _info.get("updated_at") or "",
+            }
+        if entries_all_cache or verified_cache:
+            add_log("HUB", f"WMA hari ini dimuat dari DB: {len(entries_all_cache)} entri, "
+                           f"{len(entries_cache)} antrean, {len(verified_cache)} verified")
+    except Exception:
+        pass
+
+
+def _mark_verified(nota):
+    """Tandai nota terverifikasi → DB + siaran + dashboard watcher. Return (ok, msg)."""
+    nota = (nota or "").strip()
+    if not nota:
+        return False, "nota kosong"
+    try:
+        db = _hub_db()
+        if db is not None:
+            db.wma_verify(nota, ts())
+    except Exception:
+        pass
+    verified_cache.add(nota)
+    broadcast(json.dumps({"type": "verified_update",
+                          "verified": sorted(verified_cache)}, ensure_ascii=False))
+    upd, total, err = _push_verified_to_watcher(nota)
+    if total == 0:
+        extra = "watcher: file tak ditemukan" if not err else f"watcher gagal: {err}"
+        return True, f"{nota} terverifikasi ({extra})"
+    if upd == total:
+        return True, f"{nota} terverifikasi ({upd} file watcher)"
+    return False, f"{nota} watcher gagal ({upd}/{total}): {err or 'POST gagal'}"
+
+
+def _watcher_dash_url():
+    """Base URL dashboard watcher (sumber: WMA/wma.json → default .54:5000)."""
+    try:
+        cfg = json.loads((BASE_DIR / "WMA" / "wma.json").read_text(encoding="utf-8"))
+        u = (cfg.get("dash_url") or "").strip().rstrip("/")
+        if u:
+            return u
+    except Exception:
+        pass
+    return "http://192.168.5.54:5000"
+
+
+def _watcher_api(method, path, body=None, timeout=5):
+    """Panggil API dashboard watcher. Return (status, data)."""
+    url = _watcher_dash_url() + path
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = (r.read() or b"{}").decode("utf-8")
+        try:
+            return r.status, json.loads(raw)
+        except Exception:
+            return r.status, {}
+
+
+def _push_verified_to_watcher(nota):
+    """Set verified=true di dashboard watcher untuk semua file nota tsb.
+    Return (updated, total, err). Tak lempar exception."""
+    try:
+        today = datetime.date.today().isoformat()
+        _, data = _watcher_api("GET", f"/api/files?date_from={today}&date_to={today}",
+                               timeout=5)
+        rows = data if isinstance(data, list) else (data.get("value") or [])
+        by_name = {r.get("filename"): r.get("id") for r in rows
+                   if r.get("filename") and r.get("id")}
+        names = []
+        for e in entries_all_cache.values():
+            if e.get("nota") == nota:
+                names.extend(e.get("files") or [])
+        ids = [by_name[n] for n in dict.fromkeys(names) if n in by_name]
+        ok_n = 0
+        err = ""
+        for fid in ids:
+            try:
+                st, _ = _watcher_api("POST", f"/api/files/{fid}",
+                                     {"verified": True}, timeout=4)
+                if 200 <= st < 300:
+                    ok_n += 1
+                else:
+                    err = f"HTTP {st}"
+            except Exception as e:
+                err = str(e)[:80]
+        return ok_n, len(ids), err
+    except Exception as e:
+        return 0, 0, str(e)[:80]
+
+
+def _preload_kma_from_db():
+    """Muat routes+stats KMA hari ini dari DB (restart hub tak nol).
+    seen dibiarkan 0 → status tetap offline sampai route.py melapor."""
+    try:
+        sys.path.insert(0, str(BASE_DIR / "Database"))
+        import db as nshdb
+        nshdb.init_db()
+        today = datetime.date.today().isoformat()
+        evs = nshdb.kma_events_day(today)
+        st = nshdb.kma_stats_get(today)
+        if evs or st["ok"] or st["ret"] or st["done"]:
+            kma_cache["routes"] = evs[-50:]
+            kma_cache["stats"] = st
+            add_log("HUB", f"KMA hari ini dimuat dari DB: {len(evs)} events")
+    except Exception:
+        pass
+
+
 async def main():
     global HUB_LOOP, SUPERVISE
     ws_port = WS_PORT
@@ -712,6 +1245,8 @@ async def main():
             http_port = ws_port + 1
     SUPERVISE = "--supervise" in sys.argv
 
+    _preload_kma_from_db()
+    _preload_wma_from_db()
     supervise_init(ws_port)
     if SUPERVISE:
         for _n in MANAGED_MODULES:
@@ -722,6 +1257,7 @@ async def main():
     HUB_LOOP = asyncio.get_running_loop()
     asyncio.create_task(_kma_sweeper())
     asyncio.create_task(_supervisor_poller())
+    threading.Thread(target=_output_watcher, daemon=True).start()
     start_http_server(http_port)
 
     server = await websockets.serve(handler, HOST, ws_port)

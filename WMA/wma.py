@@ -59,13 +59,32 @@ SYNC_INTERVAL_S = 60
 R_NOTA = re.compile(r"(ON\d{12})")
 R_BAHAN = re.compile(
     r"(Ap\d+gr|Ac\d+gr|(?:Stiker|Sticker)\s+\w+|HVS|Concord|BC\s+\w+|Master|BNTU"
-    r"|NewToop\d+\s*mic|Toop\d+\s*mic|Art\s*Paper|Art\s*Carton|ArtPaper|ArtCarton)",
+    r"|NewToop\s*\d+\s*mic|Toop\s*\d+\s*mic|Art\s*Paper|Art\s*Carton|ArtPaper|ArtCarton"
+    r"|(?:Kertas\s+)?[KC]rom[oe]"
+    r"|Vinyl|Vyinil|Rajawali|Pindo|Jasmine|Ivory|Transparant|Hologram|Gold|Silver)",
     re.I,
 )
 R_TOTAL = re.compile(r"TOTAL\s*=\s*(\d+)\s*(BESAR|KECIL)", re.I)
 R_KISSCUT = re.compile(r"kiss\s*cut", re.I)
 R_DIECUT = re.compile(r"die\s*cut", re.I)
 R_PDF = re.compile(r"\.pdf$", re.I)
+R_JOB_PREFIX = re.compile(r"^[A-Z]{2,}-\d+\s*-\s*")
+R_SIDES = re.compile(r"(?<![a-z0-9])([12])\s*s(?![a-z])", re.I)  # 1s / 2s
+R_LAM = re.compile(r"(?<![a-z])(doff?|glossy?)(?![a-z])", re.I)  # doff / glossy
+
+
+def extract_customer(filename, bahan=""):
+    """Judul job/pelanggan dari nama file: 'KNT-10030 - <CUSTOMER> _<bahan> ...'."""
+    name = re.sub(r"\.pdf$", "", filename or "", flags=re.I).strip()
+    name = R_JOB_PREFIX.sub("", name)
+    if bahan:
+        i = name.lower().find("_" + bahan.lower())
+        if i > 0:
+            name = name[:i]
+    for pat in (r"\s+-\s*\(.*$", r"\s+TOTAL\s*=.*$",
+                r"\s*\([^()]*ON\d{12}[^()]*\)\s*$"):
+        name = re.sub(pat, "", name, flags=re.I).strip()
+    return name.strip()[:60]
 
 
 # ════════════════════════════════════════════════════════════════
@@ -99,13 +118,17 @@ def get_dash_url():
 # SECTION 4: DASHBOARD API
 # ════════════════════════════════════════════════════════════════
 
+_API_LAST_ERR = ""
+
 def _api_get(path, retries=3):
+    global _API_LAST_ERR
     url = get_dash_url() + path
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(url, timeout=DASH_TIMEOUT_S) as r:
                 return json.loads(r.read().decode("utf-8"))
-        except Exception:
+        except Exception as e:
+            _API_LAST_ERR = f"{type(e).__name__}: {str(e)[:100]}"
             if attempt < retries - 1:
                 time.sleep(1 * (attempt + 1))
     return None
@@ -116,13 +139,16 @@ def _api_get(path, retries=3):
 # ════════════════════════════════════════════════════════════════
 
 def parse_pdf_filename(filename):
-    """Parse PDF filename → dict(nota, bahan, qty, jenis, process_type)."""
+    """Parse PDF filename → dict(nota, bahan, qty, jenis, process_type, customer, sides, laminating)."""
     result = {
         "nota": None,
         "bahan": None,
         "qty": None,
         "jenis": None,
         "process_type": None,
+        "customer": "",
+        "sides": "",
+        "laminating": "",
     }
 
     # nota
@@ -134,6 +160,9 @@ def parse_pdf_filename(filename):
     m = R_BAHAN.search(filename)
     if m:
         result["bahan"] = m.group(1).strip()
+
+    # customer (butuh bahan dulu untuk marker potong)
+    result["customer"] = extract_customer(filename, result["bahan"] or "")
 
     # qty + jenis
     m = R_TOTAL.search(filename)
@@ -147,6 +176,15 @@ def parse_pdf_filename(filename):
     elif R_DIECUT.search(filename):
         result["process_type"] = "diecut"
 
+    # sisi cetak 1s/2s (beda = tidak gabung)
+    m = R_SIDES.search(filename)
+    result["sides"] = (m.group(1) + "s") if m else ""
+
+    # laminating doff/glossy (beda = tidak gabung)
+    m = R_LAM.search(filename)
+    low_lam = (m.group(1) or "").lower() if m else ""
+    result["laminating"] = ("doff" if low_lam.startswith("do") else "glossy") if low_lam else ""
+
     return result
 
 
@@ -159,7 +197,7 @@ def fetch_completed(date_str):
     path = f"/api/files?date_from={date_str}&date_to={date_str}"
     data = _api_get(path)
     if not data:
-        print(f"  {err('gagal fetch dashboard')}")
+        print(f"  {err(f'gagal fetch dashboard ({_API_LAST_ERR})')}")
         return []
 
     # API bisa return list langsung atau {"value": [...]}
@@ -189,7 +227,8 @@ def fetch_completed(date_str):
 # ════════════════════════════════════════════════════════════════
 
 def aggregate_by_nota(rows):
-    """Group rows by (nota, bahan). Only merge if BOTH are the same."""
+    """Group rows by (nota, bahan, sides, laminating). Hanya gabung jika
+    SEMUA sama: beda 1s/2s = tidak gabung, beda laminating Doff/Glossy = tidak gabung."""
     groups = {}
 
     for r in rows:
@@ -203,13 +242,18 @@ def aggregate_by_nota(rows):
             print(f"  {warn(f'skip tanpa nota: {fname[:50]}')}")
             continue
 
-        # key = (nota, bahan) — gabung hanya jika nota DAN bahan sama
-        key = (nota, bahan)
+        # key = (nota, bahan, sides, laminating)
+        sides = parsed.get("sides") or ""
+        lam = parsed.get("laminating") or ""
+        key = (nota, bahan, sides, lam)
 
         if key not in groups:
             groups[key] = {
                 "nota": nota,
                 "bahan": bahan,
+                "customer": parsed["customer"] or "",
+                "sides": sides,
+                "laminating": lam,
                 "total_qty": 0,
                 "jenis": parsed["jenis"],
                 "process_type": parsed["process_type"],
@@ -220,6 +264,10 @@ def aggregate_by_nota(rows):
 
         groups[key]["total_qty"] += parsed["qty"] or 0
         groups[key]["files"].append(fname)
+
+        # update customer/jenis jika kosong
+        if not groups[key]["customer"] and parsed["customer"]:
+            groups[key]["customer"] = parsed["customer"]
 
         # update jenis jika kosong
         if not groups[key]["jenis"] and parsed["jenis"]:
@@ -298,10 +346,14 @@ def show_daily():
         proc = e.get("process_type") or "digital"
         op = e.get("operator", "?")
         mac = e.get("machine", "?")
+        cust = e.get("customer", "") or "-"
         files = e.get("files", [])
+        sides = e.get("sides", "") or ""
+        lam = e.get("laminating", "") or ""
+        tag = f" [{sides.upper()}" + (f"/{lam.upper()}" if lam else "") + "]" if sides or lam else ""
 
         cat = proc.upper()
-        print(f"  {i:>2}. {BOLD}{nota}{RESET}  [{CYAN}{cat}{RESET}]  {bahan} x {qty} {jenis}  |  {op}  |  {mac}")
+        print(f"  {i:>2}. {BOLD}{nota}{RESET}  [{CYAN}{cat}{RESET}]  {cust} | {bahan} x {qty} {jenis}  |  {op}  |  {mac}{tag}")
         for f in files:
             print(f"      {dim(f[:70])}")
 
@@ -392,9 +444,13 @@ def sync(date_str=None, ws_client=None):
         proc = e.get("process_type") or "digital"
         op = e.get("operator", "?")
         mac = e.get("machine", "?")
+        cust = e.get("customer", "") or "-"
+        sides = e.get("sides", "") or ""
+        lam = e.get("laminating", "") or ""
+        tag = f" [{sides.upper()}" + (f"/{lam.upper()}" if lam else "") + "]" if sides or lam else ""
 
         cat = proc.upper()
-        print(f"  {i:>2}. {BOLD}{nota}{RESET}  [{CYAN}{cat}{RESET}]  {bahan} x {qty} {jenis}  |  {op}  |  {mac}")
+        print(f"  {i:>2}. {BOLD}{nota}{RESET}  [{CYAN}{cat}{RESET}]  {cust} | {bahan} x {qty} {jenis}  |  {op}  |  {mac}{tag}")
 
     # save
     save_daily(entries, date_str)

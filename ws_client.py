@@ -149,6 +149,10 @@ class WSClient:
         """
         self.send({"type": "step_detail", "nota": nota, "steps": steps})
 
+    def send_timer(self, next_in, interval):
+        """Lapor hitung mundur siklus KMMA (detik)."""
+        self.send({"type": "kmma_timer", "next_in": int(next_in), "interval": int(interval)})
+
     def send_log(self, module, msg):
         """Send a log message."""
         self.send({"type": "log", "module": module, "msg": msg})

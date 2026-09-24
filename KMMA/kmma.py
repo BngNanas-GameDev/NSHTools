@@ -13,6 +13,7 @@ import json
 import queue
 import re
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -63,20 +64,43 @@ ENV_PATH = BASE / "env" / "kmma" / ".env"
 CFG_PATH = BASE / "kmma.json"
 DAILY_PATH = BASE.parent / "WMA" / "wma_daily.json"
 
-POLL_INTERVAL = 300
+POLL_INTERVAL = 180
 ACTION_DELAY = 1
 API_DELAY = 5
-NOTA_RETRY = 600
+NOTA_RETRY = 180  # jeda retry bila nota tak ada di KM
+AUTO_INTERVAL = 180  # proses ulang otomatis tiap 3 menit (watch mode)
 
 R_BAHAN = re.compile(
     r"(Ap\d+gr|Ac\d+gr|(?:Stiker|Sticker)\s+\w+|HVS|Concord|BC\s+\w+|Master|BNTU"
-    r"|NewToop\d+\s*mic|Toop\d+\s*mic|Art\s*Paper|Art\s*Carton)",
+    r"|NewToop\s*\d+\s*mic|Toop\s*\d+\s*mic|Art\s*Paper|Art\s*Carton"
+    r"|(?:Kertas\s+)?[KC]rom[oe]"
+    r"|Vinyl|Vyinil|Rajawali|Pindo|Jasmine|Ivory|Transparant|Hologram|Gold|Silver)",
     re.I,
 )
 R_NOTA = re.compile(r"(ON\d{12})")
 R_TOTAL = re.compile(r"TOTAL\s*=\s*(\d+)\s*(BESAR|KECIL)", re.I)
 R_KISSCUT = re.compile(r"kiss\s*cut", re.I)
 R_DIECUT = re.compile(r"die\s*cut", re.I)
+R_TEST = re.compile(r"tes", re.I)  # TEST / tes / test1 (nama pelanggan atau file)
+R_KTN = re.compile(r"ktn|kartu\s*nama", re.I)  # KTN / KartuNama / Kartu Nama
+
+
+def _is_test_entry(entry):
+    """True bila customer atau salah satu file mengandung TEST."""
+    if R_TEST.search(entry.get("customer") or ""):
+        return True
+    for fn in entry.get("files", []) or []:
+        if R_TEST.search(fn or ""):
+            return True
+    return False
+
+
+def _is_ktn_entry(entry):
+    """True bila salah satu file mengandung KTN/KartuNama."""
+    for fn in entry.get("files", []) or []:
+        if R_KTN.search(fn or ""):
+            return True
+    return False
 
 
 def load_env():
@@ -194,10 +218,14 @@ def match_bahan(filename_bahan, km_material_name):
         if f"{num}gr" in km:
             return True
     for name in ["stiker", "sticker", "concord", "hvs", "idcard", "id card",
-                  "newtoop", "toop", "artpaper", "artpaper"]:
+                  "newtoop", "toop", "artpaper", "artpaper", "kromo", "cromo",
+                  "vinyl", "vyinil", "rajawali", "pindo", "jasmine", "ivory",
+                  "transparant", "hologram", "gold", "silver"]:
         if name in fb:
             variants = {"stiker": "sticker", "sticker": "stiker",
-                        "newtoop": "toop", "toop": "newtoop"}
+                        "newtoop": "toop", "toop": "newtoop",
+                        "kromo": "cromo", "cromo": "kromo",
+                        "vyinil": "vinyl"}
             km_check = variants.get(name, name)
             if name in km or km_check in km:
                 return True
@@ -438,6 +466,14 @@ class KMClient:
         return False, "save failed"
 
 
+def send_manual(nota, msg, ws_client=None):
+    """Tandai butuh aksi manual: status hub 'manual', TANPA skip permanen
+    (entri tetap di antrean, bisa diperbaiki via dashboard lalu retry)."""
+    print(f"    {warn(f'{nota} MANUAL: {msg}')}")
+    if ws_client and ws_client.connected:
+        ws_client.send_status(nota, "manual", msg)
+
+
 def log_skip(reason, nota):
     if HAVE_DB:
         try:
@@ -482,11 +518,28 @@ def should_skip(nota):
     return False
 
 
-def mark_nota_retry(nota):
+def mark_nota_retry(nota, ws_client=None):
+    """Catat retry bila nota tak ada di KM. Retry tiap 3 mnt TANPA batas
+    (sampai berhasil / di-skip manual). Kirim status 'retry' agar dashboard
+    tak menampilkan baris hantu di Antrian. Return jumlah percobaan."""
     now = datetime.datetime.now().isoformat()
+    count = 1
     if HAVE_DB:
         try:
-            nshdb.kmma_set(nota, "skipped", "kode tidak ada di list KM", now)
+            r = nshdb.kmma_get(nota)
+            if r and r["status"] == "skipped":
+                count = int(r.get("retries") or 0) + 1
+        except Exception:
+            pass
+    else:
+        try:
+            old = _load_cfg_file().get("skipped_nota", {}).get(nota, {})
+            count = int(old.get("count") or 0) + 1
+        except Exception:
+            count = 1
+    if HAVE_DB:
+        try:
+            nshdb.kmma_set(nota, "skipped", "kode tidak ada di list KM", now, retries=count)
         except Exception:
             pass
     cfg = _load_cfg_file()
@@ -494,9 +547,13 @@ def mark_nota_retry(nota):
     retry[nota] = {
         "reason": "kode tidak ada di list KM",
         "last_try": now,
+        "count": count,
     }
     cfg["skipped_nota"] = retry
     _save_cfg_file(cfg)
+    if ws_client and ws_client.connected:
+        ws_client.send_status(nota, "retry", f"tunggu 3 mnt (percobaan {count})")
+    return count
 
 
 def mark_completed(nota):
@@ -550,6 +607,23 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
         print(f"    {warn('NOTA tidak ditemukan di entry')}")
         return
 
+    # ATURAN: file TEST → skip permanen, jangan diproses ke KM
+    if _is_test_entry(entry):
+        log_skip("TEST", nota)
+        print(f"    {err(f'{nota} SKIP: TEST (file test, jangan diproses ke KM)')}")
+        if ws_client and ws_client.connected:
+            ws_client.send_status(nota, "error", "SKIP: TEST")
+        return
+
+    # ATURAN: KartuNama → qty file wajib ÷ 4 (override manual tak ikut dibagi)
+    if _is_ktn_entry(entry) and not qty_manual:
+        try:
+            _qty_before = int(qty_file)
+            qty_file = _qty_before // 4
+            print(f"    {warn(f'{nota} KartuNama: qty {_qty_before} → {qty_file} (÷4)')}")
+        except (ValueError, TypeError):
+            pass
+
     if should_skip(nota):
         return
 
@@ -569,13 +643,13 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
             break
 
     if not matched:
-        mark_nota_retry(nota)
-        print(f"    {warn(f'{nota} tidak ada di KM, retry 10m')}")
+        n = mark_nota_retry(nota, ws_client)
+        print(f"    {warn(f'{nota} tidak ada di KM, retry 3 mnt (percobaan {n})')}")
         return
 
     if bahan_file and matched.get("bahan_km"):
         if not match_bahan(bahan_file, matched["bahan_km"]):
-            log_skip("bahan tidak sesuai: {} vs {}".format(bahan_file, matched["bahan_km"]), nota)
+            send_manual(nota, f"bahan tidak sesuai: {bahan_file} vs {matched['bahan_km']}", ws_client)
             print(f"    {err(f'bahan: {bahan_file} vs {matched["bahan_km"]}')}")
             return
 
@@ -585,7 +659,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
         try:
             qty_km_int = int(matched["qty_km"])
             if qty_file != qty_km_int:
-                log_skip("jumlah tidak sesuai: {} vs {}".format(qty_file, qty_km_int), nota)
+                send_manual(nota, f"jumlah tidak sesuai: {qty_file} vs {qty_km_int} (override qty manual / lewati)", ws_client)
                 print(f"    {err(f'qty: {qty_file} vs {qty_km_int}')}")
                 return
         except ValueError:
@@ -667,6 +741,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                 break
 
         if not digital_mac:
+            send_manual(nota, "mesin Digital A3+ tidak ditemukan", ws_client)
             print(f"    {err(f'{nota} mesin Digital A3+ tidak ditemukan')}")
             return
 
@@ -683,6 +758,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                     finish_mac = mc
                     break
         if not finish_mac:
+            send_manual(nota, f"mesin {proc_type.upper()} tidak ditemukan", ws_client)
             print(f"    {err(f'{nota} mesin {proc_type.upper()} tidak ditemukan')}")
             return
 
@@ -697,6 +773,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                 sdm_name = s["name"]
                 break
         if not sdm_id:
+            send_manual(nota, f"operator {operator_wma} tidak di dropdown", ws_client)
             print(f"    {err(f'{nota} operator {operator_wma} tidak di dropdown')}")
             return
 
@@ -838,6 +915,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                 mat_name = m["material_name"]
                 break
         if not mat_id:
+            send_manual(nota, f"bahan {bahan_file} tidak di dropdown", ws_client)
             print(f"    {err(f'{nota} bahan {bahan_file} tidak di dropdown')}")
             return
 
@@ -863,6 +941,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                     mac_name = mc["machine_name"]
                     break
         if not mac_id:
+            send_manual(nota, f"mesin {machine_wma} tidak di dropdown", ws_client)
             print(f"    {err(f'{nota} mesin {machine_wma} tidak di dropdown')}")
             return
 
@@ -876,6 +955,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                 sdm_name = s["name"]
                 break
         if not sdm_id:
+            send_manual(nota, f"operator {operator_wma} tidak di dropdown", ws_client)
             print(f"    {err(f'{nota} operator {operator_wma} tidak di dropdown')}")
             return
 
@@ -976,6 +1056,10 @@ def handle_kmma_command(cmd, client, username, password, ws_client=None):
         reply(True, f"{nota} dilewati permanen")
         return
 
+    if _process_lock.locked():
+        reply(False, "KMMA sibuk memproses otomatis, coba lagi")
+        return
+
     if not client.cookie:
         print(f"  {waiting('login KonsepMedia...')}")
         if not client.login(username, password):
@@ -1024,8 +1108,12 @@ def handle_kmma_command(cmd, client, username, password, ws_client=None):
         reply(False, f"{nota} gagal, cek log KMMA")
 
 
+_process_lock = threading.Lock()  # cegah proses tumpuk (file/hub/auto)
+_last_auto = 0.0  # trigger otomatis terakhir
+
+
 def _run_watch(username, password, ws_client=None):
-    """Event-driven mode: watch wma_daily.json, proses saat berubah."""
+    """Event-driven mode: watch wma_daily.json + proses ulang tiap 3 menit."""
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
 
@@ -1041,6 +1129,17 @@ def _run_watch(username, password, ws_client=None):
         ws_client.on_command = cmd_queue.put
 
     def process_now():
+        global _last_auto
+        _last_auto = time.time()
+        if not _process_lock.acquire(blocking=False):
+            print(f"  {dim('proses masih jalan, lewati trigger')}")
+            return
+        try:
+            _process_now_inner()
+        finally:
+            _process_lock.release()
+
+    def _process_now_inner():
         nonlocal login_fail_count
 
         entries = load_daily()
@@ -1108,6 +1207,7 @@ def _run_watch(username, password, ws_client=None):
         process_now()
 
     try:
+        tick = 0
         while True:
             try:
                 cmd = cmd_queue.get_nowait()
@@ -1115,6 +1215,17 @@ def _run_watch(username, password, ws_client=None):
                 cmd = None
             if cmd is not None:
                 handle_kmma_command(cmd, client, username, password, ws_client=ws_client)
+            if time.time() - _last_auto >= AUTO_INTERVAL:
+                print(f"\n  {dim('proses ulang otomatis (3 mnt)')}")
+                process_now()
+            tick += 1
+            if ws_client and tick % 5 == 0:
+                try:
+                    if ws_client.connected:
+                        remain = max(0, int(AUTO_INTERVAL - (time.time() - _last_auto)))
+                        ws_client.send_timer(remain, AUTO_INTERVAL)
+                except Exception:
+                    pass
             time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()

@@ -5,6 +5,7 @@ Preset 100% dari aturan guru (tidak belajar, tidak bertanya).
 Pakai: python lite.py "<nama file>" [file ...] | --dir "<folder>"
 """
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -140,6 +141,53 @@ def _write_error_txt(folder, filename, code, reason, err_msg):
         return None
 
 
+def _handle_kisscut(fn, name, outdir, udadir):
+    """Kisscut/Diecut: TIDAK di-skip. PDF di-COPY ke output (tanpa impose),
+    .cdr pendamping + asli PDF ditarik ke uda. Return True bila tertangani."""
+    import shutil as _sh
+    import time as _time
+    src = Path(fn)
+    try:
+        dst = outdir / name
+        if not dst.exists():
+            _sh.copy2(str(src), str(dst))
+        # cdr pendamping (stem sama) -> uda
+        cdr = None
+        try:
+            low = src.stem.lower()
+            for f in src.parent.iterdir():
+                if f.is_file() and f.stem.lower() == low and f.suffix.lower() == ".cdr":
+                    cdr = f
+                    break
+        except OSError:
+            pass
+        moved = ""
+        if cdr is not None:
+            try:
+                tgt = udadir / cdr.name
+                if tgt.exists():
+                    tgt = udadir / f"{cdr.stem}_{int(_time.time())}{cdr.suffix}"
+                cdr.rename(tgt)
+                moved = tgt.name
+            except OSError:
+                pass
+        # asli PDF -> uda (ikuti alur normal agar tak diproses ulang)
+        try:
+            tgt = udadir / name
+            if tgt.exists():
+                tgt = udadir / f"{src.stem}_{int(_time.time())}{src.suffix}"
+            src.rename(tgt)
+        except FileNotFoundError:
+            pass
+        _STATS["ok"] += 1
+        _IMPOSED.add(name)
+        _log(G, "[KC]", _short(name), f"copy -> {dst.name}" + (f" | cdr -> {moved}" if moved else " | tanpa cdr"))
+        return True
+    except OSError as e:
+        _log(R, "[KC-E]", _short(name), str(e)[:80])
+        return False
+
+
 def process_one(fn, bridge, outdir, udadir):
     """Proses satu file. Return True jika di-impose."""
     import time as _time
@@ -154,14 +202,15 @@ def process_one(fn, bridge, outdir, udadir):
         _log(Y, "[E034]", _short(name), f"Duplikat Terdeteksi ({pel}) -> {txt.name if txt else 'txt gagal'} (di Input)")
         # lanjut impose, tapi tetap mark
     sk = skip_reason(name)
-    if sk:
+    is_kc = (sk == "kisscut/diecut")
+    if sk and not is_kc:
         if name not in _SKIPPED:
             _STATS["skip"] += 1
             _log(Y, "[SKIP]", _short(name), f"-> {sk}")
             _SKIPPED.add(name)
         return False
-    # --- cek ukuran halaman beda ---
-    ok_sizes, sizes = _check_page_sizes(fn)
+    # --- cek ukuran halaman beda (lewati untuk kisscut: tak di-impose) ---
+    ok_sizes, sizes = (True, "") if is_kc else _check_page_sizes(fn)
     if not ok_sizes:
         pel = _extract_customer(name)
         txt = _write_error_txt(Path(fn).parent, name, "E035",
@@ -182,6 +231,8 @@ def process_one(fn, bridge, outdir, udadir):
     first = _SEEN.get(str(Path(fn)).lower())
     if first and (_time.time() - first) < COOLDOWN_BEFORE:
         return False  # masih cooldown, skip tapi jangan log
+    if is_kc:
+        return _handle_kisscut(fn, name, outdir, udadir)
     try:
         dst = outdir / name
         import io as _io
@@ -308,6 +359,9 @@ def ask_folders():
     ind = Path(cfg.get("input_folder", str(BASE / "input")))
     outd = Path(cfg.get("output_folder", str(BASE / "impose")))
     udad = Path(cfg.get("uda_folder", str(BASE / "uda")))
+    if os.environ.get("NSH_NO_PROMPT") == "1":
+        print(f"  {D}pakai tersimpan (auto-restart).{RST}")
+        return ind, outd, udad
     _banner()
     print()
     print(f"  {W}Setup Folder{RST}  {D}(Enter = pakai yang tersimpan){RST}")
@@ -335,6 +389,25 @@ def ask_folders():
     return ind, outd, udad
 
 
+def _cfg_mtime():
+    try:
+        return os.stat(str(BASE / "lite.json")).st_mtime
+    except OSError:
+        return 0.0
+
+
+def _restart_self(reason):
+    """Restart proses ini (pakai config tersimpan, tanpa prompt)."""
+    _log(Y, "[ RESTART ]", reason, "memuat path baru...")
+    os.environ["NSH_NO_PROMPT"] = "1"
+    try:
+        script = os.path.abspath(sys.argv[0])
+        os.execv(sys.executable, [sys.executable, script] + sys.argv[1:])
+    except Exception as e:
+        _log(R, "[ RESTART ]", "gagal", str(e)[:80])
+        os.environ.pop("NSH_NO_PROMPT", None)
+
+
 def watch_loop():
     """Mode watcher seperti run.bat NSH utama: pantau folder input selamanya."""
     import time as _time
@@ -348,8 +421,12 @@ def watch_loop():
     print(f"    Uda    : {C}{udadir}{RST}")
     print(f"  Legenda: {G}[ OK ] berhasil{RST}  {Y}[SKIP] skip{RST}  {Y}[E030] locked{RST}  {R}[E031/E032] gagal->.txt{RST}  {D}| Ctrl+C stop{RST}")
     print(f"  ------------------------------------------------------")
+    cfg_mtime = _cfg_mtime()
     try:
         while True:
+            if _cfg_mtime() != cfg_mtime:
+                _restart_self("lite.json berubah")
+                return  # tak tercapai bila exec sukses
             seen = {}
             for f in list(indir.glob("*.pdf")) + list(indir.glob("*.PDF")):
                 seen[str(f).lower()] = f

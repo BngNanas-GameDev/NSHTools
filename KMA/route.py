@@ -98,16 +98,36 @@ def _hub_flags():
                 _HUB_URL = sys.argv[i + 1]
 
 
-def _ev(fname, category, dest, status, msg=""):
-    """Catat event routing (dedupe per file+status+dest)."""
-    if not _HUB:
-        return
+def _machine():
+    """Label mesin file router: DEVELOP 1 (.157) / DEVELOP 2 (.158)."""
+    cur = HOT_SERVER.strip("\\")
+    if cur == PRINTERS[0]:
+        return "DEVELOP 1"
+    if cur == PRINTERS[1]:
+        return "DEVELOP 2"
+    return cur or "?"
+
+
+def _ev(fname, category, dest, status, msg="", machine=None):
+    """Catat event routing (dedupe per file+status+dest) → memori + DB harian.
+    DB-first: tetap dicatat walau tanpa --hub, agar restart tak nol.
+    Return True bila baris BARU (nama sama tak menaikkan count)."""
+    day = _ensure_day()
     key = (status, dest)
     if _EV_LAST.get(fname) == key:
-        return
+        return False
     _EV_LAST[fname] = key
-    _EVENTS.append({"file": fname, "category": category or "?",
-                    "dest": dest, "status": status, "msg": msg, "ts": _now()})
+    mc = machine or _machine()
+    ev = {"file": fname, "category": category or "?",
+          "dest": dest, "status": status, "msg": msg, "ts": _now(), "machine": mc}
+    _EVENTS.append(ev)
+    db = _kma_db()
+    if db is not None:
+        try:
+            db.kma_event_add(day, fname, category, dest, status, msg, ev["ts"], mc)
+        except Exception:
+            pass
+    return True
 
 
 def _hub_post(body, timeout=5):
@@ -136,6 +156,7 @@ def _hub_log(msg):
 
 def push_kma():
     """Kirim state router ke hub (routes/printers/rules/stats)."""
+    _ensure_day()
     if not _HUB:
         return
     rules = []
@@ -145,9 +166,16 @@ def push_kma():
     printers = []
     for i, ip in enumerate(PRINTERS):
         st = _PRINTER_STATE.get(ip)
-        printers.append({"ip": ip, "role": "utama" if i == 0 else "cadangan",
+        printers.append({"ip": ip, "role": "",
+                         "machine": "DEVELOP 1" if i == 0 else "DEVELOP 2",
                          "status": "siap" if st else ("mati" if st is False else "?"),
                          "active": HOT_SERVER.strip("\\") == ip})
+    # RICOH watcher: reader lokal — selalu ON selama router jalan
+    # (mati hanya bila foldernya dikonfigurasi tapi hilang)
+    _ricoh = (_FOLDERS.get("ricoh") or "").strip()
+    printers.append({"ip": "RICOH", "role": "watcher", "machine": "RICOH",
+                     "status": "siap" if (not _ricoh or os.path.isdir(_ricoh)) else "mati",
+                     "active": False})
     _hub_post({"source": "kma", "kind": "kma_state",
                "routes": list(_EVENTS)[-50:], "printers": printers,
                "rules": rules, "stats": dict(_STATS), "folders": dict(_FOLDERS)})
@@ -155,6 +183,101 @@ def push_kma():
 
 def _now():
     return _time.strftime("%H:%M:%S")
+
+
+def _cfg_mtime():
+    try:
+        return os.stat(str(BASE / "route.json")).st_mtime
+    except OSError:
+        return 0.0
+
+
+def _restart_self(reason):
+    """Restart proses ini (pakai config tersimpan, tanpa prompt)."""
+    _log(Y, "[ RESTART ]", reason, "memuat path baru...")
+    os.environ["NSH_NO_PROMPT"] = "1"
+    try:
+        script = os.path.abspath(sys.argv[0])
+        os.execv(sys.executable, [sys.executable, script] + sys.argv[1:])
+    except Exception as e:
+        _log(R, "[ RESTART ]", "gagal", str(e)[:80])
+        os.environ.pop("NSH_NO_PROMPT", None)
+
+
+def _today():
+    return _time.strftime("%Y-%m-%d")
+
+
+_KMA_DAY = ""  # tanggal yang sedang dimuat di memori
+_DB_MOD = None  # modul db pusat (sekali import)
+_DB_READY = False  # init_db sudah jalan
+
+
+def _kma_db():
+    """Import + init DB pusat (sekali). Return modul db atau None."""
+    global _DB_MOD, _DB_READY
+    if _DB_MOD is None:
+        _DB_MOD = _nshdb()
+    if _DB_MOD is None:
+        return None
+    if not _DB_READY:
+        try:
+            _DB_MOD.init_db()
+            _DB_READY = True
+        except Exception:
+            pass
+    return _DB_MOD
+
+
+def _load_day(date):
+    """Muat stats + events hari tsb dari DB ke memori (restart lanjut, tak nol)."""
+    global _KMA_DAY
+    _EVENTS.clear()
+    _EV_LAST.clear()
+    _STATS.update({"ok": 0, "ret": 0, "done": 0})
+    _KMA_DAY = date
+    db = _kma_db()
+    if db is None:
+        return
+    try:
+        s = db.kma_stats_get(date)
+        _STATS.update({"ok": s["ok"], "ret": s["ret"], "done": s["done"]})
+    except Exception:
+        pass
+    try:
+        for e in db.kma_events_day(date):
+            _EVENTS.append({"file": e["file"], "category": e["category"] or "?",
+                            "dest": e["dest"], "status": e["status"],
+                            "msg": e["msg"], "ts": e["ts"],
+                            "machine": e.get("machine") or ""})
+            _EV_LAST[e["file"]] = (e["status"], e["dest"])
+        db.kma_prune()
+    except Exception:
+        pass
+
+
+def _ensure_day():
+    """Ganti hari (lewat tengah malam) → reset + muat hari baru. Return tanggal aktif."""
+    today = _today()
+    if today != _KMA_DAY:
+        _load_day(today)
+    return today
+
+
+def _save_stats():
+    db = _kma_db()
+    if db is None:
+        return
+    try:
+        db.kma_stats_set(_KMA_DAY or _today(), _STATS["ok"], _STATS["ret"], _STATS["done"])
+    except Exception:
+        pass
+
+
+def _bump(key):
+    """Naikkan stat + tulis DB (write-through)."""
+    _STATS[key] += 1
+    _save_stats()
 
 
 def _log(color, tag, msg, detail=""):
@@ -306,6 +429,11 @@ def ask_folders():
     cfg = load_cfg()
     ind = Path(cfg.get("input_folder", str(BASE / "input")))
     retd = Path(cfg.get("return_folder", str(BASE / "return")))
+    saved_ricoh = (cfg.get("ricoh_folder") or "").strip()
+    if os.environ.get("NSH_NO_PROMPT") == "1":
+        udad = Path(cfg.get("uda_folder", str(ind.parent / "Uda")))
+        print(f"  {D}pakai tersimpan (auto-restart).{RST}")
+        return ind, retd, udad, (Path(saved_ricoh) if saved_ricoh else None)
     _banner()
     print()
     print(f"  {W}Setup Folder{RST}  {D}(Enter = pakai yang tersimpan){RST}")
@@ -313,6 +441,7 @@ def ask_folders():
     for label, val in [("INPUT ", ind), ("RETURN", retd)]:
         print(f"    {label} : {C}{val}{RST}")
     print(f"  Hot Folder server : {C}{HOT_SERVER}{RST}")
+    print(f"  Watcher RICOH     : {C}{saved_ricoh or '(mati)'}{RST}")
     print(f"  ------------------------------------------------------")
     try:
         a = input(f"  Folder INPUT?  Copas path (Enter=tetap): ").strip().strip('"').strip("'")
@@ -328,12 +457,22 @@ def ask_folders():
         udad = Path(c) if c else uda_default
         if c or "uda_folder" not in cfg:
             cfg["uda_folder"] = str(udad)
+        d = input(f"  Folder RICOH watcher? Copas path (Enter=tetap, '-' = matikan): ").strip().strip('"').strip("'")
+        if d == "-":
+            cfg["ricoh_folder"] = ""
+        elif d:
+            cfg["ricoh_folder"] = d
+        elif "ricoh_folder" not in cfg:
+            cfg["ricoh_folder"] = ""
         save_cfg(cfg)
         print(f"  {D}tersimpan -> route.json{RST}\n")
     except (EOFError, KeyboardInterrupt):
         print(f"\n{D}Setup dibatalkan, pakai tersimpan.{RST}\n")
         udad = Path(cfg.get("uda_folder", str(ind.parent / "Uda")))
-    return ind, retd, udad
+        if "ricoh_folder" not in cfg:
+            cfg["ricoh_folder"] = ""
+    ricoh = (cfg.get("ricoh_folder") or "").strip()
+    return ind, retd, udad, (Path(ricoh) if ricoh else None)
 
 
 def _is_unc(p: Path) -> bool:
@@ -433,9 +572,9 @@ def route_one(fn: Path, indir: Path, retdir: Path, udadir: Path):
     pair = ROUTE.get(bahan)
     if not pair:
         dst = _safe_move(fn, retdir)
-        _STATS["ret"] += 1
         _log(Y, "[KMA-E06]", _short(f"{name} -> RETURN"), "bahan tidak ada folder")
-        _ev(name, bahan, "RETURN", "return", "bahan tidak ada folder")
+        if _ev(name, bahan, "RETURN", "return", "bahan tidak ada folder"):
+            _bump("ret")
         return False
     is_booklet = str(preset.get("repeat", "")).startswith("booklet")
     duplex = preset.get("duplex", "1s")
@@ -443,9 +582,9 @@ def route_one(fn: Path, indir: Path, retdir: Path, udadir: Path):
     folder = _folder(pair[1] if side == "2S" else pair[0])
     if not folder:
         dst = _safe_move(fn, retdir)
-        _STATS["ret"] += 1
         _log(Y, "[KMA-E07]", _short(f"{name} -> RETURN"), f"{bahan} tidak ada folder {side}")
-        _ev(name, bahan, "RETURN", "return", f"{bahan} tidak ada folder {side}")
+        if _ev(name, bahan, "RETURN", "return", f"{bahan} tidak ada folder {side}"):
+            _bump("ret")
         return False
     try:
         # 1. Pastikan file ADA di hot folder (nama asli):
@@ -492,9 +631,9 @@ def route_one(fn: Path, indir: Path, retdir: Path, udadir: Path):
         if _log_quiet((name, "KMA-E08"), R, "[KMA-E08]", _short(name), f"arsip ke Uda gagal: {e}"):
             _ev(name, bahan, folder, "error", f"arsip gagal: {str(e)[:60]}")
         return False
-    _STATS["ok"] += 1
     _log(G, "[ OK ]", _short(f"{name} -> {folder} (asli->Uda)"), ringkas(name))
-    _ev(name, bahan, folder, "ok", "asli->Uda")
+    if _ev(name, bahan, folder, "ok", "asli->Uda"):
+        _bump("ok")
     return True
 
 
@@ -538,9 +677,9 @@ def sweep_done(udadir: Path):
             seen.add(key)
             try:
                 _safe_move(fn, udadir)
-                _STATS["done"] += 1
                 _log(C, "[ DONE ]", _short(f"{folder}/Done -> Uda"), _short(fn.name))
-                _ev(fn.name, "?", folder, "done", "Done->Uda")
+                if _ev(fn.name, "?", folder, "done", "Done->Uda"):
+                    _bump("done")
             except PermissionError:
                 continue
             except OSError as e:
@@ -548,14 +687,57 @@ def sweep_done(udadir: Path):
                 _ev(fn.name, "?", folder, "error", f"Done gagal: {str(e)[:60]}")
 
 
+RICOH_POLL_S = 10  # fallback poll; utama = event watcher + tiap bangun loop
+_RICOH_SEEN = set()  # nama file ricoh tercatat hari ini (dibagi thread + loop)
+_RICOH_WAKE = threading.Event()  # dinyalakan watcher saat RICOH berubah
+
+
+def _ricoh_scan(ricohdir: Path, seen: set):
+    """Sekali scan folder RICOH: catat PDF baru ke DB (tanpa dipindah/diapa-apakan)."""
+    try:
+        files = _list_pdfs(ricohdir)
+    except Exception:
+        return seen
+    for fn in files:
+        if fn.name in seen:
+            continue
+        seen.add(fn.name)
+        _log(C, "[RICOH]", _short(fn.name), "file ricoh tercatat")
+        _ev(fn.name, guess_bahan(fn.name) or "Ricoh", "RICOH", "ricoh",
+            "watcher", machine="RICOH")
+    return seen
+
+
+def _ricoh_seen_init():
+    """Isi set terlihat dari events hari ini (anti-catat-ulang pasca-restart)."""
+    _RICOH_SEEN.clear()
+    _RICOH_SEEN.update(e["file"] for e in _EVENTS if e.get("status") == "ricoh")
+    return _RICOH_SEEN
+
+
+def _ricoh_loop(ricohdir: Path):
+    """Thread watcher RICOH: hanya baca + hitung, tak ada kaitan fungsi lain."""
+    _ricoh_seen_init()
+    _log(C, "[RICOH]", f"watcher aktif: {ricohdir}", f"{len(_RICOH_SEEN)} tercatat hari ini")
+    while True:
+        _RICOH_WAKE.wait(RICOH_POLL_S)  # bangun saat ada aksi ATAU tiap 10 dtk
+        _RICOH_WAKE.clear()
+        try:
+            _ricoh_scan(ricohdir, _RICOH_SEEN)
+            push_kma()
+        except Exception as e:
+            _log(Y, "[RICOH]", "scan gagal", str(e)[:60])
+
+
 _WAKE = threading.Event()  # dinyalakan watcher saat ada file masuk/berubah
 _WATCH_OK = False
 
 
-def _dir_watcher(path: Path):
-    """Thread: blokir di ReadDirectoryChangesW, set _WAKE saat ada aksi file.
+def _dir_watcher(path: Path, wake=None):
+    """Thread: blokir di ReadDirectoryChangesW, set event saat ada aksi file.
     Tanpa polling — bangun hanya kalau ada yang masuk/berubah/dihapus."""
     global _WATCH_OK
+    ev = wake if wake is not None else _WAKE
     import ctypes
     try:
         k32 = ctypes.windll.kernel32
@@ -571,20 +753,22 @@ def _dir_watcher(path: Path):
             ok = k32.ReadDirectoryChangesW(h, buf, 4096, False, 0x00000003,
                                            ctypes.byref(nbytes), None, None)
             if ok:
-                _WAKE.set()
+                ev.set()
             else:
                 break
         k32.CloseHandle(h)
     except Exception:
         return
     finally:
-        _WAKE.set()
+        ev.set()
 
 
 def watch_loop():
     _hub_flags()
-    indir, retdir, udadir = ask_folders()
-    _FOLDERS.update({"input": str(indir), "return": str(retdir), "uda": str(udadir)})
+    _ensure_day()
+    indir, retdir, udadir, ricohdir = ask_folders()
+    _FOLDERS.update({"input": str(indir), "return": str(retdir), "uda": str(udadir),
+                     "ricoh": str(ricohdir) if ricohdir else ""})
     for d, code in ((indir, "KMA-E02"), (retdir, "KMA-E03"), (udadir, "KMA-E04")):
         try:
             d.mkdir(parents=True, exist_ok=True)
@@ -598,26 +782,39 @@ def watch_loop():
     print(f"    Return : {C}{retdir}{RST}")
     print(f"    Uda    : {C}{udadir}{RST}")
     print(f"    Server : {C}{HOT_SERVER}{RST}")
+    print(f"    RICOH  : {C}{ricohdir if ricohdir else '(watcher mati)'}{RST}")
     print(f"  Legenda: {G}[ OK ] hot folder{RST}  {Y}[ RET ] RETURN[KMA-E06/E07]{RST}  {C}[ DONE ] Done->Uda{RST}  {R}[KMA-E01/E02/E03/E04/E05/E08/E09]{RST}  {D}| Ctrl+C stop{RST}")
     print(f"  Pemicu: aksi file di INPUT (event, bukan polling) + cek printer")
     print(f"  ------------------------------------------------------")
     threading.Thread(target=_dir_watcher, args=(indir,), daemon=True).start()
+    if ricohdir:
+        _ricoh_seen_init()
+        threading.Thread(target=_dir_watcher, args=(ricohdir, _RICOH_WAKE), daemon=True).start()
+        threading.Thread(target=_ricoh_loop, args=(ricohdir,), daemon=True).start()
     _time.sleep(1)
     if not _WATCH_OK:
         _log(Y, "[ WARN ]", "event watcher gagal", "fallback polling 30 detik")
     scan_once(indir, retdir, udadir)
     sweep_done(udadir)
+    cfg_mtime = _cfg_mtime()
     try:
         while True:
             _WAKE.wait(30)  # bangun saat ada aksi file; jaring pengaman 30 dtk
             _WAKE.clear()
+            if _cfg_mtime() != cfg_mtime:
+                _restart_self("route.json berubah")
+                return  # tak tercapai bila exec sukses
             if not server_ok_quiet():
                 _WAKE.wait(15)  # printer mati: cek pulih tiap 15 dtk
                 _WAKE.clear()
+                if ricohdir:
+                    _ricoh_scan(ricohdir, _RICOH_SEEN)
                 push_kma()
                 continue
             scan_once(indir, retdir, udadir)
             sweep_done(udadir)
+            if ricohdir:
+                _ricoh_scan(ricohdir, _RICOH_SEEN)
             push_kma()
     except KeyboardInterrupt:
         print(f"\n  {D}stop. OK={_STATS['ok']} RET={_STATS['ret']} DONE={_STATS['done']}{RST}")
@@ -626,12 +823,14 @@ def watch_loop():
 if __name__ == "__main__":
     if "--once" in sys.argv:
         _hub_flags()
+        _ensure_day()
         _banner()
         cfg = load_cfg()
         indir = Path(cfg.get("input_folder", str(BASE / "input")))
         retdir = Path(cfg.get("return_folder", str(BASE / "return")))
         udadir = Path(cfg.get("uda_folder", str(indir.parent / "Uda")))
         _FOLDERS.update({"input": str(indir), "return": str(retdir), "uda": str(udadir)})
+        _FOLDERS["ricoh"] = (cfg.get("ricoh_folder") or "").strip()
         for d, code in ((indir, "KMA-E02"), (retdir, "KMA-E03"), (udadir, "KMA-E04")):
             try:
                 d.mkdir(parents=True, exist_ok=True)
@@ -642,6 +841,9 @@ if __name__ == "__main__":
             raise SystemExit(1)
         scan_once(indir, retdir, udadir)
         sweep_done(udadir)
+        _rpath = (_FOLDERS.get("ricoh") or "").strip()
+        if _rpath:
+            _ricoh_scan(Path(_rpath), _ricoh_seen_init())
         push_kma()
         print(f"  {D}sekali jalan. OK={_STATS['ok']} RET={_STATS['ret']} DONE={_STATS['done']}{RST}")
     else:

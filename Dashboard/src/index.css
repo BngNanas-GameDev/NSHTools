@@ -364,11 +364,14 @@ body {
   .sidebar-desktop { display: none !important; }
   .mobile-menu-btn { display: flex !important; }
   .kpi-grid { grid-template-columns: repeat(2, 1fr) !important; }
+  .modul-grid { grid-template-columns: repeat(2, 1fr) !important; }
+  .wma-racks { grid-template-columns: 1fr !important; }
   .health-grid { grid-template-columns: 1fr !important; }
   .two-col { grid-template-columns: 1fr !important; }
 }
 @media (max-width: 640px) {
   .page-content { padding: 12px !important; }
+  .modul-grid { grid-template-columns: 1fr !important; }
   .three-col { grid-template-columns: 1fr !important; }
   .four-col { grid-template-columns: repeat(2, 1fr) !important; }
 }

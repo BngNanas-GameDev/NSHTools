@@ -30,6 +30,10 @@ export interface WmaEntry {
   operator?: string
   machine?: string
   files: string[]
+  customer?: string
+  verified?: boolean
+  sides?: string
+  laminating?: string
 }
 
 export interface NotaStatus {
@@ -60,6 +64,7 @@ export interface KmaRoute {
   status: string
   msg?: string
   ts: string
+  machine?: string
 }
 
 export interface KmaPrinter {
@@ -67,6 +72,7 @@ export interface KmaPrinter {
   role: string
   status: string
   active: boolean
+  machine?: string
 }
 
 export interface KmaRule {
@@ -87,12 +93,19 @@ export interface KmaState {
   stats: KmaStats
 }
 
+export interface OutputFile {
+  name: string
+  size?: number
+  ts?: number
+}
+
 export interface CommandResult {
   id: string
   action: string
   nota?: string
   module?: string
   folders?: Record<string, string>
+  files?: OutputFile[]
   ok: boolean
   msg: string
 }
@@ -105,14 +118,26 @@ export interface SendCommandOpts {
   machine?: string
   module?: string
   folders?: Record<string, string>
+  dest?: string
+  files?: string[]
+  operator?: string
 }
 
 export type ConnState = 'connecting' | 'open' | 'closed'
+
+export interface KmmaTimer {
+  next_in: number
+  interval: number
+}
 
 export interface HubState {
   conn: ConnState
   logs: HubLogEntry[]
   entries: WmaEntry[]
+  entriesAll: WmaEntry[]
+  verified: string[]
+  kmmaTimer: KmmaTimer | null
+  outputFiles: OutputFile[]
   statuses: Record<string, NotaStatus>
   modules: Record<string, ModuleState>
   details: Record<string, HubStep[]>
@@ -146,6 +171,18 @@ function handleIncoming(prev: HubState, d: unknown, cap: number): HubState {
     }
     case 'entries': {
       return { ...prev, entries: (msg.entries as WmaEntry[]) ?? [] }
+    }
+    case 'entries_all': {
+      return { ...prev, entriesAll: (msg.entries as WmaEntry[]) ?? [] }
+    }
+    case 'verified_update': {
+      return { ...prev, verified: (msg.verified as string[]) ?? [] }
+    }
+    case 'kmma_timer_update': {
+      return { ...prev, kmmaTimer: { next_in: Number(msg.next_in ?? 0), interval: Number(msg.interval ?? 180) } }
+    }
+    case 'output_update': {
+      return { ...prev, outputFiles: (msg.files as OutputFile[]) ?? [] }
     }
     case 'status_update': {
       const nota = String(msg.nota ?? '')
@@ -201,6 +238,7 @@ function handleIncoming(prev: HubState, d: unknown, cap: number): HubState {
         ok: msg.ok === true,
         msg: String(msg.msg ?? ''),
         folders: (msg.folders as Record<string, string> | undefined) ?? undefined,
+        files: (msg.files as OutputFile[] | undefined) ?? undefined,
       }
       const results = [...prev.results, res]
       if (results.length > 20) results.splice(0, results.length - 20)
@@ -212,6 +250,10 @@ function handleIncoming(prev: HubState, d: unknown, cap: number): HubState {
         ...prev,
         logs,
         entries: (msg.entries as WmaEntry[]) ?? [],
+        entriesAll: (msg.entries_all as WmaEntry[]) ?? [],
+        verified: (msg.verified as string[]) ?? [],
+        kmmaTimer: (msg.kmma_timer as KmmaTimer | null) ?? null,
+        outputFiles: (msg.output_files as OutputFile[]) ?? [],
         statuses: (msg.status as Record<string, NotaStatus>) ?? {},
         modules: (msg.modules as Record<string, ModuleState>) ?? {},
         details: (msg.steps as Record<string, HubStep[]>) ?? {},
@@ -228,6 +270,10 @@ export function useHub(url: string = defaultHubUrl(), maxLogs: number = MAX_LOGS
     conn: 'connecting',
     logs: [],
     entries: [],
+    entriesAll: [],
+    verified: [],
+    kmmaTimer: null,
+    outputFiles: [],
     statuses: {},
     modules: {},
     details: {},
@@ -248,6 +294,9 @@ export function useHub(url: string = defaultHubUrl(), maxLogs: number = MAX_LOGS
     if (opts?.machine) payload.machine = opts.machine
     if (opts?.module) payload.module = opts.module
     if (opts?.folders) payload.folders = opts.folders
+    if (opts?.dest) payload.dest = opts.dest
+    if (opts?.files) payload.files = opts.files
+    if (opts?.operator) payload.operator = opts.operator
     try {
       wsRef.current?.send(JSON.stringify(payload))
     } catch {
