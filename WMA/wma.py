@@ -26,12 +26,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))  # NSH Tools root: ui, ws_client
 sys.path.insert(0, str(Path(__file__).parent.parent / "Database"))  # db.py pusat
+sys.path.insert(0, str(Path(__file__).parent.parent / "NSH Lite"))  # bahan_dict kanonis
 try:
     import db as nshdb
     HAVE_DB = True
 except Exception:
     nshdb = None
     HAVE_DB = False
+try:
+    from bahan_dict import guess_bahan as _guess_bahan
+except Exception:
+    _guess_bahan = None
+try:
+    from konica_printer import resolve_bahan as _resolve_bahan
+except Exception:
+    _resolve_bahan = None
 
 from ui import (
     header, section, ok, err, warn, info, dim,
@@ -57,30 +66,62 @@ SYNC_INTERVAL_S = 60
 # ════════════════════════════════════════════════════════════════
 
 R_NOTA = re.compile(r"(ON\d{12})")
-R_BAHAN = re.compile(
-    r"(Ap\d+gr|Ac\d+gr|(?:Stiker|Sticker)\s+\w+|HVS|Concord|BC\s+\w+|Master|BNTU"
-    r"|NewToop\s*\d+\s*mic|Toop\s*\d+\s*mic|Art\s*Paper|Art\s*Carton|ArtPaper|ArtCarton"
-    r"|(?:Kertas\s+)?[KC]rom[oe]"
-    r"|Vinyl|Vyinil|Rajawali|Pindo|Jasmine|Ivory|Transparant|Hologram|Gold|Silver)",
-    re.I,
-)
+# R_BAHAN dibangun dari CANONICAL (sumber kebenaran) + pola tambahan; sinkron dengan KMMA
+try:
+    from bahan_dict import CANONICAL as _CANONICAL_WMA
+except Exception:
+    _CANONICAL_WMA = None
+
+def _build_r_bahan_wma():
+    extra = r"Ap\d+gr|Ac\d+gr|(?:Stiker|Sticker)\s+\w+|BC\s+\w+|Master|BNTU|NewToop\s*\d+\s*mic|Toop\s*\d+\s*mic|Art\s*Paper|Art\s*Carton|ArtPaper|ArtCarton|HVS|Concord"
+    if _CANONICAL_WMA:
+        canon_terms = sorted({k for k in _CANONICAL_WMA.keys()}, key=len, reverse=True)
+        canon_pat = "|".join(re.escape(t) for t in canon_terms)
+        typo_extra = r"Krom[oe]|Crom[oe]|Chromo|Vinyl|Vyinil|Vynil|Rajawali|Pindo|Jasmine|Ivory|Transparant|Hologram|Gold|Silver"
+        return re.compile(rf"({extra}|(?:Kertas\s+)?(?:{typo_extra})|{canon_pat})", re.I)
+    return re.compile(
+        r"(Ap\d+gr|Ac\d+gr|(?:Stiker|Sticker)\s+\w+|HVS|Concord|BC\s+\w+|Master|BNTU"
+        r"|NewToop\s*\d+\s*mic|Toop\s*\d+\s*mic|Art\s*Paper|Art\s*Carton|ArtPaper|ArtCarton"
+        r"|(?:Kertas\s+)?[KC]rom[oe]"
+        r"|Vinyl|Vyinil|Rajawali|Pindo|Jasmine|Ivory|Transparant|Hologram|Gold|Silver)",
+        re.I,
+    )
+
+R_BAHAN = _build_r_bahan_wma()
 R_TOTAL = re.compile(r"TOTAL\s*=\s*(\d+)\s*(BESAR|KECIL)", re.I)
 R_KISSCUT = re.compile(r"kiss\s*cut", re.I)
 R_DIECUT = re.compile(r"die\s*cut", re.I)
 R_PDF = re.compile(r"\.pdf$", re.I)
+R_TEST = re.compile(r"(?<![a-z])tes(t)?(?![a-z])", re.I)  # whole-word test/tes, case-insensitive (anti Contesa/PT Tesa)
 R_JOB_PREFIX = re.compile(r"^[A-Z]{2,}-\d+\s*-\s*")
 R_SIDES = re.compile(r"(?<![a-z0-9])([12])\s*s(?![a-z])", re.I)  # 1s / 2s
 R_LAM = re.compile(r"(?<![a-z])(doff?|glossy?)(?![a-z])", re.I)  # doff / glossy
 
 
 def extract_customer(filename, bahan=""):
-    """Judul job/pelanggan dari nama file: 'KNT-10030 - <CUSTOMER> _<bahan> ...'."""
+    """Judul job/pelanggan dari nama file: 'KNT-10030 - <CUSTOMER> _<bahan> ...'.
+    bahan = raw_bahan mentah (agar potong cocok); bila raw="" jangan potong,
+    fallback kanonik boundary (\\b)."""
     name = re.sub(r"\.pdf$", "", filename or "", flags=re.I).strip()
     name = R_JOB_PREFIX.sub("", name)
-    if bahan:
-        i = name.lower().find("_" + bahan.lower())
+    if bahan and bahan.strip():
+        bl = bahan.strip().lower()
+        low = name.lower()
+        # 1) potong di marker mentah "_<bahan>"
+        i = low.find("_" + bl)
         if i > 0:
             name = name[:i]
+        else:
+            # 2) fallback kanonik boundary: cari bahan sebagai kata terpisah tanpa underscore
+            #    (mis. kanonik "kromo" vs raw "cromo" sudah tertangani di caller via raw,
+            #     tapi bila raw="" kita coba boundary kata)
+            try:
+                m = re.search(r"\b" + re.escape(bl) + r"\b", low)
+                if m and m.start() > 0:
+                    # potong sebelum bahan, bersihkan trailing delimiter
+                    name = name[:m.start()].rstrip(" _-")
+            except Exception:
+                pass
     for pat in (r"\s+-\s*\(.*$", r"\s+TOTAL\s*=.*$",
                 r"\s*\([^()]*ON\d{12}[^()]*\)\s*$"):
         name = re.sub(pat, "", name, flags=re.I).strip()
@@ -156,13 +197,37 @@ def parse_pdf_filename(filename):
     if m:
         result["nota"] = m.group(1)
 
-    # bahan
+    # bahan (regex lokal sbg basis) lalu kanonisasi via pipeline yang sama
+    # dgn KMA/Lite (guess_bahan + resolve_bahan), mis. "Stiker Cromo"
+    # (typo) -> "Stiker Kromo". Regex dipertahankan sbg fallback utk bahan
+    # yg tak ada di kamus (Master/BNTU/Toop/Art Paper/BC).
     m = R_BAHAN.search(filename)
+    raw_bahan = m.group(1).strip() if m else ""
     if m:
-        result["bahan"] = m.group(1).strip()
+        result["bahan"] = raw_bahan
+    try:
+        if _guess_bahan is not None:
+            _canon = _guess_bahan(filename)
+            if _canon:
+                result["bahan"] = (_resolve_bahan(filename, _canon)
+                                   if _resolve_bahan is not None else _canon)
+    except Exception:
+        pass
 
-    # customer (butuh bahan dulu untuk marker potong)
-    result["customer"] = extract_customer(filename, result["bahan"] or "")
+    # customer: pakai bahan MENTAH (sesuai teks file) agar marker potong cocok;
+    # bahan kanonis (mis. Cromo->Kromo) tak ada di teks file.
+    # bila raw=="" jangan potong pakai kanonis langsung — biarkan fallback boundary di extract_customer
+    if raw_bahan:
+        result["customer"] = extract_customer(filename, raw_bahan)
+    else:
+        # raw kosong: jangan potong pakai kanonis mentah; panggil dengan "" (tak potong)
+        # atau bila kanon ada, biarkan extract_customer coba fallback boundary kata
+        # tapi hanya bila kanon berbeda dari raw (mis. deteksi typo tanpa capture regex)
+        _canon_for_customer = result.get("bahan") or ""
+        if _canon_for_customer and _canon_for_customer.lower() not in (filename or "").lower():
+            result["customer"] = extract_customer(filename, "")
+        else:
+            result["customer"] = extract_customer(filename, _canon_for_customer if _canon_for_customer else "")
 
     # qty + jenis
     m = R_TOTAL.search(filename)
@@ -242,16 +307,22 @@ def aggregate_by_nota(rows):
             print(f"  {warn(f'skip tanpa nota: {fname[:50]}')}")
             continue
 
-        # key = (nota, bahan, sides, laminating)
+        # file TEST: grup sendiri + flag (tampil dgn Tag TEST di Menunggu
+        # Aksi, tak diproses KMMA) — tak boleh menyeret se-nota ikut skip
+        is_test = bool(R_TEST.search(fname))
+        # key = (nota, bahan, sides, laminating, test, process_type):
+        # DIGITAL vs KISSCUT/DIECUT se-nota = baris beda, jangan gabung
         sides = parsed.get("sides") or ""
         lam = parsed.get("laminating") or ""
-        key = (nota, bahan, sides, lam)
+        proc = parsed.get("process_type") or ""
+        key = (nota, bahan, sides, lam, is_test, proc)
 
         if key not in groups:
             groups[key] = {
                 "nota": nota,
                 "bahan": bahan,
                 "customer": parsed["customer"] or "",
+                "test": is_test,
                 "sides": sides,
                 "laminating": lam,
                 "total_qty": 0,
@@ -351,6 +422,7 @@ def show_daily():
         sides = e.get("sides", "") or ""
         lam = e.get("laminating", "") or ""
         tag = f" [{sides.upper()}" + (f"/{lam.upper()}" if lam else "") + "]" if sides or lam else ""
+        tag += " [TEST]" if e.get("test") else ""
 
         cat = proc.upper()
         print(f"  {i:>2}. {BOLD}{nota}{RESET}  [{CYAN}{cat}{RESET}]  {cust} | {bahan} x {qty} {jenis}  |  {op}  |  {mac}{tag}")
@@ -364,28 +436,49 @@ def show_daily():
 # SECTION 10: KMMA STATE (skip nota yang sudah diproses)
 # ════════════════════════════════════════════════════════════════
 
+def _ekey(e):
+    return (e.get("nota") or "", e.get("bahan") or "", e.get("sides") or "",
+            e.get("laminating") or "", 1 if e.get("test") else 0,
+            e.get("process_type") or "")
+
+
 def get_processed_notas():
-    """Set nota yang sudah diproses/skip — sumber utama Database."""
+    """Set KUNCI BARIS yang sudah diproses — hanya completed+skip_forever.
+    Retry (skipped) tetap antre; per-baris agar varian se-nota yg belum diproses tetap antre."""
     if HAVE_DB:
         try:
             with nshdb.get_conn() as con:
-                return {r[0] for r in con.execute("SELECT nota FROM kmma_state")}
+                return {(r[0], r[1] or "", r[2] or "", r[3] or "", r[4] or 0, r[5] or "")
+                        for r in con.execute(
+                            "SELECT nota,bahan,sides,laminating,test,process_type FROM kmma_state"
+                            " WHERE status IN ('completed','skip_forever')")}
         except Exception:
             pass
     processed = set()
     try:
         data = json.loads(KMMA_PATH.read_text(encoding="utf-8"))
-        # completed: nota → timestamp
-        processed.update(data.get("completed", {}).keys())
-        # skip_forever: nota → reason
-        processed.update(data.get("skip_forever", {}).keys())
-        # skipped_nota: nota → {reason, last_try}
-        processed.update(data.get("skipped_nota", {}).keys())
+        # kunci komposit "nota||bahan||sides||lam||1/0[||proc]"; legacy nota-only = semua varian
+        for section in ("completed", "skip_forever"):
+            for k in (data.get(section, {}) or {}).keys():
+                parts = str(k).split("||")
+                if len(parts) >= 6:
+                    processed.add((parts[0], parts[1], parts[2], parts[3], int(parts[4] or 0), parts[5]))
+                elif len(parts) == 5:
+                    processed.add((parts[0], parts[1], parts[2], parts[3], int(parts[4] or 0), ""))
+                else:
+                    processed.add((str(k), None, None, None, None, None))  # legacy: cocok semua
     except FileNotFoundError:
         pass
     except Exception:
         pass
     return processed
+
+
+def _row_done(row, processed):
+    k = _ekey(row)
+    if k in processed:
+        return True
+    return any(p[0] == k[0] and p[1] is None for p in processed)  # legacy nota-only
 
 
 # ════════════════════════════════════════════════════════════════
@@ -414,6 +507,9 @@ def sync(date_str=None, ws_client=None):
     if not rows:
         print(f"  {warn('tidak ada file selesai hari ini')}")
         save_daily([], date_str)
+        # antrean live hub ikut dikosongkan agar tak jadi hantu
+        if ws_client and ws_client.connected:
+            ws_client.send_entries([])
         return
 
     # aggregate
@@ -421,10 +517,10 @@ def sync(date_str=None, ws_client=None):
     print(f"  {ok(f'{len(entries)} nota (setelah agregasi)')}")
     print()
 
-    # filter: hapus nota yang sudah diproses KMMA
+    # filter: hapus BARIS yang sudah diproses KMMA (per-baris, bukan per-nota)
     processed = get_processed_notas()
     before = len(entries)
-    entries = [e for e in entries if e["nota"] not in processed]
+    entries = [e for e in entries if not _row_done(e, processed)]
     skipped = before - len(entries)
     if skipped:
         print(f"  {dim(f'hapus {skipped} nota sudah diproses KMMA')}")
@@ -434,6 +530,9 @@ def sync(date_str=None, ws_client=None):
     if not entries:
         print(f"  {warn('semua nota sudah diproses KMMA')}")
         save_daily([], date_str)
+        # antrean live hub ikut dikosongkan agar tak jadi hantu
+        if ws_client and ws_client.connected:
+            ws_client.send_entries([])
         return
 
     for i, e in enumerate(entries, 1):
@@ -448,6 +547,7 @@ def sync(date_str=None, ws_client=None):
         sides = e.get("sides", "") or ""
         lam = e.get("laminating", "") or ""
         tag = f" [{sides.upper()}" + (f"/{lam.upper()}" if lam else "") + "]" if sides or lam else ""
+        tag += " [TEST]" if e.get("test") else ""
 
         cat = proc.upper()
         print(f"  {i:>2}. {BOLD}{nota}{RESET}  [{CYAN}{cat}{RESET}]  {cust} | {bahan} x {qty} {jenis}  |  {op}  |  {mac}{tag}")
@@ -469,6 +569,17 @@ def sync(date_str=None, ws_client=None):
 # SECTION 12: MAIN
 # ════════════════════════════════════════════════════════════════
 
+def _wait_ws(ws_client, timeout=8.0):
+    """Tunggu WS tersambung sebentar (single-run --hub agar push tak hilang
+    karena thread connect belum selesai). Return True bila tersambung."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if ws_client is not None and ws_client.connected:
+            return True
+        time.sleep(0.5)
+    return bool(ws_client is not None and ws_client.connected)
+
+
 def main():
     args = sys.argv[1:]
 
@@ -488,6 +599,7 @@ def main():
         ws_client = WSClient("wma", hub_url=hub_url)
         ws_client.connect()
         print(f"  {ok('WebSocket client started')}")
+        _wait_ws(ws_client)
 
     # --date DATE
     date_str = None
@@ -524,7 +636,9 @@ def main():
             try:
                 date_str_w = date_str or datetime.date.today().isoformat()
                 rows = fetch_completed(date_str_w)
-                current_hash = json.dumps([r.get("filename", "") for r in rows], sort_keys=True)
+                # hash mencakup status + verified (perubahan status tanpa file baru WAJIB sync)
+                current_hash = json.dumps([(r.get("filename", ""), r.get("status", ""),
+                                            bool(r.get("verified", False))) for r in rows], sort_keys=True)
 
                 if current_hash != last_hash:
                     last_hash = current_hash

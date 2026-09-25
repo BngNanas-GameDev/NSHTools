@@ -9,7 +9,8 @@ def llm_parse_filename(filename):
     tmp = re.sub(r'\.pdf$', '', tmp, flags=re.I)
     return tmp
 
-STIKER_1S = {"Vinyl", "Hologram", "Gold", "Silver", "Stiker HVS"}
+STIKER_1S = {"Vinyl", "Hologram", "Gold", "Silver", "Stiker HVS",
+             "Stiker", "Stiker Kromo", "Transparant"}
 
 
 def parse_duplex(filename):
@@ -31,6 +32,10 @@ def parse_duplex(filename):
     if _b in STIKER_1S:
         return "1s"
     if _b == "Kromo" and ("stiker" in low or "sticker" in low):
+        return "1s"
+    # bahan generik tak tertebak kamus (guess=None) tapi jelas stiker-like:
+    # paksa 1s agar tak jatuh ke RETURN E07 (stiker tak punya folder 2S).
+    if _b is None and any(k in low for k in ("stiker", "sticker", "transparant", "vinyl")):
         return "1s"
     if ("data sama" in low or "datasama" in low
             or "bolak balik sama" in low or "gambar sama" in low

@@ -10,7 +10,7 @@ echo   Tanpa argumen = watcher  ^|  Dengan argumen = sekali jalan
 echo ============================================================
 echo.
 if "%~1"=="" (
-  echo  [Watcher] pantau folder input setiap 2 detik
+  echo  [Watcher] pantau folder input setiap 1 detik
   echo  [Cooldown] 5 detik anti-spam  ^|  3x gagal -^> .txt ERROR
   echo.
   python lite.py

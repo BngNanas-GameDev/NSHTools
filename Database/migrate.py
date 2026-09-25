@@ -23,24 +23,46 @@ def read_json(path):
         return None
 
 
+def _row_variants(nota):
+    """Varian baris (bahan,sides,laminating,test,process_type) nota tsb dari wma_seen.
+    Fallback [kosong] bila tak ada (perilaku lama)."""
+    try:
+        with get_conn() as con:
+            rows = [tuple(r) for r in con.execute(
+                "SELECT DISTINCT bahan,sides,laminating,test,process_type FROM wma_seen WHERE nota=?",
+                (nota,))]
+        return rows or [("", "", "", 0, "")]
+    except Exception:
+        return [("", "", "", 0, "")]
+
+
 def main():
     init_db()
     counts = {}
 
     # KMMA: completed / skip_forever / skipped_nota -> kmma_state
+    # (kunci legacy per-nota direplikasi per varian baris agar tak salah blokir)
     n = 0
     kmma = read_json(TOOLS / "KMMA" / "kmma.json") or {}
     for nota, t in (kmma.get("completed") or {}).items():
-        kmma_set(nota, "completed", "", t if isinstance(t, str) else "")
-        n += 1
+        for (b, s, l, tst, p) in _row_variants(nota):
+            kmma_set(nota, "completed", "", t if isinstance(t, str) else "",
+                     bahan=b or "", sides=s or "", laminating=l or "", test=bool(tst),
+                     process_type=p or "")
+            n += 1
     for nota, reason in (kmma.get("skip_forever") or {}).items():
-        kmma_set(nota, "skip_forever", str(reason))
-        n += 1
+        for (b, s, l, tst, p) in _row_variants(nota):
+            kmma_set(nota, "skip_forever", str(reason),
+                     bahan=b or "", sides=s or "", laminating=l or "", test=bool(tst),
+                     process_type=p or "")
+            n += 1
     for nota, v in (kmma.get("skipped_nota") or {}).items():
         v = v or {}
-        kmma_set(nota, "skipped", str(v.get("reason", "")),
-                 str(v.get("last_try", "")))
-        n += 1
+        for (b, s, l, tst, p) in _row_variants(nota):
+            kmma_set(nota, "skipped", str(v.get("reason", "")),
+                     str(v.get("last_try", "")), bahan=b or "", sides=s or "",
+                     laminating=l or "", test=bool(tst), process_type=p or "")
+            n += 1
     counts["kmma_state"] = n
 
     # WMA: wma_daily.json -> wma_entries ; wma.json -> config

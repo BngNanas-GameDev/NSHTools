@@ -1,4 +1,37 @@
 {
-  "date": "2026-09-24",
-  "entries": []
+  "date": "2026-09-25",
+  "entries": [
+    {
+      "nota": "ON202609250041",
+      "bahan": "Ac260gr",
+      "customer": "AstonHotel01_TEST1",
+      "test": true,
+      "sides": "1s",
+      "laminating": "doff",
+      "total_qty": 100,
+      "jenis": "BESAR",
+      "process_type": null,
+      "operator": "Nanas",
+      "machine": "Ricoh",
+      "files": [
+        "AstonHotel01_TEST1_Ac260gr 1s_MAP (uk.426x303mm) (1d1 = 100 KECIL) - (Doff 2s+Potong+Sayap) TOTAL = 100 BESAR (1s) (C688635BL-ON202609250041).pdf"
+      ]
+    },
+    {
+      "nota": "ON202609250003",
+      "bahan": "Ap150gr",
+      "customer": "Vany01 _TEST 1",
+      "test": true,
+      "sides": "1s",
+      "laminating": "",
+      "total_qty": 125,
+      "jenis": "BESAR",
+      "process_type": null,
+      "operator": "Nanas",
+      "machine": "Ricoh",
+      "files": [
+        "Vany01 _TEST 1_Ap150gr 1s (uk.148x210mm) (1d4 = 500 KECIL) - (Potong Bleed 2mm) TOTAL = 125 BESAR (1s) (L688590DP-ON202609250003).pdf"
+      ]
+    }
+  ]
 }

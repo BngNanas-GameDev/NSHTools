@@ -70,29 +70,70 @@ API_DELAY = 5
 NOTA_RETRY = 180  # jeda retry bila nota tak ada di KM
 AUTO_INTERVAL = 180  # proses ulang otomatis tiap 3 menit (watch mode)
 
-R_BAHAN = re.compile(
-    r"(Ap\d+gr|Ac\d+gr|(?:Stiker|Sticker)\s+\w+|HVS|Concord|BC\s+\w+|Master|BNTU"
-    r"|NewToop\s*\d+\s*mic|Toop\s*\d+\s*mic|Art\s*Paper|Art\s*Carton"
-    r"|(?:Kertas\s+)?[KC]rom[oe]"
-    r"|Vinyl|Vyinil|Rajawali|Pindo|Jasmine|Ivory|Transparant|Hologram|Gold|Silver)",
-    re.I,
-)
+try:
+    from bahan_dict import CANONICAL as _CANONICAL_KMMA
+except Exception:
+    try:
+        import sys as _sys_k
+        from pathlib import Path as _Path_k
+        _sys_k.path.insert(0, str(_Path_k(__file__).parent.parent / "NSH Lite"))
+        from bahan_dict import CANONICAL as _CANONICAL_KMMA
+    except Exception:
+        _CANONICAL_KMMA = None
+
+def _build_r_bahan():
+    # sumber kebenaran: bahan_dict.CANONICAL + pola tambahan (Master/BNTU/BC/Toop/ArtPaper)
+    extra = r"Ap\d+gr|Ac\d+gr|(?:Stiker|Sticker)\s+\w+|BC\s+\w+|Master|BNTU|NewToop\s*\d+\s*mic|Toop\s*\d+\s*mic|Art\s*Paper|Art\s*Carton|ArtPaper|ArtCarton|HVS|Concord"
+    if _CANONICAL_KMMA:
+        canon_terms = sorted({k for k in _CANONICAL_KMMA.keys()}, key=len, reverse=True)
+        # canonical sudah cover vinyl/vyinil via TYPO_MAP, tapi regex harus tangkap ambos
+        canon_pat = "|".join(re.escape(t) for t in canon_terms)
+        # tambah varian typo yang ada di TYPO_MAP: cromo/vyinil dkk agar regex tetap tangkap raw mentah
+        typo_extra = r"Krom[oe]|Crom[oe]|Chromo|Vinyl|Vyinil|Vynil|Rajawali|Pindo|Jasmine|Ivory|Transparant|Hologram|Gold|Silver"
+        return re.compile(rf"({extra}|(?:Kertas\s+)?(?:{typo_extra})|{canon_pat})", re.I)
+    return re.compile(
+        r"(Ap\d+gr|Ac\d+gr|(?:Stiker|Sticker)\s+\w+|HVS|Concord|BC\s+\w+|Master|BNTU"
+        r"|NewToop\s*\d+\s*mic|Toop\s*\d+\s*mic|Art\s*Paper|Art\s*Carton|ArtPaper|ArtCarton"
+        r"|(?:Kertas\s+)?[KC]rom[oe]"
+        r"|Vinyl|Vyinil|Rajawali|Pindo|Jasmine|Ivory|Transparant|Hologram|Gold|Silver)",
+        re.I,
+    )
+
+R_BAHAN = _build_r_bahan()
 R_NOTA = re.compile(r"(ON\d{12})")
 R_TOTAL = re.compile(r"TOTAL\s*=\s*(\d+)\s*(BESAR|KECIL)", re.I)
 R_KISSCUT = re.compile(r"kiss\s*cut", re.I)
 R_DIECUT = re.compile(r"die\s*cut", re.I)
-R_TEST = re.compile(r"tes", re.I)  # TEST / tes / test1 (nama pelanggan atau file)
 R_KTN = re.compile(r"ktn|kartu\s*nama", re.I)  # KTN / KartuNama / Kartu Nama
 
 
-def _is_test_entry(entry):
-    """True bila customer atau salah satu file mengandung TEST."""
-    if R_TEST.search(entry.get("customer") or ""):
-        return True
-    for fn in entry.get("files", []) or []:
-        if R_TEST.search(fn or ""):
-            return True
-    return False
+def ekey(entry):
+    """Kunci baris (nota,bahan,sides,laminating,test,process_type)."""
+    e = entry or {}
+    return (e.get("nota") or "", e.get("bahan") or "", e.get("sides") or "",
+            e.get("laminating") or "", 1 if e.get("test") else 0,
+            e.get("process_type") or "")
+
+
+def skey(key):
+    """Kunci string kanonis (JSON/hub/dashboard). proc '' = digital/lama."""
+    try:
+        n, b, s, l, t = key[0], key[1], key[2], key[3], key[4]
+        p = key[5] if len(key) > 5 else ""
+    except Exception:
+        return str(key)
+    return "||".join([n or "", b or "", s or "", l or "",
+                      "1" if t else "0", p or ""])
+
+
+def _cfg_lookup(d, key):
+    """Cari kunci komposit, fallback legacy nota-only (data lama)."""
+    if not isinstance(d, dict):
+        return None
+    hit = d.get(skey(key))
+    if hit is not None:
+        return hit
+    return d.get(key[0])
 
 
 def _is_ktn_entry(entry):
@@ -123,7 +164,7 @@ def _load_cfg_file():
     try:
         cfg = json.loads(CFG_PATH.read_text(encoding="utf-8"))
         # tolerate list → dict untuk semua dict-type fields
-        for key in ("skipped_nota", "skip_forever", "completed"):
+        for key in ("skipped_nota", "skip_forever", "completed", "manual"):
             if isinstance(cfg.get(key), list):
                 cfg[key] = {}
         return cfg
@@ -145,37 +186,93 @@ def _save_cfg_file(cfg):
 
 
 def load_cfg():
-    """Sumber utama: Database. Fallback: JSON cadangan."""
+    """Sumber utama: Database. Fallback: JSON cadangan.
+    Dict berkunci skey komposit (legacy nota-only tetap terbaca via fallback)."""
     if HAVE_DB:
         try:
-            return {
-                "completed": {n: v["updated_at"]
+            out = {
+                "completed": {skey(n): v["updated_at"]
                               for n, v in nshdb.kmma_by_status("completed").items()},
-                "skip_forever": {n: v["reason"]
+                "skip_forever": {skey(n): v["reason"]
                                  for n, v in nshdb.kmma_by_status("skip_forever").items()},
-                "skipped_nota": {n: {"reason": v["reason"], "last_try": v["updated_at"]}
+                "skipped_nota": {skey(n): {"reason": v["reason"], "last_try": v["updated_at"]}
                                  for n, v in nshdb.kmma_by_status("skipped").items()},
             }
+            # manual juga dipulihkan untuk is_completed/should_skip fallback dan dashboard
+            try:
+                out["manual"] = {skey(n): {"reason": v["reason"], "updated_at": v["updated_at"]}
+                                 for n, v in nshdb.kmma_by_status("manual").items()}
+            except Exception:
+                out["manual"] = {}
+            return out
         except Exception:
             pass
     return _load_cfg_file()
 
 
+def _parse_skey(k):
+    """'nota||...||1/0[||proc]' -> tuple; 5-part lama (tanpa proc) dipad '';
+    legacy nota-only -> kunci kosong."""
+    try:
+        p = str(k).split("||")
+        if len(p) == 6:
+            return (p[0], p[1], p[2], p[3], 1 if p[4] == "1" else 0, p[5])
+        if len(p) == 5:
+            return (p[0], p[1], p[2], p[3], 1 if p[4] == "1" else 0, "")
+    except Exception:
+        pass
+    return (str(k), "", "", "", 0, "")
+
+
 def save_cfg(cfg):
-    """Tulis Database (utama) + JSON cadangan."""
+    """Tulis Database (utama) + JSON cadangan. Kunci komposit diurai kembali."""
     if HAVE_DB:
         try:
             for nota, t in (cfg.get("completed") or {}).items():
-                nshdb.kmma_set(nota, "completed", "", t if isinstance(t, str) else "")
+                _k = _parse_skey(nota)
+                nshdb.kmma_set(_k[0], "completed", "", t if isinstance(t, str) else "",
+                               bahan=_k[1], sides=_k[2], laminating=_k[3], test=bool(_k[4]),
+                               process_type=_k[5] if len(_k) > 5 else "")
             for nota, reason in (cfg.get("skip_forever") or {}).items():
-                nshdb.kmma_set(nota, "skip_forever", str(reason))
+                _k = _parse_skey(nota)
+                nshdb.kmma_set(_k[0], "skip_forever", str(reason), "",
+                               bahan=_k[1], sides=_k[2], laminating=_k[3], test=bool(_k[4]),
+                               process_type=_k[5] if len(_k) > 5 else "")
             for nota, v in (cfg.get("skipped_nota") or {}).items():
                 v = v or {}
-                nshdb.kmma_set(nota, "skipped", str(v.get("reason", "")),
-                               str(v.get("last_try", "")))
+                _k = _parse_skey(nota)
+                nshdb.kmma_set(_k[0], "skipped", str(v.get("reason", "")),
+                               str(v.get("last_try", "")), bahan=_k[1], sides=_k[2],
+                               laminating=_k[3], test=bool(_k[4]),
+                               process_type=_k[5] if len(_k) > 5 else "")
+            for nota, v in (cfg.get("manual") or {}).items():
+                v = v or {}
+                _k = _parse_skey(nota)
+                reason = v.get("reason", "") if isinstance(v, dict) else str(v)
+                upd = v.get("updated_at", "") if isinstance(v, dict) else ""
+                nshdb.kmma_set(_k[0], "manual", str(reason), str(upd),
+                               bahan=_k[1], sides=_k[2], laminating=_k[3], test=bool(_k[4]),
+                               process_type=_k[5] if len(_k) > 5 else "")
         except Exception:
             pass
     _save_cfg_file(cfg)
+
+
+def sync_orders_to_db(client, date_str=None):
+    """Workflow 1: baca semua order KM (belum+selesai) dan snapshot ke km_orders hari ini."""
+    import datetime as _dt
+    if not HAVE_DB:
+        return []
+    date_str = date_str or _dt.date.today().isoformat()
+    try:
+        orders = client.fetch_orders_page() or []
+    except Exception:
+        return []
+    try:
+        nshdb.km_orders_replace(date_str, orders)
+    except Exception:
+        pass
+    return orders
 
 
 def load_daily():
@@ -207,28 +304,48 @@ def extract_total(filename):
 
 
 def match_bahan(filename_bahan, km_material_name):
-    """Cek apakah bahan dari filename match bahan KM."""
-    fb = filename_bahan.lower().replace(" ", "")
-    km = km_material_name.lower().replace(" ", "")
-    if fb in km:
+    """Cek apakah bahan dari filename match bahan KM — kanonik sinkron (kromo/cromo, vinyl/vyinil, dsb.)."""
+    fb = (filename_bahan or "").lower().replace(" ", "")
+    km = (km_material_name or "").lower().replace(" ", "")
+    if not fb or not km:
+        return False
+    if fb in km or km in fb:
         return True
     m_fn = re.match(r'(ap|ac)(\d+)', fb)
     if m_fn:
         prefix, num = m_fn.groups()
         if f"{num}gr" in km:
             return True
-    for name in ["stiker", "sticker", "concord", "hvs", "idcard", "id card",
-                  "newtoop", "toop", "artpaper", "artpaper", "kromo", "cromo",
-                  "vinyl", "vyinil", "rajawali", "pindo", "jasmine", "ivory",
-                  "transparant", "hologram", "gold", "silver"]:
+        # juga cek km punya ap/ac num
+        m_km = re.search(r'(ap|ac)(\d+)', km)
+        if m_km and m_km.group(2) == num:
+            return True
+    # daftar bahan sinkron CANONICAL + typo ; urut panjang agar "stiker hvs" prioritas
+    for name in ["stikerhvs", "stiker", "sticker", "concord", "concorde", "hvs", "idcard", "idcard", "newtoop", "toop",
+                  "artpaper", "artcarton", "kromo", "cromo", "chromo",
+                  "vinyl", "vyinil", "vynil", "vinil",
+                  "rajawali", "pindo", "jasmine", "ivory", "transparant", "hologram", "gold", "silver",
+                  "bc", "master", "bntu"]:
         if name in fb:
             variants = {"stiker": "sticker", "sticker": "stiker",
+                        "concorde": "concord", "concord": "concorde",
                         "newtoop": "toop", "toop": "newtoop",
-                        "kromo": "cromo", "cromo": "kromo",
-                        "vyinil": "vinyl"}
+                        "kromo": "cromo", "cromo": "kromo", "chromo": "kromo",
+                        "vyinil": "vinyl", "vynil": "vinyl", "vinil": "vinyl", "vinyl": "vyinil",
+                        "artpaper": "artpaper", "artcarton": "artcarton"}
             km_check = variants.get(name, name)
             if name in km or km_check in km:
                 return True
+            # via CANONICAL normalisasi tambahan
+            if _CANONICAL_KMMA:
+                try:
+                    from bahan_dict import TYPO_MAP as _TM
+                    norm_fb = _TM.get(name, name)
+                    norm_km_check = _TM.get(km_check, km_check)
+                    if norm_fb in km or norm_km_check in km:
+                        return True
+                except Exception:
+                    pass
     return False
 
 
@@ -466,47 +583,111 @@ class KMClient:
         return False, "save failed"
 
 
-def send_manual(nota, msg, ws_client=None):
-    """Tandai butuh aksi manual: status hub 'manual', TANPA skip permanen
-    (entri tetap di antrean, bisa diperbaiki via dashboard lalu retry)."""
+def send_manual(key, msg, ws_client=None):
+    """Tandai butuh aksi manual: persist DB status 'manual' + WS (restart tidak hilang).
+    TANPA skip permanen — entri tetap di antrean, bisa retry."""
+    nota = key[0] if isinstance(key, tuple) else key
+    now = datetime.datetime.now().isoformat()
+    # persist ke DB (skey komposit) agar restart tidak hilang
+    if isinstance(key, tuple):
+        if HAVE_DB:
+            try:
+                nshdb.kmma_set(key[0], "manual", str(msg), now,
+                               bahan=key[1], sides=key[2], laminating=key[3],
+                               test=bool(key[4]), process_type=key[5] if len(key) > 5 else "")
+            except Exception:
+                pass
+        # JSON cadangan untuk mode tanpa DB
+        try:
+            cfg = _load_cfg_file()
+            manu = cfg.get("manual", {})
+            manu[skey(key)] = {"reason": str(msg), "updated_at": now}
+            cfg["manual"] = manu
+            _save_cfg_file(cfg)
+        except Exception:
+            pass
+    else:
+        if HAVE_DB:
+            try:
+                nshdb.kmma_set(nota, "manual", str(msg), now)
+            except Exception:
+                pass
+        try:
+            cfg = _load_cfg_file()
+            manu = cfg.get("manual", {})
+            manu[nota] = {"reason": str(msg), "updated_at": now}
+            cfg["manual"] = manu
+            _save_cfg_file(cfg)
+        except Exception:
+            pass
     print(f"    {warn(f'{nota} MANUAL: {msg}')}")
     if ws_client and ws_client.connected:
-        ws_client.send_status(nota, "manual", msg)
+        ws_client.send_status(nota, "manual", msg, key=key if isinstance(key, tuple) else None)
 
 
-def log_skip(reason, nota):
+def log_skip(reason, key):
     if HAVE_DB:
         try:
-            nshdb.kmma_set(nota, "skip_forever", str(reason))
+            nshdb.kmma_set(key[0], "skip_forever", str(reason),
+                           bahan=key[1], sides=key[2], laminating=key[3],
+                           test=bool(key[4]),
+                           process_type=key[5] if len(key) > 5 else "")
         except Exception:
             pass
     cfg = _load_cfg_file()
     skip = cfg.get("skip_forever", {})
-    skip[nota] = reason
+    skip[skey(key)] = reason
     cfg["skip_forever"] = skip
     _save_cfg_file(cfg)
-    print(f"    {warn(f'{nota} SKIP: {reason}')}")
+    print(f"    {warn(f'{key[0]} SKIP: {reason}')}")
 
 
-def should_skip(nota):
+def should_skip(key):
+    """Manual/error/retry tidak skip; hanya skip_forever dan skipped dalam jendela retry."""
+    nota = key[0] if isinstance(key, tuple) else key
     if HAVE_DB:
         try:
-            r = nshdb.kmma_get(nota)
-            if r and r["status"] == "skip_forever":
-                return True
-            if r and r["status"] == "skipped":
-                try:
-                    last_dt = datetime.datetime.fromisoformat(r["updated_at"])
-                    if (datetime.datetime.now() - last_dt).total_seconds() < NOTA_RETRY:
-                        return True
-                except Exception:
-                    pass
-                return False
+            if isinstance(key, tuple):
+                r = nshdb.kmma_get(*key)
+            else:
+                r = nshdb.kmma_get(nota)
+            if r:
+                st = r.get("status")
+                if st == "skip_forever":
+                    return True
+                if st == "skipped":
+                    try:
+                        last_dt = datetime.datetime.fromisoformat(r["updated_at"])
+                        if (datetime.datetime.now() - last_dt).total_seconds() < NOTA_RETRY:
+                            return True
+                    except Exception:
+                        pass
+                    return False
+                if st in ("manual", "error", "completed"):
+                    return False
         except Exception:
             pass
     cfg = _load_cfg_file()
+    if isinstance(key, tuple):
+        if _cfg_lookup(cfg.get("skip_forever", {}), key) is not None:
+            return True
+        # manual/error tidak dianggap skip
+        if _cfg_lookup(cfg.get("manual", {}), key) is not None:
+            return False
+        retry = cfg.get("skipped_nota", {})
+        hit = _cfg_lookup(retry, key)
+        if hit is not None:
+            try:
+                last_dt = datetime.datetime.fromisoformat(hit["last_try"])
+                if (datetime.datetime.now() - last_dt).total_seconds() < NOTA_RETRY:
+                    return True
+            except Exception:
+                pass
+        return False
     if nota in cfg.get("skip_forever", {}):
         return True
+    if nota in cfg.get("manual", {}):
+        return False
     retry = cfg.get("skipped_nota", {})
     if nota in retry:
         try:
@@ -518,33 +699,41 @@ def should_skip(nota):
     return False
 
 
-def mark_nota_retry(nota, ws_client=None):
-    """Catat retry bila nota tak ada di KM. Retry tiap 3 mnt TANPA batas
+def mark_nota_retry(key, ws_client=None):
+    """Catat retry bila baris tak ada di KM. Retry tiap 3 mnt TANPA batas
     (sampai berhasil / di-skip manual). Kirim status 'retry' agar dashboard
     tak menampilkan baris hantu di Antrian. Return jumlah percobaan."""
     now = datetime.datetime.now().isoformat()
+    nota = key[0] if isinstance(key, tuple) else key
     count = 1
     if HAVE_DB:
         try:
-            r = nshdb.kmma_get(nota)
+            r = nshdb.kmma_get(*key) if isinstance(key, tuple) else nshdb.kmma_get(nota)
             if r and r["status"] == "skipped":
                 count = int(r.get("retries") or 0) + 1
         except Exception:
             pass
     else:
         try:
-            old = _load_cfg_file().get("skipped_nota", {}).get(nota, {})
-            count = int(old.get("count") or 0) + 1
+            old = _load_cfg_file().get("skipped_nota", {})
+            old = _cfg_lookup(old, key) if isinstance(key, tuple) else old.get(nota, {})
+            count = int((old or {}).get("count") or 0) + 1
         except Exception:
             count = 1
     if HAVE_DB:
         try:
-            nshdb.kmma_set(nota, "skipped", "kode tidak ada di list KM", now, retries=count)
+            if isinstance(key, tuple):
+                nshdb.kmma_set(key[0], "skipped", "kode tidak ada di list KM", now,
+                               retries=count, bahan=key[1], sides=key[2],
+                               laminating=key[3], test=bool(key[4]),
+                               process_type=key[5] if len(key) > 5 else "")
+            else:
+                nshdb.kmma_set(nota, "skipped", "kode tidak ada di list KM", now, retries=count)
         except Exception:
             pass
     cfg = _load_cfg_file()
     retry = cfg.get("skipped_nota", {})
-    retry[nota] = {
+    retry[skey(key) if isinstance(key, tuple) else nota] = {
         "reason": "kode tidak ada di list KM",
         "last_try": now,
         "count": count,
@@ -552,32 +741,45 @@ def mark_nota_retry(nota, ws_client=None):
     cfg["skipped_nota"] = retry
     _save_cfg_file(cfg)
     if ws_client and ws_client.connected:
-        ws_client.send_status(nota, "retry", f"tunggu 3 mnt (percobaan {count})")
+        ws_client.send_status(nota, "retry", f"tunggu 3 mnt (percobaan {count})",
+                              key=key if isinstance(key, tuple) else None)
     return count
 
 
-def mark_completed(nota):
+def mark_completed(key):
     now = datetime.datetime.now().isoformat()
     if HAVE_DB:
         try:
-            nshdb.kmma_set(nota, "completed", "", now)
+            if isinstance(key, tuple):
+                nshdb.kmma_set(key[0], "completed", "", now,
+                               bahan=key[1], sides=key[2],
+                               laminating=key[3], test=bool(key[4]),
+                               process_type=key[5] if len(key) > 5 else "")
+            else:
+                nshdb.kmma_set(key, "completed", "", now)
         except Exception:
             pass
     cfg = _load_cfg_file()
     completed = cfg.get("completed", {})
-    completed[nota] = now
+    completed[skey(key) if isinstance(key, tuple) else key] = now
     cfg["completed"] = completed
     _save_cfg_file(cfg)
 
 
-def is_completed(nota):
+def is_completed(key):
+    nota = key[0] if isinstance(key, tuple) else key
     if HAVE_DB:
         try:
-            r = nshdb.kmma_get(nota)
+            if isinstance(key, tuple):
+                r = nshdb.kmma_get(*key)
+            else:
+                r = nshdb.kmma_get(nota)
             return bool(r and r["status"] == "completed")
         except Exception:
             pass
     cfg = _load_cfg_file()
+    if isinstance(key, tuple):
+        return _cfg_lookup(cfg.get("completed", {}), key) is not None
     return nota in cfg.get("completed", {})
 
 
@@ -607,27 +809,28 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
         print(f"    {warn('NOTA tidak ditemukan di entry')}")
         return
 
-    # ATURAN: file TEST → skip permanen, jangan diproses ke KM
-    if _is_test_entry(entry):
-        log_skip("TEST", nota)
-        print(f"    {err(f'{nota} SKIP: TEST (file test, jangan diproses ke KM)')}")
+    key = ekey(entry)  # identitas baris (nota+bahan+sides+laminating+test)
+
+    # ATURAN: entri TEST tampil dgn Tag TEST di Menunggu Aksi, tak diproses ke KM
+    if entry.get("test"):
+        print(f"    {warn(f'{nota} TEST: file test, masuk Menunggu Aksi (tidak diproses ke KM)')}")
         if ws_client and ws_client.connected:
-            ws_client.send_status(nota, "error", "SKIP: TEST")
+            ws_client.send_status(nota, "manual", "TEST: file test", key=key)
         return
 
-    # ATURAN: KartuNama → qty file wajib ÷ 4 (override manual tak ikut dibagi)
+    # ATURAN: KartuNama → qty file wajib ÷ 4 (override manual tak ikut dibagi), minimal 1
     if _is_ktn_entry(entry) and not qty_manual:
         try:
             _qty_before = int(qty_file)
-            qty_file = _qty_before // 4
+            qty_file = max(1, _qty_before // 4)
             print(f"    {warn(f'{nota} KartuNama: qty {_qty_before} → {qty_file} (÷4)')}")
         except (ValueError, TypeError):
             pass
 
-    if should_skip(nota):
+    if should_skip(key):
         return
 
-    if is_completed(nota):
+    if is_completed(key):
         print(f"    {dim(f'{nota} sudah diproses')}")
         return
 
@@ -643,14 +846,13 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
             break
 
     if not matched:
-        n = mark_nota_retry(nota, ws_client)
+        n = mark_nota_retry(key, ws_client)
         print(f"    {warn(f'{nota} tidak ada di KM, retry 3 mnt (percobaan {n})')}")
         return
 
     if bahan_file and matched.get("bahan_km"):
         if not match_bahan(bahan_file, matched["bahan_km"]):
-            send_manual(nota, f"bahan tidak sesuai: {bahan_file} vs {matched['bahan_km']}", ws_client)
-            print(f"    {err(f'bahan: {bahan_file} vs {matched["bahan_km"]}')}")
+            send_manual(key, f"bahan tidak sesuai: {bahan_file} vs {matched['bahan_km']}", ws_client)
             return
 
     # qty validation: WMA v2 sudah aggregate total_qty per nota
@@ -659,8 +861,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
         try:
             qty_km_int = int(matched["qty_km"])
             if qty_file != qty_km_int:
-                send_manual(nota, f"jumlah tidak sesuai: {qty_file} vs {qty_km_int} (override qty manual / lewati)", ws_client)
-                print(f"    {err(f'qty: {qty_file} vs {qty_km_int}')}")
+                send_manual(key, f"jumlah tidak sesuai: {qty_file} vs {qty_km_int} (override qty manual / lewati)", ws_client)
                 return
         except ValueError:
             pass
@@ -677,11 +878,14 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
     if proc_type and len(detail["flow"]) > 2:
         step_names = [(s.get("step_name") or s.get("name") or "").lower() for s in detail["flow"]]
         for sn in step_names[1:-1]:
-            if "laminat" in sn or "finishing" in sn:
-                log_skip(f"ada step '{sn}' sebelum {proc_type}", nota)
+            # allowlist: hanya Digital A3+ | Kisscut | Diecut yang diproses KMMA;
+            # selain itu (Laminating*, Finishing*, Finishing A3+, dsb.) = divisi lain
+            # pakai regex agar "kiss cut"/"die cut" (spasi) tetap lolos
+            if not re.search(r"digital\s*a3\+", sn) and not re.search(r"kiss\s*cut", sn) and not re.search(r"die\s*cut", sn):
+                log_skip(f"ada step '{sn}' sebelum {proc_type}", key)
                 print(f"    {warn(f'{nota} SKIP: ada step {sn} sebelum {proc_type.upper()} — harus diselesaikan divisi lain')}")
                 if ws_client and ws_client.connected:
-                    ws_client.send_status(nota, "error", f"SKIP: ada step {sn} sebelum {proc_type.upper()}")
+                    ws_client.send_status(nota, "manual", f"SKIP: ada step {sn} sebelum {proc_type.upper()}", key=key)
                 return
 
     # ── untuk kisscut/diecut: proses Digital A3+ dulu, lalu step-nya ──
@@ -741,8 +945,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                 break
 
         if not digital_mac:
-            send_manual(nota, "mesin Digital A3+ tidak ditemukan", ws_client)
-            print(f"    {err(f'{nota} mesin Digital A3+ tidak ditemukan')}")
+            send_manual(key, "mesin Digital A3+ tidak ditemukan", ws_client)
             return
 
         # cari mesin Kisscut/Diecut (Vulcan)
@@ -758,14 +961,16 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                     finish_mac = mc
                     break
         if not finish_mac:
-            send_manual(nota, f"mesin {proc_type.upper()} tidak ditemukan", ws_client)
-            print(f"    {err(f'{nota} mesin {proc_type.upper()} tidak ditemukan')}")
+            send_manual(key, f"mesin {proc_type.upper()} tidak ditemukan", ws_client)
             return
 
-        # cari SDM (dari flow Digital A3+, operator sama)
+        # cari SDM (dari flow Digital A3+, operator sama) — guard operator kosong jangan random
         sdm_id = None
         sdm_name = ""
-        op_low = operator_wma.lower()
+        op_low = (operator_wma or "").strip().lower()
+        if not op_low:
+            send_manual(key, "operator kosong tidak di dropdown", ws_client)
+            return
         for s in digital_flow.get("sdm", []):
             s_low = s["name"].lower()
             if op_low in s_low or s_low in op_low:
@@ -773,8 +978,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                 sdm_name = s["name"]
                 break
         if not sdm_id:
-            send_manual(nota, f"operator {operator_wma} tidak di dropdown", ws_client)
-            print(f"    {err(f'{nota} operator {operator_wma} tidak di dropdown')}")
+            send_manual(key, f"operator {operator_wma} tidak di dropdown", ws_client)
             return
 
         qty_str = str(qty_file) if qty_file is not None else ""
@@ -861,7 +1065,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
             if not ok1:
                 _push_steps(("error", msg1), ("pending", ""))
                 if ws_client and ws_client.connected:
-                    ws_client.send_status(nota, "error", "gagal simpan Digital A3+")
+                    ws_client.send_status(nota, "error", "gagal simpan Digital A3+", key=key)
                 return
             _push_steps(("ok", ""), ("pending", ""))
             time.sleep(ACTION_DELAY)
@@ -876,13 +1080,13 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
         ok2, msg2 = _save_step(finish_step, finish_mac["idmachine"], "", sdm_id, qty_str, cat_label, finish_flow)
         if ok2:
             _push_steps(("ok", ""), ("ok", ""))
-            mark_completed(nota)
+            mark_completed(key)
             if ws_client and ws_client.connected:
-                ws_client.send_status(nota, "ok", f"{cat_label} | {bahan_km} x {qty_str} | {f_mac_name} | {sdm_name}")
+                ws_client.send_status(nota, "ok", f"{cat_label} | {bahan_km} x {qty_str} | {f_mac_name} | {sdm_name}", key=key)
         else:
             _push_steps(("ok", ""), ("error", msg2))
             if ws_client and ws_client.connected:
-                ws_client.send_status(nota, "error", msg2)
+                ws_client.send_status(nota, "error", msg2, key=key)
 
     else:
         # Digital A3+ biasa — single step
@@ -915,8 +1119,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                 mat_name = m["material_name"]
                 break
         if not mat_id:
-            send_manual(nota, f"bahan {bahan_file} tidak di dropdown", ws_client)
-            print(f"    {err(f'{nota} bahan {bahan_file} tidak di dropdown')}")
+            send_manual(key, f"bahan {bahan_file} tidak di dropdown", ws_client)
             return
 
         mac_id = None
@@ -941,13 +1144,15 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                     mac_name = mc["machine_name"]
                     break
         if not mac_id:
-            send_manual(nota, f"mesin {machine_wma} tidak di dropdown", ws_client)
-            print(f"    {err(f'{nota} mesin {machine_wma} tidak di dropdown')}")
+            send_manual(key, f"mesin {machine_wma} tidak di dropdown", ws_client)
             return
 
         sdm_id = None
         sdm_name = ""
-        op_low = operator_wma.lower()
+        op_low = (operator_wma or "").strip().lower()
+        if not op_low:
+            send_manual(key, "operator kosong tidak di dropdown", ws_client)
+            return
         for s in flow.get("sdm", []):
             s_low = s["name"].lower()
             if op_low in s_low or s_low in op_low:
@@ -955,8 +1160,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                 sdm_name = s["name"]
                 break
         if not sdm_id:
-            send_manual(nota, f"operator {operator_wma} tidak di dropdown", ws_client)
-            print(f"    {err(f'{nota} operator {operator_wma} tidak di dropdown')}")
+            send_manual(key, f"operator {operator_wma} tidak di dropdown", ws_client)
             return
 
         qty_str = str(qty_file) if qty_file is not None else ""
@@ -1000,15 +1204,15 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
         ok_flag, msg = client.save_flow(payload)
         if ok_flag:
             _push_single("ok")
-            mark_completed(nota)
+            mark_completed(key)
             print(f"    {ok(f'{nota} SIMPAN OK')}")
             if ws_client and ws_client.connected:
-                ws_client.send_status(nota, "ok", f"{cat_label} | {bahan_km} x {qty_str} | {mat_name} | {mac_name} | {sdm_name}")
+                ws_client.send_status(nota, "ok", f"{cat_label} | {bahan_km} x {qty_str} | {mat_name} | {mac_name} | {sdm_name}", key=key)
         else:
             _push_single("error", msg)
             print(f"    {err(f'{nota} SIMPAN gagal: {msg}')}")
             if ws_client and ws_client.connected:
-                ws_client.send_status(nota, "error", msg)
+                ws_client.send_status(nota, "error", msg, key=key)
 
 
 def run_entries(client, entries, orders_cache, username, password, ws_client=None, qty_override=None):
@@ -1024,6 +1228,36 @@ def run_entries(client, entries, orders_cache, username, password, ws_client=Non
         print(f"  {progress(i, len(entries))} {dim(entry.get('nota', '?') + ' ' + files_str[:45])}")
         process_entry(client, entry, orders_cache, ws_client=ws_client, qty_override=qty_override)
         time.sleep(ACTION_DELAY)
+
+
+def _find_entries_nota(nota):
+    """Cari entries satu nota: wma_daily.json dulu, fallback Database
+    (WMA memfilter nota yg sudah diproses dari file, shg retry dashboard
+    tetap bisa jalan). Return list (bisa kosong)."""
+    entries = [e for e in load_daily() if e.get("nota") == nota]
+    if entries or not HAVE_DB:
+        return entries
+    try:
+        today = datetime.date.today().isoformat()
+        yest = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        for _day in (today, yest):
+            try:
+                for e in nshdb.wma_seen_day(_day):
+                    if e.get("nota") == nota:
+                        entries.append(e)
+            except Exception:
+                pass
+            try:
+                for e in nshdb.wma_all(_day):
+                    if e.get("nota") == nota and e not in entries:
+                        entries.append(e)
+            except Exception:
+                pass
+            if entries:
+                break
+    except Exception:
+        pass
+    return entries
 
 
 def handle_kmma_command(cmd, client, username, password, ws_client=None):
@@ -1050,9 +1284,17 @@ def handle_kmma_command(cmd, client, username, password, ws_client=None):
         if not nota:
             reply(False, "nota kosong")
             return
-        log_skip(reason, nota)
-        if ws_client and ws_client.connected:
-            ws_client.send_status(nota, "error", f"SKIP: {reason}")
+        skip_entries = [e for e in load_daily() if e.get("nota") == nota]
+        if not skip_entries:
+            # nota tak ada di file: tandai kunci kosong (kompatibel lama)
+            log_skip(reason, (nota, "", "", "", 0))
+            if ws_client and ws_client.connected:
+                ws_client.send_status(nota, "manual", f"SKIP: {reason}")
+        for _se in skip_entries:
+            _sk = ekey(_se)
+            log_skip(reason, _sk)
+            if ws_client and ws_client.connected:
+                ws_client.send_status(nota, "manual", f"SKIP: {reason}", key=_sk)
         reply(True, f"{nota} dilewati permanen")
         return
 
@@ -1092,18 +1334,22 @@ def handle_kmma_command(cmd, client, username, password, ws_client=None):
         except (ValueError, TypeError):
             reply(False, f"qty tidak valid: {qty_cmd}")
             return
-    entries = [e for e in load_daily() if e.get("nota") == nota]
+    entries = _find_entries_nota(nota)
     if not entries:
-        reply(False, f"{nota} tidak ada di wma_daily.json")
+        reply(False, f"{nota} tidak ada di WMA hari ini (daily+DB)")
         return
     run_entries(client, entries, orders_cache, username, password, ws_client=ws_client, qty_override=qty_override)
     print(f"\n  {ok('selesai')}")
     cfg = load_cfg()
-    if nota in cfg.get("completed", {}):
+    comp, skips = cfg.get("completed", {}), cfg.get("skip_forever", {})
+    done_keys = [e for e in entries if _cfg_lookup(comp, ekey(e)) is not None]
+    skip_keys = [e for e in entries if _cfg_lookup(skips, ekey(e)) is not None]
+    if done_keys and len(done_keys) == len(entries):
         suffix = f" (qty {qty_override})" if qty_override is not None else ""
         reply(True, f"{nota} SIMPAN OK{suffix}")
-    elif nota in cfg.get("skip_forever", {}):
-        reply(False, f"{nota} SKIP: {cfg['skip_forever'][nota]}")
+    elif skip_keys:
+        _r = _cfg_lookup(skips, ekey(skip_keys[0]))
+        reply(False, f"{nota} SKIP: {_r}")
     else:
         reply(False, f"{nota} gagal, cek log KMMA")
 
@@ -1141,6 +1387,9 @@ def _run_watch(username, password, ws_client=None):
 
     def _process_now_inner():
         nonlocal login_fail_count
+
+        # Workflow 1: snapshot order KM harian (belum+selesai) ke DB
+        sync_orders_to_db(client)
 
         entries = load_daily()
         if not entries:

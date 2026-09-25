@@ -370,6 +370,14 @@ const LiveClock = () => {
 
 // ─── Page: Ringkasan ──────────────────────────────────────────────────────────
 
+// Kunci status kanonis per-baris: "nota||bahan||sides||lam||1/0||process_type"
+function rkey(e: { nota: string; bahan?: string | null; sides?: string | null; laminating?: string | null; test?: boolean; process_type?: string | null }): string {
+  return `${e.nota}||${e.bahan ?? ''}||${e.sides ?? ''}||${e.laminating ?? ''}||${e.test ? '1' : '0'}||${e.process_type ?? ''}`
+}
+function stOf(statuses: Record<string, NotaStatus>, e: { nota: string; bahan?: string | null; sides?: string | null; laminating?: string | null; test?: boolean; process_type?: string | null }): NotaStatus | undefined {
+  return statuses[rkey(e)] ?? statuses[e.nota]
+}
+
 const MODULE_HEALTH = [
   { name: 'NSH Lite',     modKey: 'lite', ctl: true,  desc: 'Imposisi & antrean berjalan normal' },
   { name: 'KMA Router',   modKey: 'kma',  ctl: true,  desc: 'Routing file ke hotfolder printer' },
@@ -451,9 +459,9 @@ const PageRingkasan = ({ connected, logs, entriesAll, statuses, modules, live, s
 
   // 4 tab pipeline WMA/KMMA dari tampilan SEHARIAN (.entries_all + status),
   // bukan antrean live — agar tracker tetap hidup walau antrean kosong
-  const okAll = entriesAll.filter(e => statuses[e.nota]?.status === 'ok').length
-  const errAll = entriesAll.filter(e => statuses[e.nota]?.status === 'error').length
-  const manAll = entriesAll.filter(e => statuses[e.nota]?.status === 'manual').length
+  const okAll = entriesAll.filter(e => stOf(statuses, e)?.status === 'ok').length
+  const errAll = entriesAll.filter(e => stOf(statuses, e)?.status === 'error').length
+  const manAll = entriesAll.filter(e => stOf(statuses, e)?.status === 'manual').length
   const pipeTabs: ModulTab[] = [
     { label: 'Antrian Aktif', value: entriesAll.length - okAll - errAll - manAll, level: 'accent' },
     { label: 'Selesai', value: okAll, level: 'success' },
@@ -787,6 +795,7 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
         onSave={() => folders.save(folders.values)}
         saving={folders.saving}
       />
+      <div className="grid gap-4 two-col" style={{ gridTemplateColumns: '380px 1fr' }}>
       {/* File list */}
       <div className="card overflow-hidden">
         <div className="px-5 py-3.5" style={{ borderBottom: '1px solid var(--color-border)' }}>
@@ -820,8 +829,8 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
         </div>
       </div>
 
-      {/* Status printer */}
-      <div className="card p-5">
+      {/* Status printer — dipindah ke atas, bersebelahan seperti HOME */}
+      <div className="card p-5 h-fit" style={{ order: -1 }}>
         <SectionHeader label="Status Printer" />
           <div className="flex flex-col gap-2.5">
             {printers.length === 0 && (
@@ -873,6 +882,7 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
             })}
           </div>
         </div>
+      </div>
     </div>
   )
 }
@@ -897,12 +907,12 @@ const PageWma = ({ entriesAll = [], statuses = {}, verified = [], live, sendComm
     }
   }, [results])
 
-  const doVerify = (nota: string) => {
+  const doVerify = (e: WmaEntry) => {
     if (!live) {
       pushToast('Hub offline — perintah tidak dikirim', 'warning')
       return
     }
-    const id = sendCommand('verify', { nota })
+    const id = sendCommand('verify', { nota: e.nota, bahan: e.bahan ?? '', sides: e.sides ?? '', laminating: e.laminating ?? '', test: e.test ?? false, process_type: e.process_type ?? '' })
     if (!id) {
       pushToast('Hub offline — perintah tidak dikirim', 'warning')
       return
@@ -910,30 +920,37 @@ const PageWma = ({ entriesAll = [], statuses = {}, verified = [], live, sendComm
     pendingRef.current.add(id)
   }
 
-  const isVerified = (nota: string) => verified.includes(nota)
+  const isVerified = (e: WmaEntry) => verified.includes(rkey(e))
 
-  // Kiri: belum diproses KMMA (Antrian) | Tengah: sudah diproses/gagal/manual/retry, belum verified (Menunggu Aksi) | Kanan: verified (Selesai)
-  const left = entriesAll.filter(e => !statuses[e.nota] && !isVerified(e.nota))
-  const mid = entriesAll.filter(e => {
-    const s = statuses[e.nota]?.status
-    return (s === 'ok' || s === 'error' || s === 'manual' || s === 'retry') && !isVerified(e.nota)
+  // Kiri: belum diproses / retry-menunggu-timer = Antrian | Tengah: ok/error/manual, belum verified (Menunggu Aksi) | Kanan: verified (Selesai)
+  const left = entriesAll.filter(e => {
+    const s = stOf(statuses, e)?.status
+    return (!s || s === 'retry') && !isVerified(e)
   })
-  const right = entriesAll.filter(e => isVerified(e.nota))
+  const mid = entriesAll.filter(e => {
+    const s = stOf(statuses, e)?.status
+    return (s === 'ok' || s === 'error' || s === 'manual') && !isVerified(e)
+  })
+  const right = entriesAll.filter(e => isVerified(e))
 
-  const wmaReason = (nota: string): string | null => {
-    const m = statuses[nota]?.msg ?? ''
+  const wmaReason = (e: WmaEntry): string | null => {
+    const st = stOf(statuses, e)
+    const m = st?.msg ?? ''
+    if (/^test:/i.test(m)) return 'TEST'
     if (/tidak ada di km/i.test(m)) return 'Nota tidak ada di KM'
     if (/bahan tidak sesuai/i.test(m)) return 'Bahan Tidak Sesuai'
     if (/jumlah tidak sesuai/i.test(m)) return 'QTY tidak sesuai'
-    if (/tunggu 3 mnt|retry/i.test(m)) return 'Retry otomatis 3 mnt'
+    if (/laminat|divisi lain|ada step/i.test(m)) return 'Menunggu divisi lain'
+    if ((st?.status === 'error' || st?.status === 'manual') && m)
+      return m.length > 80 ? m.slice(0, 77) + '…' : m
     return null
   }
 
   const row = (e: WmaEntry, showVerify: boolean) => {
-    const reason = wmaReason(e.nota)
-    const tag = [e.sides ? e.sides.toUpperCase() : '', e.laminating ? e.laminating.toUpperCase() : ''].filter(Boolean).join('/')
+    const reason = wmaReason(e)
+    const tag = [e.sides ? e.sides.toUpperCase() : '', e.laminating ? e.laminating.toUpperCase() : '', e.test ? 'TEST' : ''].filter(Boolean).join('/')
     return (
-    <div key={`${e.nota}||${e.bahan ?? ''}||${e.sides ?? ''}||${e.laminating ?? ''}`} className="rounded-lg px-3.5 py-2.5" style={{ background: 'var(--color-bg)' }}>
+    <div key={rkey(e)} className="rounded-lg px-3.5 py-2.5" style={{ background: 'var(--color-bg)' }}>
       <div className="flex items-center gap-2 mb-1">
         <span className="font-mono font-semibold truncate" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent)' }}>{e.nota}</span>
         <span className="font-mono ml-auto shrink-0" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text)' }}>×{e.total_qty ?? 0}</span>
@@ -957,7 +974,7 @@ const PageWma = ({ entriesAll = [], statuses = {}, verified = [], live, sendComm
               <div style={{ fontSize: 10, color: 'var(--color-warning-fg)' }}>{reason}</div>
             )}
             {showVerify && (
-              <button className="btn btn-primary btn-sm" onClick={() => doVerify(e.nota)}>
+              <button className="btn btn-primary btn-sm" onClick={() => doVerify(e)}>
                 <Icon name="check" size={12} /> Verified
               </button>
             )}
@@ -1108,9 +1125,14 @@ const PageKmma = ({ entries, statuses, details, live, sendCommand, results, time
   const racks = notas.map(n => {
     const rows = entries.filter(e => e.nota === n)
     const first = rows[0]
-    const st = statuses[n]
+    const rowSts = rows.map(r => stOf(statuses, r)).filter(Boolean) as NotaStatus[]
+    const pick = rowSts.find(s => s.status === 'manual')
+      ?? rowSts.find(s => s.status === 'error')
+      ?? (rowSts.length === rows.length && rowSts.length > 0 && rowSts.every(s => s.status === 'ok')
+        ? { status: 'ok', msg: '', ts: '' } as NotaStatus
+        : undefined)
+    const stName = pick?.status
     const real = details[n]
-    const stName = st?.status
     return {
       nota: n,
       customer: rows.map(r => r.customer).find(Boolean) || '—',
@@ -1119,7 +1141,7 @@ const PageKmma = ({ entries, statuses, details, live, sendCommand, results, time
       operator: rows.map(r => r.operator).find(Boolean) || '—',
       status: (stName === 'ok' ? 'success' : stName === 'manual' ? 'warning' : stName === 'error' ? 'danger' : 'accent') as StatusLevel,
       statusLabel: stName === 'ok' ? 'SELESAI' : stName === 'manual' ? 'MANUAL' : stName === 'error' ? 'ERROR' : 'ANTRI',
-      steps: real?.length ? real.map(kmmaStepFromHub) : kmmaStepsHeuristic(first, st),
+      steps: real?.length ? real.map(kmmaStepFromHub) : kmmaStepsHeuristic(first, pick),
     }
   })
 

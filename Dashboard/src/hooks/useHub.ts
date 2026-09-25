@@ -2,17 +2,21 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 // ─── Protocol (mirror hub_server.py) ─────────────────────────────────────────
 // Server -> client:
-//   {type:'init', logs, entries, status, modules, steps, kma}
+//   {type:'init', logs, entries, entries_all, verified, kmma_timer, output_files, status, modules, steps, kma}
 //   {type:'log', module, msg, ts}
 //   {type:'entries', entries}
+//   {type:'entries_all', entries}
+//   {type:'verified_update', verified}
+//   {type:'kmma_timer_update', next_in, interval}
+//   {type:'output_update', files}
 //   {type:'status_update', nota, status, msg, ts}
 //   {type:'module_status', module, connected, ts}
 //   {type:'step_detail_update', nota, steps}
 //   {type:'kma_state', routes, printers, rules, stats}
-//   {type:'command_result', id, action, nota, ok, msg}
+//   {type:'command_result', id, action, nota?, module?, folders?, files?, ok, msg}
 // Client -> server:
 //   {type:'subscribe', role:'dashboard', id}
-//   {type:'command', id, action, nota?, reason?, qty?, file?, machine?, module?}
+//   {type:'command', id, action, nota?, reason?, qty?, file?, machine?, module?, folders?, dest?, files?, operator?}
 
 export interface HubLogEntry {
   type: 'log'
@@ -34,6 +38,7 @@ export interface WmaEntry {
   verified?: boolean
   sides?: string
   laminating?: string
+  test?: boolean
 }
 
 export interface NotaStatus {
@@ -121,6 +126,11 @@ export interface SendCommandOpts {
   dest?: string
   files?: string[]
   operator?: string
+  bahan?: string
+  sides?: string
+  laminating?: string
+  test?: boolean
+  process_type?: string
 }
 
 export type ConnState = 'connecting' | 'open' | 'closed'
@@ -135,6 +145,7 @@ export interface HubState {
   logs: HubLogEntry[]
   entries: WmaEntry[]
   entriesAll: WmaEntry[]
+  /** skey per-baris 6-tuple: "nota||bahan||sides||lam||1/0||process_type" */
   verified: string[]
   kmmaTimer: KmmaTimer | null
   outputFiles: OutputFile[]
@@ -158,6 +169,23 @@ export function defaultHubUrl(): string {
 const MAX_LOGS = 200
 const RECONNECT_DELAYS = [1000, 2000, 5000, 10000]
 
+/** Migrasi rkey legacy 5-tuple (tanpa process_type) -> 6-tuple; nota-only dibiarkan (fallback). */
+function normalizeVerified(arr: unknown): string[] {
+  if (!Array.isArray(arr)) return []
+  return (arr as unknown[]).map(v => {
+    const s = String(v ?? '')
+    if (!s) return ''
+    if (!s.includes('||')) return s
+    const parts = s.split('||')
+    if (parts.length === 5) return s + '||'
+    if (parts.length < 6) {
+      while (parts.length < 6) parts.push('')
+      return parts.join('||')
+    }
+    return s
+  }).filter(Boolean) as string[]
+}
+
 function handleIncoming(prev: HubState, d: unknown, cap: number): HubState {
   if (typeof d !== 'object' || d === null) return prev
   const msg = d as Record<string, unknown>
@@ -176,7 +204,7 @@ function handleIncoming(prev: HubState, d: unknown, cap: number): HubState {
       return { ...prev, entriesAll: (msg.entries as WmaEntry[]) ?? [] }
     }
     case 'verified_update': {
-      return { ...prev, verified: (msg.verified as string[]) ?? [] }
+      return { ...prev, verified: normalizeVerified(msg.verified) }
     }
     case 'kmma_timer_update': {
       return { ...prev, kmmaTimer: { next_in: Number(msg.next_in ?? 0), interval: Number(msg.interval ?? 180) } }
@@ -187,11 +215,12 @@ function handleIncoming(prev: HubState, d: unknown, cap: number): HubState {
     case 'status_update': {
       const nota = String(msg.nota ?? '')
       if (!nota) return prev
+      const key = msg.key ? String(msg.key) : nota
       return {
         ...prev,
         statuses: {
           ...prev.statuses,
-          [nota]: {
+          [key]: {
             status: String(msg.status ?? ''),
             msg: String(msg.msg ?? ''),
             ts: String(msg.ts ?? ''),
@@ -251,7 +280,7 @@ function handleIncoming(prev: HubState, d: unknown, cap: number): HubState {
         logs,
         entries: (msg.entries as WmaEntry[]) ?? [],
         entriesAll: (msg.entries_all as WmaEntry[]) ?? [],
-        verified: (msg.verified as string[]) ?? [],
+        verified: normalizeVerified(msg.verified),
         kmmaTimer: (msg.kmma_timer as KmmaTimer | null) ?? null,
         outputFiles: (msg.output_files as OutputFile[]) ?? [],
         statuses: (msg.status as Record<string, NotaStatus>) ?? {},
@@ -297,6 +326,11 @@ export function useHub(url: string = defaultHubUrl(), maxLogs: number = MAX_LOGS
     if (opts?.dest) payload.dest = opts.dest
     if (opts?.files) payload.files = opts.files
     if (opts?.operator) payload.operator = opts.operator
+    if (opts?.bahan !== undefined) payload.bahan = opts.bahan
+    if (opts?.sides !== undefined) payload.sides = opts.sides
+    if (opts?.laminating !== undefined) payload.laminating = opts.laminating
+    if (opts?.test !== undefined) payload.test = opts.test
+    if (opts?.process_type !== undefined) payload.process_type = opts.process_type
     try {
       wsRef.current?.send(JSON.stringify(payload))
     } catch {

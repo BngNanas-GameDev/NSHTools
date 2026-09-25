@@ -137,9 +137,21 @@ class WSClient:
         """Send new entries from WMA."""
         self.send({"type": "new_entries", "entries": entries})
 
-    def send_status(self, nota, status, msg=""):
-        """Send status update from KMMA."""
-        self.send({"type": "status", "nota": nota, "status": status, "msg": msg})
+    def send_status(self, nota, status, msg="", key=None):
+        """Send status update from KMMA. key = (nota,bahan,sides,laminating,test[,process_type])
+        untuk status per-baris (None = kompatibel lama per-nota)."""
+        body = {"type": "status", "nota": nota, "status": status, "msg": msg}
+        if key is not None:
+            try:
+                n, b, s, l, t = key[0], key[1], key[2], key[3], key[4]
+                body["bahan"] = b or ""
+                body["sides"] = s or ""
+                body["laminating"] = l or ""
+                body["test"] = bool(t)
+                body["process_type"] = key[5] if len(key) > 5 else ""
+            except Exception:
+                pass
+        self.send(body)
 
     def send_step_detail(self, nota, steps):
         """Send per-step detail from KMMA.
@@ -169,9 +181,12 @@ class WSClient:
         })
 
     def send_kma_state(self, state):
-        """Push KMA router state: {routes, machines, rules}."""
+        """Push KMA router state (mirror hub kma_state):
+        {routes, printers, rules, stats}."""
+        printers = state.get("printers", state.get("machines", []))
         self.send({"type": "kma_state", "routes": state.get("routes", []),
-                   "machines": state.get("machines", []), "rules": state.get("rules", [])})
+                   "printers": printers, "rules": state.get("rules", []),
+                   "stats": state.get("stats", {})})
 
     @property
     def connected(self):

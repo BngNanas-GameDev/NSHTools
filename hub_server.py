@@ -215,39 +215,24 @@ def stop_all_modules():
         pass
 
 
-def _write_relauncher(hub_pid, py_exe, script, args):
-    """Tulis .bat sekali-pakai: tunggu PID hub mati → start hub baru
-    (console "NSH Hub Server") → hapus diri. Return path .bat."""
-    import tempfile
-    fd, path = tempfile.mkstemp(prefix=f"nsh_hub_relaunch_{hub_pid}_", suffix=".bat")
-    inner = subprocess.list2cmdline([py_exe, script] + [str(a) for a in args])
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write("@echo off\n")
-        f.write(f"set HPID={hub_pid}\n")
-        f.write(":wait_hub\n")
-        f.write('tasklist /FI "PID eq %HPID%" 2>nul | findstr /R "\\<%HPID%\\>" >nul\n')
-        f.write("if %errorlevel%==0 (ping -n 2 127.0.0.1 >nul & goto wait_hub)\n")
-        f.write("ping -n 3 127.0.0.1 >nul\n")
-        f.write(f'cd /d "{BASE_DIR}"\n')
-        f.write(f"start \"NSH Hub Server\" {inner}\n")
-        f.write('del "%~f0"\n')
-    return path
-
-
 def handle_hub_restart():
-    """Restart hub via relauncher eksternal (anti-mati-total):
-    1) tulis .bat yang menunggu PID hub hilang lalu start hub baru,
-    2) hentikan modul supervisi, 3) keluar — relauncher menyalakan gantinya.
-    Dashboard/modul reconnect otomatis."""
+    """Restart hub: luncurkan pengganti (console "NSH Hub Server" baru),
+    lalu matikan diri + modul supervisi. Pengganti coba bind port berulang
+    (hub lama butuh ±detik untuk bebas) dan HANYA nyalakan modul bila bind
+    sukses — anti duplikat, anti mati-total. Dashboard/modul reconnect otomatis."""
     try:
         script = os.path.abspath(sys.argv[0])
-        bat = _write_relauncher(os.getpid(), sys.executable, script, sys.argv[1:])
-        subprocess.Popen(["cmd", "/c", bat], cwd=str(BASE_DIR),
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL,
-                         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+        # JANGAN kutip manual: list2cmdline yang mengutip (kutip ganda
+        # membuat cmd salah parse -> "cannot find the file ...").
+        subprocess.Popen(
+            ["cmd", "/c", "start", "NSH Hub Server", sys.executable, script]
+            + [str(a) for a in sys.argv[1:]],
+            cwd=str(BASE_DIR),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
     except Exception as e:
-        return False, f"gagal siapkan relaunch: {e}"
+        return False, f"gagal meluncurkan pengganti: {e}"
 
     def _do():
         try:
@@ -256,7 +241,7 @@ def handle_hub_restart():
         finally:
             os._exit(0)
     threading.Timer(1.0, _do).start()  # jeda: biarkan balasan terkirim dulu
-    return True, "HUB restart ~5 detik (dashboard reconnect otomatis)"
+    return True, "HUB restart ±15 detik (dashboard reconnect otomatis)"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -343,7 +328,7 @@ def handle_folders_command(action, module, folders=None):
     except Exception:
         pass
     add_log("HUB", f"folders {module} disimpan — restart modul agar berlaku")
-    return True, "tersimpan — modul restart otomatis", cleaned
+    return True, "tersimpan — modul restart otomatis (±30 dtk)", cleaned
 
 
 OPERATORS = ("Nanas", "Eric", "Rahmadi")
@@ -555,10 +540,44 @@ def refresh_supervised_status():
 clients = {}
 log_history = []
 entries_cache = []
-entries_all_cache = {}  # (nota,bahan) -> entry terlihat hari ini (tak dihapus KMMA)
-verified_cache = set()  # nota terverifikasi (tombol Verified WMA)
+entries_all_cache = {}  # (nota,bahan,sides,lam,test) -> entry terlihat hari ini
+verified_cache = set()  # skey per-baris terverifikasi: "nota||bahan||sides||lam||1/0||proc"
 kmma_timer_cache = None  # {next_in, interval} hitung mundur siklus KMMA
-status_cache = {}
+status_cache = {}  # skey "nota||bahan||sides||lam||1/0" -> {status,msg,ts}
+
+
+def _rkey(nota, bahan="", sides="", laminating="", test=False, process_type=""):
+    """Kunci status kanonis (sama dgn db.skey + dashboard)."""
+    if isinstance(test, str):
+        t = "1" if test.strip() in ("1", "true", "True", "TRUE", "yes", "Yes") else "0"
+    else:
+        t = "1" if test else "0"
+    return "||".join([nota or "", bahan or "", sides or "", laminating or "", t, process_type or ""])
+
+
+def _ekey_of(e):
+    e = e or {}
+    return (e.get("nota") or "", e.get("bahan") or "", e.get("sides") or "",
+            e.get("laminating") or "", 1 if e.get("test") else 0,
+            e.get("process_type") or "")
+
+
+def _pkey(s):
+    """'nota||..||1/0[||proc]' -> tuple. Legacy nota-only
+    -> (nota,'','','',-1,'') dgn -1 = cocok SEMUA varian (kompatibel lama)."""
+    try:
+        if "||" not in (s or ""):
+            return (s or "", "", "", "", -1, "")
+        p = (s or "").split("||")
+        while len(p) < 6:
+            p.append("")
+        return (p[0], p[1], p[2], p[3], 1 if p[4] == "1" else 0, p[5])
+    except Exception:
+        return (s or "", "", "", "", -1, "")
+
+
+def _key_match(ek, sk):
+    return ek[0] == sk[0] and (sk[1:] == ("", "", "", -1, "") or ek[1:] == sk[1:])
 module_status = {}  # role → {"connected": bool, "ts": "..."}
 step_cache = {}  # nota → [{name, machine, material, sdm, qty, status, msg}]
 kma_cache = {"routes": [], "printers": [], "rules": [], "stats": {}, "seen": 0.0}
@@ -579,13 +598,20 @@ async def _safe_send(ws, msg):
 
 
 def broadcast(msg, roles=None):
-    dead = []
-    for ws, info in clients.items():
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            loop = asyncio.get_event_loop()
+        except Exception:
+            return
+    for ws, info in list(clients.items()):
         if roles and info["role"] not in roles:
             continue
-        asyncio.get_event_loop().create_task(_safe_send(ws, msg))
-    for ws in dead:
-        clients.pop(ws, None)
+        try:
+            loop.create_task(_safe_send(ws, msg))
+        except Exception:
+            pass
 
 
 def broadcast_threadsafe(payload):
@@ -615,7 +641,7 @@ def add_log(module, msg):
 
 def apply_kma_state(data):
     """Terapkan laporan KMA (WS maupun HTTP). Return payload broadcast."""
-    kma_cache["routes"] = (data.get("routes") or [])[:50]
+    kma_cache["routes"] = (data.get("routes") or [])[:500]
     kma_cache["printers"] = data.get("printers") or []
     kma_cache["rules"] = data.get("rules") or []
     kma_cache["stats"] = data.get("stats") or {}
@@ -839,19 +865,25 @@ async def handler(connection):
                 # Varian basi per nota dibuang (mis. bahan terkoreksi saat re-parse),
                 # kecuali nota berstatus final ok/error (riwayat dipertahankan).
                 try:
-                    batch_keys = {(e.get("nota"), e.get("bahan"),
+                    # Kunci kanonis = DB PK (nota,bahan,sides,laminating,test,process_type);
+                    # bahan dinormalkan "" (bukan None) agar cocok dgn baris DB.
+                    batch_keys = {(e.get("nota"), e.get("bahan") or "",
                                    e.get("sides") or "",
-                                   e.get("laminating") or "") for e in entries_list}
+                                   e.get("laminating") or "",
+                                   1 if e.get("test") else 0,
+                                   e.get("process_type") or "") for e in entries_list}
                     batch_notas = {k[0] for k in batch_keys}
                     for k in list(entries_all_cache.keys()):
                         if k[0] in batch_notas and k not in batch_keys:
-                            _s = status_cache.get(k[0], {}).get("status")
+                            _s = status_cache.get(_rkey(*k), {}).get("status")
                             if _s not in ("ok", "error"):
                                 del entries_all_cache[k]
                     for e in entries_list:
-                        entries_all_cache[(e.get("nota"), e.get("bahan"),
+                        entries_all_cache[(e.get("nota"), e.get("bahan") or "",
                                            e.get("sides") or "",
-                                           e.get("laminating") or "")] = e
+                                           e.get("laminating") or "",
+                                           1 if e.get("test") else 0,
+                                           e.get("process_type") or "")] = e
                     db = _hub_db()
                     if db is not None:
                         db.wma_seen_upsert(datetime.date.today().isoformat(), entries_list)
@@ -865,7 +897,13 @@ async def handler(connection):
                 nota = msg.get("nota", "")
                 st = msg.get("status", "")
                 smsg = msg.get("msg", "")
-                status_cache[nota] = {"status": st, "msg": smsg, "ts": ts()}
+                if any(msg.get(k) is not None for k in ("bahan", "sides", "laminating", "test", "process_type")):
+                    _rk = _rkey(nota, msg.get("bahan"), msg.get("sides"),
+                                msg.get("laminating"), msg.get("test"),
+                                msg.get("process_type"))
+                else:
+                    _rk = nota  # pengirim lama: kunci legacy per-nota
+                status_cache[_rk] = {"status": st, "msg": smsg, "ts": ts()}
                 add_log("KMMA", f"{nota} -> {st} {smsg}")
                 broadcast(json.dumps({
                     "type": "status_update",
@@ -873,11 +911,13 @@ async def handler(connection):
                     "status": st,
                     "msg": smsg,
                     "ts": ts(),
+                    "key": _rk,
                 }))
-                # antrean live: nota yang sudah diproses KMMA keluar dari entries
+                # antrean live: BARIS final (ok/error) keluar dari entries
                 # (cermin filter WMA; entries_all/seen tak tersentuh utk kolom Tengah)
                 if nota and st in ("ok", "error"):
-                    kept = [e for e in entries_cache if e.get("nota") != nota]
+                    _sk = _pkey(_rk)
+                    kept = [e for e in entries_cache if not _key_match(_ekey_of(e), _sk)]
                     if len(kept) != len(entries_cache):
                         entries_cache[:] = kept
                         broadcast(json.dumps({"type": "entries", "entries": entries_cache}))
@@ -910,8 +950,10 @@ async def handler(connection):
                         "msg": res,
                     }, ensure_ascii=False))
                 elif action == "verify":
-                    # KONSUMSI di hub (tombol Verified WMA), jangan teruskan.
-                    ok, res = _mark_verified(msg.get("nota", ""))
+                    # per-baris: jika payload bawa bahan/sides/lam/test/proc, verifikasi 1 baris; else semua varian nota tsb
+                    ok, res = _mark_verified(
+                        msg.get("nota", ""), msg.get("bahan"), msg.get("sides"),
+                        msg.get("laminating"), msg.get("test"), msg.get("process_type"))
                     add_log("HUB", f"verify {msg.get('nota', '')} -> {res}")
                     await _safe_send(ws, json.dumps({
                         "type": "command_result",
@@ -1082,48 +1124,63 @@ def _preload_wma_from_db():
         today = datetime.date.today().isoformat()
         for e in db.wma_seen_day(today):
             entries_all_cache[(e.get("nota"), e.get("bahan"), e.get("sides") or "",
-                               e.get("laminating") or "")] = e
+                               e.get("laminating") or "",
+                               1 if e.get("test") else 0,
+                               e.get("process_type") or "")] = e
         try:
             # WMA simpan ke wma_entries walau hub sedang mati/offline —
             # gabung agar tak ada yang hilang dari kolom.
             for e in db.wma_all(today):
                 entries_all_cache.setdefault(
                     (e.get("nota"), e.get("bahan"), e.get("sides") or "",
-                     e.get("laminating") or ""), e)
+                     e.get("laminating") or "", 1 if e.get("test") else 0,
+                     e.get("process_type") or ""), e)
         except Exception:
             pass
         for n in db.wma_verified_all():
             verified_cache.add(n)
         proc = set()
         st_map = {}
-        for _st in ("completed", "skip_forever", "skipped"):
+        for _st in ("completed", "skip_forever", "skipped", "manual"):
             try:
                 rows = db.kmma_by_status(_st)
             except Exception:
                 rows = {}
-            proc.update(rows.keys())
-            for _n, _info in rows.items():
-                st_map[_n] = _st
+            # Antrean live HANYA keluarkan final (completed/skip_forever),
+            # sama spt handler status (ok/error). Retry (skipped) + manual tetap di
+            # antrean + berstatus masing-masing agar tak jadi hantu.
+            if _st in ("completed", "skip_forever"):
+                proc.update(rows.keys())
+            for _k, _info in rows.items():
+                st_map[_k] = _st
         entries_cache.clear()
         entries_cache.extend(
-            e for e in entries_all_cache.values() if e.get("nota") not in proc)
-        for _n, _st in st_map.items():
-            if _n in status_cache:
+            e for e in entries_all_cache.values() if _ekey_of(e) not in proc)
+        for _k, _st in st_map.items():
+            _sk = _rkey(*_k)
+            if _sk in status_cache:
                 continue
             try:
-                _info = db.kmma_get(_n) or {}
+                _info = db.kmma_get(*_k) or {}
             except Exception:
                 _info = {}
             _reason = (_info.get("reason") or "").strip()
             if _st == "skipped":
                 # retry menunggu timer: status sendiri agar tak jadi hantu Antrian
-                status_cache[_n] = {
+                status_cache[_sk] = {
                     "status": "retry",
                     "msg": "tunggu 3 mnt",
                     "ts": _info.get("updated_at") or "",
                 }
                 continue
-            status_cache[_n] = {
+            if _st == "manual":
+                status_cache[_sk] = {
+                    "status": "manual",
+                    "msg": _reason or "manual",
+                    "ts": _info.get("updated_at") or "",
+                }
+                continue
+            status_cache[_sk] = {
                 "status": "ok" if _st == "completed" else "error",
                 "msg": _reason or ("selesai" if _st == "completed" else _st),
                 "ts": _info.get("updated_at") or "",
@@ -1135,27 +1192,65 @@ def _preload_wma_from_db():
         pass
 
 
-def _mark_verified(nota):
-    """Tandai nota terverifikasi → DB + siaran + dashboard watcher. Return (ok, msg)."""
+def _mark_verified(nota, bahan=None, sides=None, laminating=None, test=None, process_type=None):
+    """Tandai terverifikasi per-baris 6-tuple → DB + siaran + watcher. Return (ok, msg).
+    Jika hanya nota, semua varian nota tsb diverifikasi (loop per row)."""
     nota = (nota or "").strip()
     if not nota:
         return False, "nota kosong"
-    try:
-        db = _hub_db()
-        if db is not None:
-            db.wma_verify(nota, ts())
-    except Exception:
-        pass
-    verified_cache.add(nota)
+    # tentukan target rows
+    explicit = any(v is not None for v in (bahan, sides, laminating, test, process_type))
+    targets = []
+    if explicit:
+        b = bahan or ""
+        s = sides or ""
+        l = laminating or ""
+        # test bisa bool/int/str
+        if isinstance(test, str):
+            t = 1 if test in ("1", "true", "True", "1") else 0
+        elif test is None:
+            t = 0
+        else:
+            t = 1 if test else 0
+        p = process_type or ""
+        targets = [(nota, b, s, l, t, p)]
+    else:
+        for k in list(entries_all_cache.keys()):
+            if k[0] == nota:
+                targets.append(k)
+        if not targets:
+            targets = [(nota, "", "", "", 0, "")]
+    db = _hub_db()
+    for tk in targets:
+        n, b, s, l, t, p = tk
+        try:
+            if db is not None:
+                if hasattr(db, "wma_verify_row"):
+                    db.wma_verify_row(n, b, s, l, bool(t), p, ts())
+                else:
+                    db.wma_verify(n, ts(), bahan=b, sides=s, laminating=l, test=bool(t), process_type=p)
+        except Exception:
+            pass
+        verified_cache.add(_rkey(n, b, s, l, bool(t), p))
     broadcast(json.dumps({"type": "verified_update",
                           "verified": sorted(verified_cache)}, ensure_ascii=False))
-    upd, total, err = _push_verified_to_watcher(nota)
-    if total == 0:
-        extra = "watcher: file tak ditemukan" if not err else f"watcher gagal: {err}"
+    upd_total = 0
+    matched_total = 0
+    err_last = ""
+    for tk in targets:
+        upd, total, err = _push_verified_to_watcher_for_key(tk)
+        upd_total += upd
+        matched_total += total
+        if err:
+            err_last = err
+    if matched_total == 0:
+        extra = "watcher: file tak ditemukan" if not err_last else f"watcher gagal: {err_last}"
+        if len(targets) > 1:
+            return True, f"{nota} terverifikasi {len(targets)} baris ({extra})"
         return True, f"{nota} terverifikasi ({extra})"
-    if upd == total:
-        return True, f"{nota} terverifikasi ({upd} file watcher)"
-    return False, f"{nota} watcher gagal ({upd}/{total}): {err or 'POST gagal'}"
+    if upd_total == matched_total:
+        return True, f"{nota} terverifikasi ({upd_total} file watcher)"
+    return False, f"{nota} watcher gagal ({upd_total}/{matched_total}): {err_last or 'POST gagal'}"
 
 
 def _watcher_dash_url():
@@ -1184,36 +1279,57 @@ def _watcher_api(method, path, body=None, timeout=5):
             return r.status, {}
 
 
-def _push_verified_to_watcher(nota):
-    """Set verified=true di dashboard watcher untuk semua file nota tsb.
-    Return (updated, total, err). Tak lempar exception."""
+def _push_verified_to_watcher_for_key(key):
+    """Set verified=true di watcher untuk SATU baris 6-tuple. Return (updated,total,err)."""
     try:
+        n, b, s, l, t, p = key
         today = datetime.date.today().isoformat()
-        _, data = _watcher_api("GET", f"/api/files?date_from={today}&date_to={today}",
-                               timeout=5)
+        _, data = _watcher_api("GET", f"/api/files?date_from={today}&date_to={today}", timeout=5)
         rows = data if isinstance(data, list) else (data.get("value") or [])
-        by_name = {r.get("filename"): r.get("id") for r in rows
-                   if r.get("filename") and r.get("id")}
-        names = []
-        for e in entries_all_cache.values():
-            if e.get("nota") == nota:
-                names.extend(e.get("files") or [])
-        ids = [by_name[n] for n in dict.fromkeys(names) if n in by_name]
+        by_name = {r.get("filename"): r.get("id") for r in rows if r.get("filename") and r.get("id")}
+        e = entries_all_cache.get(key)
+        # fallback: cari berdasar nota+bahan jika key lengkap tak ada
+        if e is None:
+            for ek, ev in entries_all_cache.items():
+                if ek[0] == n and ek[1] == b and ek[2] == s and ek[3] == l and ek[4] == t and ek[5] == p:
+                    e = ev
+                    break
+        names = (e.get("files") or []) if e else []
+        ids = [by_name[nm] for nm in dict.fromkeys(names) if nm in by_name]
         ok_n = 0
         err = ""
         for fid in ids:
             try:
-                st, _ = _watcher_api("POST", f"/api/files/{fid}",
-                                     {"verified": True}, timeout=4)
+                st, _ = _watcher_api("POST", f"/api/files/{fid}", {"verified": True}, timeout=4)
                 if 200 <= st < 300:
                     ok_n += 1
                 else:
                     err = f"HTTP {st}"
-            except Exception as e:
-                err = str(e)[:80]
+            except Exception as ex:
+                err = str(ex)[:80]
         return ok_n, len(ids), err
-    except Exception as e:
-        return 0, 0, str(e)[:80]
+    except Exception as ex:
+        return 0, 0, str(ex)[:80]
+
+
+def _push_verified_to_watcher(nota):
+    """Legacy wrapper per-nota: gabung semua varian nota tsb."""
+    try:
+        keys = [k for k in entries_all_cache.keys() if k[0] == nota]
+        if not keys:
+            keys = [(nota, "", "", "", 0, "")]
+        upd_total = 0
+        tot_total = 0
+        err_last = ""
+        for k in keys:
+            upd, tot, err = _push_verified_to_watcher_for_key(k)
+            upd_total += upd
+            tot_total += tot
+            if err:
+                err_last = err
+        return upd_total, tot_total, err_last
+    except Exception as ex:
+        return 0, 0, str(ex)[:80]
 
 
 def _preload_kma_from_db():
@@ -1227,7 +1343,7 @@ def _preload_kma_from_db():
         evs = nshdb.kma_events_day(today)
         st = nshdb.kma_stats_get(today)
         if evs or st["ok"] or st["ret"] or st["done"]:
-            kma_cache["routes"] = evs[-50:]
+            kma_cache["routes"] = evs[-500:]
             kma_cache["stats"] = st
             add_log("HUB", f"KMA hari ini dimuat dari DB: {len(evs)} events")
     except Exception:
@@ -1248,6 +1364,27 @@ async def main():
     _preload_kma_from_db()
     _preload_wma_from_db()
     supervise_init(ws_port)
+
+    # Bind port DULU (retry bila hub lama belum bebas), modul BARU dinyalakan
+    # bila bind sukses — anti duplikat & anti start-yatim.
+    server = None
+    http_ok = False
+    for _attempt in range(15):
+        try:
+            if not http_ok:
+                start_http_server(http_port)
+                http_ok = True
+            server = await websockets.serve(handler, HOST, ws_port)
+            break
+        except OSError as e:
+            print(f"  [hub] port sibuk ({e}), coba lagi {2 * (_attempt + 1)}s...")
+            await asyncio.sleep(2)
+    if server is None or not http_ok:
+        print("  [hub] FATAL: port tak bebas — hub lama masih jalan?")
+        print("  [hub] berhenti tanpa menyalakan modul.")
+        await asyncio.sleep(30)
+        return
+
     if SUPERVISE:
         for _n in MANAGED_MODULES:
             _ok, _msg = start_module(_n)
@@ -1258,9 +1395,6 @@ async def main():
     asyncio.create_task(_kma_sweeper())
     asyncio.create_task(_supervisor_poller())
     threading.Thread(target=_output_watcher, daemon=True).start()
-    start_http_server(http_port)
-
-    server = await websockets.serve(handler, HOST, ws_port)
     print(f"  NSH Hub running:")
     print(f"    Dashboard: http://localhost:{http_port}")
     print(f"    WebSocket: ws://0.0.0.0:{ws_port}")

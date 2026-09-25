@@ -20,7 +20,7 @@ _COOLDOWN = {}  # nama file -> timestamp gagal terakhir
 _FAIL_COUNT = {}  # nama file -> jumlah gagal berturut (diluar cooldown)
 _SEEN = {}  # path.lower() -> timestamp pertama kali terlihat (untuk delay impose)
 COOLDOWN_S = 5
-COOLDOWN_BEFORE = 5  # delay HANYA di impose, deteksi langsung
+COOLDOWN_BEFORE = 10  # delay HANYA di impose, deteksi langsung
 MAX_FAIL = 3
 # E030=locked, E031=tidak bisa ditarik(3x locked), E032=gagal impose(3x), E034=duplikat
 # E035=ukuran halaman beda
@@ -227,7 +227,7 @@ def process_one(fn, bridge, outdir, udadir):
     # file sudah hilang di disk (duplikat glob / dipindah manual) -> diam, bukan error
     if not Path(fn).exists():
         return False
-    # delay 5 detik: file harus sudah terlihat >= COOLDOWN_BEFORE baru impose
+    # delay 10 detik: file harus sudah terlihat >= COOLDOWN_BEFORE baru impose
     first = _SEEN.get(str(Path(fn)).lower())
     if first and (_time.time() - first) < COOLDOWN_BEFORE:
         return False  # masih cooldown, skip tapi jangan log

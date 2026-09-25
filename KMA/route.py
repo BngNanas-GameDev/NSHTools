@@ -82,7 +82,7 @@ ERR_QUIET_S = 120
 # ── Hub reporting (opt-in via --hub; default mati, perilaku lama tak berubah) ──
 _HUB = False
 _HUB_URL = "http://localhost:8766"
-_EVENTS = deque(maxlen=200)  # ring: {file, category, dest, status, msg, ts}
+_EVENTS = deque(maxlen=500)  # ring: {file, category, dest, status, msg, ts}
 _EV_LAST = {}  # file -> (status, dest) terakhir (anti-duplikat)
 _PRINTER_STATE = {}  # ip -> True/False (hasil cek terakhir)
 _FOLDERS = {}  # input/return/uda (diisi watch_loop/--once)
@@ -177,7 +177,7 @@ def push_kma():
                      "status": "siap" if (not _ricoh or os.path.isdir(_ricoh)) else "mati",
                      "active": False})
     _hub_post({"source": "kma", "kind": "kma_state",
-               "routes": list(_EVENTS)[-50:], "printers": printers,
+               "routes": list(_EVENTS)[-500:], "printers": printers,
                "rules": rules, "stats": dict(_STATS), "folders": dict(_FOLDERS)})
 
 

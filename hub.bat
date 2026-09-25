@@ -13,15 +13,19 @@ echo [1] Starting Hub Server...
 start "NSH Hub Server" python hub_server.py
 ping -n 3 127.0.0.1 >nul
 
-echo [2] Starting WMA (watch + hub)...
+echo [2] Starting NSH Lite (watcher imposition)...
+start "NSH Lite" python "NSH Lite\lite.py"
+ping -n 2 127.0.0.1 >nul
+
+echo [3] Starting WMA (watch + hub)...
 start "NSH WMA" python WMA\wma.py --watch --hub
 ping -n 2 127.0.0.1 >nul
 
-echo [3] Starting KMMA (watch + hub)...
+echo [4] Starting KMMA (watch + hub)...
 start "NSH KMMA" python KMMA\kmma.py --watch --hub
 ping -n 2 127.0.0.1 >nul
 
-echo [4] Starting KMA (route + hub)...
+echo [5] Starting KMA (route + hub)...
 start "NSH KMA" python KMA\route.py --hub
 
 echo.
@@ -32,6 +36,7 @@ pause >nul
 
 echo Stopping...
 taskkill /FI "WINDOWTITLE eq NSH Hub Server*" /F >nul 2>&1
+taskkill /FI "WINDOWTITLE eq NSH Lite*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NSH WMA*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NSH KMMA*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq NSH KMA*" /F >nul 2>&1

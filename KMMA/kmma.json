@@ -70,384 +70,431 @@
     "ON202609240076": "2026-09-24T10:55:31.266864",
     "ON202609240079": "2026-09-24T11:13:34.063323",
     "ON202609240089": "2026-09-24T11:27:23.558561",
-    "ON202609240092": "2026-09-24T11:30:23.753820"
+    "ON202609240092": "2026-09-24T11:30:23.753820",
+    "ON202609240097": "2026-09-24T11:43:57.639851",
+    "ON202609240095": "2026-09-24T11:44:12.909508",
+    "ON202609240108": "2026-09-24T12:17:53.612707",
+    "ON202609240109": "2026-09-24T12:21:04.042149",
+    "ON202609240119": "2026-09-24T12:48:00.369886",
+    "ON202609240114": "2026-09-24T12:48:33.442851",
+    "ON202609240117": "2026-09-24T12:51:12.657994",
+    "ON202609240124": "2026-09-24T13:15:10.580950",
+    "ON202609240113": "2026-09-24T13:16:23.892228",
+    "ON202609240073": "2026-09-24T13:46:02.206859",
+    "ON202609240136": "2026-09-24T13:54:12.306112",
+    "ON202609240130": "2026-09-24T13:54:36.515730",
+    "ON202609240111": "2026-09-24T13:55:04.437727",
+    "ON202609240134": "2026-09-24T13:56:51.656045",
+    "ON202609240143": "2026-09-24T14:23:43.576377",
+    "ON202609240140": "2026-09-24T14:23:57.793375",
+    "ON202609240146": "2026-09-24T14:24:47.057488",
+    "ON202609240145": "2026-09-24T14:26:43.258212",
+    "ON202609240164": "2026-09-24T15:02:37.277521",
+    "ON202609240159": "2026-09-24T15:02:52.241935",
+    "ON202609240157": "2026-09-24T15:03:09.645167",
+    "ON202609240153": "2026-09-24T15:03:45.138248",
+    "ON202609240146||Ac230gr||1s||||0": "2026-09-24T15:27:43.033224",
+    "ON202609240182||Vinyl||1s||||0||diecut": "2026-09-24T16:07:12.814092",
+    "ON202609240155||Stiker Kromo||1s||||0||kisscut": "2026-09-24T16:09:59.962832",
+    "ON202609240155||Stiker Kromo||1s||||0||": "2026-09-24T16:11:45.535172",
+    "ON202609240190||Vinyl||1s||||0||": "2026-09-24T16:23:46.693687",
+    "ON202609240187||Hologram||1s||||0||": "2026-09-24T16:24:14.516591",
+    "ON202609240181||Pindo||1s||||0||": "2026-09-24T16:30:08.804028",
+    "ON202609240176||Vinyl||1s||glossy||0||diecut": "2026-09-24T16:30:34.085286",
+    "ON202609240171||Vinyl||1s||||0||kisscut": "2026-09-24T16:30:59.301040",
+    "ON202609240167||Vinyl||1s||||0||": "2026-09-24T16:31:13.793278",
+    "ON202609240174||Ap150gr||1s||||0||": "2026-09-24T16:32:49.253139",
+    "ON202609240197||Ac310gr||2s||||0||": "2026-09-24T16:33:16.003206",
+    "ON202609240195||Ac260gr||1s||||0||": "2026-09-24T17:08:53.445253",
+    "ON202609240216||Vinyl||1s||||0||kisscut": "2026-09-24T17:38:42.370251",
+    "ON202609240209||Pindo||1s||||0||": "2026-09-24T17:39:22.139623",
+    "ON202609240201||Vinyl||1s||||0||": "2026-09-24T17:39:37.265370",
+    "ON202609240198||Vinyl||1s||||0||kisscut": "2026-09-24T17:40:02.550140",
+    "ON202609240180||Stiker Kromo||1s||||0||": "2026-09-24T17:40:18.974109",
+    "ON202609240205||Ac230gr||1s||||0||": "2026-09-24T17:44:52.926098",
+    "ON202609240215||Ac260gr||2s||||0||": "2026-09-24T17:59:35.427358",
+    "ON202609240233||Vinyl||1s||||0||kisscut": "2026-09-24T18:14:47.081696",
+    "ON202609240229||Vinyl||1s||||0||": "2026-09-24T18:15:17.208856",
+    "ON202609240226||Vinyl||1s||||0||diecut": "2026-09-24T18:15:42.195989",
+    "ON202609240233||Vinyl||1s||||0||": "2026-09-24T18:17:37.539953",
+    "ON202609240238||Ac230gr||1s||||0||": "2026-09-24T18:23:38.189565",
+    "ON202609240237||Stiker Kromo||1s||||0||": "2026-09-24T18:23:53.256840",
+    "ON202609240245||Ap120gr||1s||||0||diecut": "2026-09-24T18:32:49.185572",
+    "ON202609240244||Ac310gr||1s||glossy||0||": "2026-09-24T18:33:03.933796",
+    "ON202609240251||Vinyl||1s||||0||kisscut": "2026-09-24T18:53:52.336109",
+    "ON202609250002||Pindo||1s||||0||": "2026-09-25T08:23:01.480883",
+    "ON202609250005||Ac230gr||1s||||0||": "2026-09-25T08:34:49.270766",
+    "ON202609250006||Stiker Kromo||1s||||0||": "2026-09-25T08:37:49.633466",
+    "ON202609250010||Kromo||1s||||0||": "2026-09-25T08:45:11.490631",
+    "ON202609250007||Ac230gr||1s||||0||": "2026-09-25T08:48:11.971469",
+    "ON202609250009||Ac310gr||1s||doff||0||": "2026-09-25T08:48:26.836453",
+    "ON202609240184||Ac230gr||1s||glossy||0||": "2026-09-25T09:11:49.620761",
+    "ON202609250021||Stiker Kromo||1s||||0||diecut": "2026-09-25T09:21:02.090767",
+    "ON202609250021||Stiker Kromo||1s||||0||": "2026-09-25T09:23:52.550290",
+    "ON202609250011||Vinyl||1s||||0||diecut": "2026-09-25T09:30:03.814262",
+    "ON202609250016||Vinyl||1s||||0||kisscut": "2026-09-25T09:30:28.821481",
+    "ON202609250017||Stiker Kromo||1s||||0||kisscut": "2026-09-25T09:36:05.141965",
+    "ON202609250033||Hvs100gr||1s||||0||": "2026-09-25T09:41:56.370244",
+    "ON202609250028||Hvs100gr||1s||||0||": "2026-09-25T09:42:11.373436",
+    "ON202609250023||Ac230gr||2s||||0||": "2026-09-25T09:47:57.440520",
+    "ON202609250034||Vinyl||1s||||0||kisscut": "2026-09-25T09:51:07.713274",
+    "ON202609250030||Vinyl||1s||||0||": "2026-09-25T09:51:22.714574",
+    "ON202609250023||Ap120gr||1s||||0||": "2026-09-25T09:51:37.731531",
+    "ON202609250030||Concord||2s||||0||": "2026-09-25T09:53:58.014756",
+    "ON202609250035||Ac260gr||1s||||0||": "2026-09-25T10:03:00.102966",
+    "ON202609250035||Ac260gr||2s||||0||": "2026-09-25T10:06:00.384998"
   },
   "skip_forever": {
-    "ON202609220085": "jumlah tidak sesuai: 1000 vs 4",
-    "ON202609220071": "bahan tidak sesuai: Ac230gr vs Art Carton 310gr Fullcolor Laminating 2s",
-    "ON202609220128": "jumlah tidak sesuai: 4 vs 1",
-    "ON202609220115": "jumlah tidak sesuai: 16 vs 8",
-    "ON202609220189": "bahan tidak sesuai: Sticker Cromo vs Art Carton 260gr Fullcolor Laminating 2s",
-    "ON202609220174": "jumlah tidak sesuai: 5 vs 1",
-    "ON202609220191": "jumlah tidak sesuai: 8 vs 4",
-    "ON202609230049": "jumlah tidak sesuai: 500 vs 2",
-    "ON202609230044": "jumlah tidak sesuai: 5 vs 10",
-    "ON202609230012": "jumlah tidak sesuai: 12 vs 33",
-    "ON202609230057": "bahan tidak sesuai: Ac310gr vs HVS 100gr 32.5 x 48.7cm",
-    "ON202609230087": "jumlah tidak sesuai: 38 vs 1200",
-    "ON202609230069": "bahan tidak sesuai: Ac310gr vs Art Carton 190gr Fullcolor Laminating 2s",
-    "ON202609230169": "bahan tidak sesuai: Ac230gr vs Art Carton 310gr Fullcolor",
-    "ON202609230195": "TEST",
-    "ON202609240002": "tidak ada di KM setelah 3x retry (9 menit)",
-    "ON202609240010": "tidak ada di KM setelah 3x retry (9 menit)",
-    "ON202609240014": "tidak ada di KM setelah 3x retry (9 menit)",
-    "ON202609240036": "TEST",
-    "ON202609240081": "manual dari dashboard"
+    "ON202609240103": "manual dari dashboard",
+    "ON202609240144||Vinyl||1s||||0||kisscut": "manual dari dashboard",
+    "ON202609240131||Stiker Kromo||1s||||1||": "manual dari dashboard",
+    "ON202609230087||||1s||||1||": "manual dari dashboard",
+    "ON202609240123||Hvs100gr||1s||||0||": "manual dari dashboard",
+    "ON202609240123||Ap150gr||1s||glossy||0||diecut": "manual dari dashboard"
   },
   "skipped_nota": {
-    "ON202609220092": {
+    "ON202609240080": {
       "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:04.180835"
+      "last_try": "2026-09-24T13:42:59.052117",
+      "count": 5
     },
-    "ON202609220089": {
+    "ON202609240081": {
       "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:05.200788"
-    },
-    "ON202609220087": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:08.215601"
-    },
-    "ON202609220083": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:16.378967"
-    },
-    "ON202609220074": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:17.396271"
-    },
-    "ON202609220080": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:18.414018"
-    },
-    "ON202609220078": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:19.448314"
-    },
-    "ON202609220070": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:20.465363"
-    },
-    "ON202609220069": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:23.521614"
-    },
-    "ON202609220067": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:24.555557"
-    },
-    "ON202609220061": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:25.571583"
-    },
-    "ON202609210107": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:26.602826"
-    },
-    "ON202609220059": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:27.624199"
-    },
-    "ON202609220054": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:28.660115"
-    },
-    "ON202609220057": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:29.672653"
-    },
-    "ON202609220050": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:30.693386"
-    },
-    "ON202609220045": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:31.728593"
-    },
-    "ON202609220043": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:32.761173"
-    },
-    "ON202609220039": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:33.780670"
-    },
-    "ON202609220037": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:34.809930"
-    },
-    "ON202609220036": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:35.827498"
-    },
-    "ON202609220029": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:36.845206"
-    },
-    "ON202609220028": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:37.879954"
-    },
-    "ON202609220026": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:38.901993"
-    },
-    "ON202609220024": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:39.936506"
-    },
-    "ON202609220025": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:40.952987"
-    },
-    "ON202609220022": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:41.968911"
-    },
-    "ON202609220020": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:44.989780"
-    },
-    "ON202609220018": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:46.021298"
-    },
-    "ON202609220010": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:47.024127"
-    },
-    "ON202609220009": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:48.039351"
-    },
-    "ON202609220004": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:49.057761"
-    },
-    "ON202609220008": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:50.075502"
-    },
-    "ON202609220006": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T13:04:51.092367"
-    },
-    "ON202609220131": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T14:10:18.136288"
-    },
-    "ON202609220118": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T14:11:13.822752"
-    },
-    "ON202609220136": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T14:27:26.795135"
-    },
-    "ON202609220134": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T14:27:27.815420"
-    },
-    "ON202609220113": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T14:27:28.845757"
-    },
-    "ON202609220109": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T14:27:29.862413"
-    },
-    "ON202609220105": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T14:27:43.178870"
-    },
-    "ON202609210260": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T14:28:23.179508"
-    },
-    "ON202609220158": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T15:07:10.279367"
-    },
-    "ON202609220154": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T15:07:13.310183"
-    },
-    "ON202609220152": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T15:07:14.316637"
-    },
-    "ON202609220161": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T15:21:37.307728"
-    },
-    "ON202609220168": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T15:38:33.373607"
-    },
-    "ON202609220191": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-22T16:31:28.635806"
-    },
-    "ON202609230053": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T10:53:19.086048"
-    },
-    "ON202609230109": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T13:08:13.980505"
-    },
-    "ON202609230108": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T13:09:18.896853"
-    },
-    "ON202609230116": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T13:10:07.610621"
-    },
-    "ON202609230120": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T13:10:21.547663"
-    },
-    "ON202609230103": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T13:10:29.597897"
-    },
-    "ON202609230098": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T13:10:34.253910"
-    },
-    "ON202609230101": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T13:14:16.427246"
-    },
-    "ON202609230093": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T13:14:20.515145"
-    },
-    "ON202609230091": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T13:14:21.535055"
-    },
-    "ON202609230090": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T13:14:22.566221"
-    },
-    "ON202609230089": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T13:31:35.034283"
-    },
-    "ON202609230086": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T13:14:27.732913"
-    },
-    "ON202609230125": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T13:59:09.639213"
-    },
-    "ON202609230135": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T14:32:48.532657"
-    },
-    "ON202609230172": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T15:19:25.034186"
-    },
-    "ON202609230177": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T15:56:12.334830"
-    },
-    "ON202609230171": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T15:56:14.406326"
-    },
-    "ON202609230179": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T15:56:15.435164"
-    },
-    "ON202609230170": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T15:56:28.770463"
-    },
-    "ON202609230195": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T16:17:29.013505"
-    },
-    "ON202609230184": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T16:17:49.318879"
-    },
-    "ON202609230187": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T16:23:50.159486"
-    },
-    "ON202609230199": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T16:46:38.372110"
-    },
-    "ON202609230208": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T16:48:48.254238"
-    },
-    "ON202609230191": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T16:49:11.630251"
-    },
-    "ON202609230206": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T16:55:53.625512"
-    },
-    "ON202609230211": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-23T16:59:54.333097"
-    },
-    "ON202609240002": {
-      "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-24T08:33:54.551625",
+      "last_try": "2026-09-24T13:49:01.175982",
       "count": 2
     },
-    "ON202609240010": {
+    "ON202609240077": {
       "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-24T08:48:58.390011",
+      "last_try": "2026-09-24T13:49:02.226202",
       "count": 2
     },
-    "ON202609240014": {
+    "ON202609240075": {
       "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-24T09:04:01.594750",
+      "last_try": "2026-09-24T13:49:04.287384",
+      "count": 2
+    },
+    "ON202609240069": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T13:49:06.393918",
+      "count": 2
+    },
+    "ON202609240064": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T13:49:07.444030",
       "count": 2
     },
     "ON202609240027": {
       "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-24T09:54:12.643447",
+      "last_try": "2026-09-24T13:49:08.494551",
+      "count": 2
+    },
+    "ON202609240014": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T13:49:09.529976",
+      "count": 2
+    },
+    "ON202609240010": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T13:49:10.565694",
+      "count": 2
+    },
+    "ON202609240002": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T13:49:11.625204",
+      "count": 2
+    },
+    "ON202609240127": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T13:59:42.557173",
+      "count": 2
+    },
+    "ON202609240149": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T14:38:21.252933",
+      "count": 5
+    },
+    "ON202609240142": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:17:24.151214",
+      "count": 4
+    },
+    "ON202609240163": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:17:27.205617",
+      "count": 4
+    },
+    "ON202609240142||Stiker Kromo||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:21:41.562406",
+      "count": 5
+    },
+    "ON202609240163||Vinyl||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:21:44.594633",
+      "count": 5
+    },
+    "ON202609240097||Stiker Kromo||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:24:52.606411",
       "count": 1
     },
-    "ON202609240064": {
+    "ON202609240089||Vinyl||1s||||0": {
       "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-24T10:46:14.346814",
-      "count": 1
+      "last_try": "2026-09-24T15:38:19.262383",
+      "count": 4
     },
-    "ON202609240073": {
+    "ON202609240079||Vinyl||1s||||0": {
       "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-24T10:49:30.723404",
-      "count": 1
+      "last_try": "2026-09-24T15:38:20.298344",
+      "count": 4
     },
-    "ON202609240069": {
+    "ON202609240076||Stiker Kromo||1s||||0": {
       "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-24T10:49:55.848270",
-      "count": 1
+      "last_try": "2026-09-24T15:38:21.333694",
+      "count": 4
     },
-    "ON202609240077": {
+    "ON202609240053||Vinyl||1s||||0": {
       "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-24T11:01:17.902712",
+      "last_try": "2026-09-24T15:38:22.367850",
+      "count": 4
+    },
+    "ON202609240052||Vinyl||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:23.403347",
+      "count": 4
+    },
+    "ON202609240051||Stiker Kromo||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:24.438073",
+      "count": 4
+    },
+    "ON202609240049||Rajawali||2s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:25.486867",
+      "count": 4
+    },
+    "ON202609240049||Ac260gr||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:26.520824",
+      "count": 4
+    },
+    "ON202609240038||Vinyl||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:27.573845",
+      "count": 4
+    },
+    "ON202609240039||Master||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:28.613105",
+      "count": 4
+    },
+    "ON202609240037||Hologram||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:29.646333",
+      "count": 4
+    },
+    "ON202609240032||Ac310gr||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:31.684327",
+      "count": 4
+    },
+    "ON202609240033||Vinyl||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:32.729931",
+      "count": 4
+    },
+    "ON202609240030||Vinyl||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:33.766109",
+      "count": 4
+    },
+    "ON202609240028||Vinyl||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:34.798426",
+      "count": 4
+    },
+    "ON202609240026||Ap150gr||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:35.831101",
+      "count": 4
+    },
+    "ON202609240025||Hvs100gr||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:36.881216",
+      "count": 4
+    },
+    "ON202609240021||Stiker Kromo||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:37.924728",
+      "count": 4
+    },
+    "ON202609240011||Ap150gr||2s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:38.951138",
+      "count": 4
+    },
+    "ON202609240011||Ap150gr||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:40.002138",
+      "count": 4
+    },
+    "ON202609240008||Stiker Kromo||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:41.040175",
+      "count": 4
+    },
+    "ON202609240005||Stiker Kromo||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:42.086695",
+      "count": 4
+    },
+    "ON202609240003||Vinyl||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T15:38:43.138499",
+      "count": 4
+    },
+    "ON202609240182||Vinyl||1s||||0": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T16:01:19.909411",
       "count": 3
     },
-    "ON202609240075": {
+    "ON202609240173||Vinyl||1s||doff||0": {
       "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-24T11:01:20.007047",
+      "last_try": "2026-09-24T16:01:20.924673",
       "count": 3
     },
-    "ON202609240081": {
+    "ON202609240173||Vinyl||1s||doff||0||": {
       "reason": "kode tidak ada di list KM",
-      "last_try": "2026-09-24T11:30:24.792981",
+      "last_try": "2026-09-24T16:07:13.846425",
+      "count": 4
+    },
+    "ON202609240064||Vinyl||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T16:10:20.294017",
       "count": 1
+    },
+    "ON202609240172||Concord||2s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T16:30:36.152918",
+      "count": 2
+    },
+    "ON202609240195||Ac260gr||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T17:05:41.705122",
+      "count": 9
+    },
+    "ON202609240215||Ac260gr||2s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T17:53:21.544178",
+      "count": 5
+    },
+    "ON202609024020||Stiker Kromo||1s||||0||kisscut": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T18:11:44.707804",
+      "count": 10
+    },
+    "ON202609240205||Ac230gr||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T17:39:24.243319",
+      "count": 1
+    },
+    "ON202609240248||Master||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T18:56:28.297606",
+      "count": 1
+    },
+    "ON202609240242||Ac230gr||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T18:56:29.319805",
+      "count": 1
+    },
+    "ON202609240247||Stiker Kromo||1s||||0||kisscut": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T18:56:30.395713",
+      "count": 1
+    },
+    "ON202609240244||||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T18:56:31.428100",
+      "count": 1
+    },
+    "ON202609240228||Transparant||1s||||0||kisscut": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T18:56:33.494864",
+      "count": 1
+    },
+    "ON202609240212||Ac260gr||2s||glossy||0||diecut": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T18:56:35.557124",
+      "count": 1
+    },
+    "ON202609240199||Ap150gr||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T18:59:31.339399",
+      "count": 1
+    },
+    "ON202609240181||Stiker Kromo||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T18:59:33.414187",
+      "count": 1
+    },
+    "ON202609240188||Transparant||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T18:59:34.453786",
+      "count": 1
+    },
+    "ON202609240158||Transparant||1s||||0||kisscut": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-24T18:59:35.515467",
+      "count": 1
+    },
+    "ON202609250009||Ac310gr||1s||doff||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T08:45:12.541574",
+      "count": 1
+    },
+    "ON202609250016||Vinyl||1s||||0||kisscut": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T09:26:41.421244",
+      "count": 5
+    },
+    "ON202609250017||Stiker Kromo||1s||||0||kisscut": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T09:30:04.868495",
+      "count": 3
+    },
+    "ON202609250023||Ap120gr||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T09:29:39.378569",
+      "count": 1
+    },
+    "ON202609250030||Concord||2s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T09:47:42.953863",
+      "count": 2
+    },
+    "ON202609250030||Vinyl||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T09:47:44.010713",
+      "count": 2
+    }
+  },
+  "manual": {
+    "ON123456789012||Kromo||1s||doff||0||": {
+      "reason": "bahan tidak sesuai: Kromo vs Vinyl",
+      "updated_at": "2026-09-25T08:31:44.801142"
+    },
+    "ON202609250023||Ap120gr||1s||||0||": {
+      "reason": "bahan tidak sesuai: Ap120gr vs Art Carton 230gr Fullcolor Press Tebal A4",
+      "updated_at": "2026-09-25T09:47:45.069270"
+    },
+    "ON202609250030||Concord||2s||||0||": {
+      "reason": "bahan tidak sesuai: Concord vs Sticker Vinyl Glossy A3+ Fullcolor",
+      "updated_at": "2026-09-25T09:51:08.768180"
+    },
+    "ON202609250035||Ac260gr||2s||||0||": {
+      "reason": "jumlah tidak sesuai: 5 vs 1 (override qty manual / lewati)",
+      "updated_at": "2026-09-25T10:02:46.749157"
     }
   }
 }
