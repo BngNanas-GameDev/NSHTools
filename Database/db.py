@@ -13,8 +13,15 @@ Tabel:
   kma_events  id AI     | date | file | category | dest | status | msg | ts
   km_orders   data_id PK | date | nota | bahan_km | qty_km | status_km | flow_json | updated_at
 """
+import hashlib
+import hmac
 import json
+import os
+import re
+import secrets
 import sqlite3
+import time
+import uuid
 from pathlib import Path
 
 BASE = Path(__file__).parent
@@ -132,6 +139,24 @@ CREATE TABLE IF NOT EXISTS km_orders (
   updated_at TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_km_orders_date ON km_orders(date, nota);
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  pass_hash TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('admin','user')),
+  created_at REAL DEFAULT 0,
+  created_by TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  token TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  expires_at REAL NOT NULL,
+  created_at REAL NOT NULL,
+  remember INTEGER DEFAULT 0,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 """
 
 
@@ -145,9 +170,29 @@ def get_conn(path=None):
     return con
 
 
+def _seed_admin(con):
+    try:
+        cnt = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if cnt and int(cnt) > 0:
+            return False
+        # seed admin/admin123
+        uid = str(uuid.uuid4())
+        ph = hash_password("admin123")
+        con.execute("INSERT INTO users(id,username,pass_hash,role,created_at,created_by) VALUES(?,?,?,?,?,?)",
+                    (uid, "admin", ph, "admin", time.time(), "seed"))
+        con.commit()
+        return True
+    except Exception:
+        return False
+
+
 def init_db(path=None):
     with get_conn(path) as con:
         con.executescript(SCHEMA)
+        try:
+            _seed_admin(con)
+        except Exception:
+            pass
     # migrasi ringan DB lama: tambah kolom machine bila belum ada
     try:
         con = get_conn(path)
@@ -801,3 +846,225 @@ def km_orders_all(date, con=None):
     finally:
         if close:
             con.close()
+
+
+# ── Auth: users + sessions ───────────────────────────────────────
+USERNAME_RE = re.compile(r"^[a-z0-9._-]{3,32}$")
+PBKDF2_ITER = 260000
+
+
+def normalize_username(u: str) -> str:
+    return (u or "").strip().lower()
+
+
+def validate_username(u: str) -> str:
+    n = normalize_username(u)
+    if not USERNAME_RE.match(n):
+        raise ValueError("username 3-32 char [a-z0-9._-] (lowercase)")
+    return n
+
+
+def validate_password(p: str) -> str:
+    if not isinstance(p, str) or len(p) < 6:
+        raise ValueError("password min 6 karakter")
+    if len(p) > 128:
+        raise ValueError("password max 128 karakter")
+    return p
+
+
+def hash_password(pwd: str) -> str:
+    try:
+        import bcrypt  # type: ignore
+        return bcrypt.hashpw(pwd.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    except Exception:
+        salt = secrets.token_bytes(16)
+        dk = hashlib.pbkdf2_hmac("sha256", pwd.encode("utf-8"), salt, PBKDF2_ITER)
+        return f"pbkdf2${PBKDF2_ITER}${salt.hex()}${dk.hex()}"
+
+
+def verify_password(pwd: str, stored: str) -> bool:
+    try:
+        if stored.startswith("$2"):
+            try:
+                import bcrypt  # type: ignore
+                return bcrypt.checkpw(pwd.encode("utf-8"), stored.encode("utf-8"))
+            except Exception:
+                return False
+        if stored.startswith("pbkdf2$"):
+            parts = stored.split("$")
+            if len(parts) != 4:
+                return False
+            it = int(parts[1])
+            salt = bytes.fromhex(parts[2])
+            expect = parts[3]
+            dk = hashlib.pbkdf2_hmac("sha256", pwd.encode("utf-8"), salt, it)
+            return hmac.compare_digest(dk.hex(), expect)
+        return False
+    except Exception:
+        return False
+
+
+def user_get_by_username(username: str, con=None):
+    n = normalize_username(username)
+    close = con is None
+    con = con or get_conn()
+    try:
+        r = con.execute("SELECT id,username,pass_hash,role,created_at,created_by FROM users WHERE username=?", (n,)).fetchone()
+        return dict(r) if r else None
+    finally:
+        if close:
+            con.close()
+
+
+def user_get_by_id(uid: str, con=None):
+    close = con is None
+    con = con or get_conn()
+    try:
+        r = con.execute("SELECT id,username,pass_hash,role,created_at,created_by FROM users WHERE id=?", (uid,)).fetchone()
+        return dict(r) if r else None
+    finally:
+        if close:
+            con.close()
+
+
+def user_list(con=None):
+    close = con is None
+    con = con or get_conn()
+    try:
+        return [dict(r) for r in con.execute("SELECT id,username,role,created_at,created_by FROM users ORDER BY username")]
+    finally:
+        if close:
+            con.close()
+
+
+def user_create(username: str, password: str, role: str = "user", created_by: str = "", con=None):
+    n = validate_username(username)
+    validate_password(password)
+    if role not in ("admin", "user"):
+        raise ValueError("role harus admin/user")
+    close = con is None
+    con = con or get_conn()
+    try:
+        if con.execute("SELECT 1 FROM users WHERE username=?", (n,)).fetchone():
+            raise ValueError("username sudah ada")
+        uid = str(uuid.uuid4())
+        ph = hash_password(password)
+        con.execute("INSERT INTO users(id,username,pass_hash,role,created_at,created_by) VALUES(?,?,?,?,?,?)",
+                    (uid, n, ph, role, time.time(), created_by or ""))
+        con.commit()
+        return {"id": uid, "username": n, "role": role}
+    finally:
+        if close:
+            con.close()
+
+
+def user_delete(username: str, con=None):
+    n = normalize_username(username)
+    close = con is None
+    con = con or get_conn()
+    try:
+        cur = con.execute("DELETE FROM users WHERE username=?", (n,))
+        con.commit()
+        # cascade sessions via FK or manual
+        try:
+            con.execute("DELETE FROM sessions WHERE user_id NOT IN (SELECT id FROM users)")
+            con.commit()
+        except Exception:
+            pass
+        return cur.rowcount > 0
+    finally:
+        if close:
+            con.close()
+
+
+def user_set_password(username: str, new_password: str, con=None):
+    n = normalize_username(username)
+    validate_password(new_password)
+    close = con is None
+    con = con or get_conn()
+    try:
+        ph = hash_password(new_password)
+        cur = con.execute("UPDATE users SET pass_hash=? WHERE username=?", (ph, n))
+        con.commit()
+        return cur.rowcount > 0
+    finally:
+        if close:
+            con.close()
+
+
+def session_create(user_id: str, remember: bool = False, con=None):
+    close = con is None
+    con = con or get_conn()
+    try:
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        max_age = 7 * 86400 if remember else 2 * 86400
+        exp = now + max_age
+        con.execute("INSERT INTO sessions(token,user_id,expires_at,created_at,remember) VALUES(?,?,?,?,?)",
+                    (token, user_id, exp, now, 1 if remember else 0))
+        con.commit()
+        return token, exp, max_age
+    finally:
+        if close:
+            con.close()
+
+
+def session_get(token: str, con=None):
+    if not token:
+        return None
+    close = con is None
+    con = con or get_conn()
+    try:
+        now = time.time()
+        # cleanup expired lazily
+        try:
+            con.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
+            con.commit()
+        except Exception:
+            pass
+        r = con.execute("SELECT token,user_id,expires_at,created_at,remember FROM sessions WHERE token=? AND expires_at > ?", (token, now)).fetchone()
+        if not r:
+            return None
+        u = con.execute("SELECT id,username,role FROM users WHERE id=?", (r["user_id"],)).fetchone()
+        if not u:
+            return None
+        return {"token": r["token"], "user_id": r["user_id"], "expires_at": r["expires_at"], "remember": bool(r["remember"]),
+                "user": {"id": u["id"], "username": u["username"], "role": u["role"]}}
+    finally:
+        if close:
+            con.close()
+
+
+def session_delete(token: str, con=None):
+    if not token:
+        return False
+    close = con is None
+    con = con or get_conn()
+    try:
+        cur = con.execute("DELETE FROM sessions WHERE token=?", (token,))
+        con.commit()
+        return cur.rowcount > 0
+    finally:
+        if close:
+            con.close()
+
+
+def session_delete_by_user(user_id: str, con=None):
+    close = con is None
+    con = con or get_conn()
+    try:
+        con.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        con.commit()
+    finally:
+        if close:
+            con.close()
+
+
+# ── helper untuk hub_server exec (admin SQL editor) ──────────────
+def db_execute(sql: str, *, timeout: float = 5.0, max_rows: int = 100):
+    """Eksekusi 1 statement admin (SELECT/INSERT/UPDATE/DELETE).
+    Dipanggil dari hub_server; hub tetap yang validasi auth/admin."""
+    sql = (sql or "").strip().rstrip(";").strip()
+    if not sql:
+        raise ValueError("sql kosong")
+    return sql

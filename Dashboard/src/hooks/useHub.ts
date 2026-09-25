@@ -156,11 +156,32 @@ export interface HubState {
   kma: KmaState
 }
 
-/** Default WS: ikuti hostname halaman (LAN IP saat dibuka di PC lain, localhost di PC sendiri). */
+export function getAuthToken(): string {
+  try { return localStorage.getItem('nsh_token') || '' } catch { return '' }
+}
+export function getAuthRole(): string {
+  try { return localStorage.getItem('nsh_role') || '' } catch { return '' }
+}
+export function getAuthUser(): string {
+  try { return localStorage.getItem('nsh_user') || '' } catch { return '' }
+}
+export function clearAuth() {
+  try {
+    localStorage.removeItem('nsh_token')
+    localStorage.removeItem('nsh_role')
+    localStorage.removeItem('nsh_user')
+  } catch {}
+  try { document.cookie = 'nsh_token=; Max-Age=0; Path=/; SameSite=Lax' } catch {}
+}
+
+/** Default WS: ikuti hostname halaman + ?token= bila ada (LAN IP saat dibuka di PC lain, localhost di PC sendiri). */
 export function defaultHubUrl(): string {
   try {
     const host = location.hostname || 'localhost'
-    return `ws://${host}:8765`
+    let base = `ws://${host}:8765`
+    const tok = getAuthToken()
+    if (tok) base += `?token=${encodeURIComponent(tok)}`
+    return base
   } catch {
     return 'ws://localhost:8765'
   }
@@ -315,7 +336,8 @@ export function useHub(url: string = defaultHubUrl(), maxLogs: number = MAX_LOGS
 
   const sendCommand = useCallback((action: string, opts?: SendCommandOpts): string | null => {
     const id = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`
-    const payload: Record<string, unknown> = { type: 'command', id, action }
+    const tok = getAuthToken()
+    const payload: Record<string, unknown> = { type: 'command', id, action, token: tok }
     if (opts?.nota) payload.nota = opts.nota
     if (opts?.reason) payload.reason = opts.reason
     if (opts?.qty !== undefined && opts.qty !== '') payload.qty = opts.qty
@@ -360,7 +382,8 @@ export function useHub(url: string = defaultHubUrl(), maxLogs: number = MAX_LOGS
       ws.onopen = () => {
         attempt = 0
         setState((p) => ({ ...p, conn: 'open' }))
-        ws?.send(JSON.stringify({ type: 'subscribe', role: 'dashboard', id: 'dashboard-web' }))
+        const tok = getAuthToken()
+        ws?.send(JSON.stringify({ type: 'subscribe', role: 'dashboard', id: 'dashboard-web', token: tok }))
       }
 
       ws.onmessage = (e) => {
@@ -371,10 +394,21 @@ export function useHub(url: string = defaultHubUrl(), maxLogs: number = MAX_LOGS
         }
       }
 
-      ws.onclose = () => {
+      ws.onclose = (e: CloseEvent) => {
         if (closed) return
         if (wsRef.current === ws) wsRef.current = null
         setState((p) => ({ ...p, conn: 'closed' }))
+        // 4401 = unauthorized → redirect login
+        try {
+          if ((e as CloseEvent).code === 4401) {
+            clearAuth()
+            // avoid loop: only redirect if not already on login
+            if (location.pathname !== '/login' && location.hash !== '#/login') {
+              location.href = '/login'
+            }
+            return
+          }
+        } catch {}
         scheduleReconnect()
       }
 

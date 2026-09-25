@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useHub, defaultHubUrl, type HubLogEntry, type WmaEntry, type NotaStatus, type ModuleState, type HubStep, type CommandResult, type SendCommandOpts, type KmaRoute, type KmaPrinter, type KmaRule, type KmaStats, type KmmaTimer, type OutputFile } from './hooks/useHub'
+import { useHub, defaultHubUrl, getAuthToken, getAuthRole, getAuthUser, clearAuth, type HubLogEntry, type WmaEntry, type NotaStatus, type ModuleState, type HubStep, type CommandResult, type SendCommandOpts, type KmaRoute, type KmaPrinter, type KmaRule, type KmaStats, type KmmaTimer, type OutputFile } from './hooks/useHub'
 import { pushToast, onToast, type ToastItem } from './toast'
+import LoginPage from './pages/Login'
 
 // ─── Shared live-data helpers ───────────────────────────────────────────────
 
@@ -118,9 +119,29 @@ function PathBar({ fields, values, onChange, onSave, saving }: {
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Page = 'ringkasan' | 'nshlite' | 'kma' | 'wma' | 'kmma' | 'log' | 'pengaturan'
+type Page = 'ringkasan' | 'nshlite' | 'kma' | 'wma' | 'kmma' | 'log' | 'pengaturan' | 'database'
 type ConnStatus = 'connected' | 'connecting' | 'disconnected'
 type StatusLevel = 'success' | 'warning' | 'danger' | 'violet' | 'accent' | 'muted'
+
+const NAV: { id: Page; icon: string; label: string }[] = [
+  { id: 'ringkasan',  icon: 'dashboard', label: 'HOME'        },
+  { id: 'nshlite',   icon: 'layers',    label: 'NSH Lite'    },
+  { id: 'kma',       icon: 'router',    label: 'KMA'         },
+  { id: 'wma',       icon: 'workflow',  label: 'WMA'         },
+  { id: 'kmma',      icon: 'package',   label: 'KMMA'        },
+  { id: 'log',       icon: 'terminal',  label: 'Log'         },
+  { id: 'pengaturan',icon: 'settings',  label: 'Pengaturan'  },
+  { id: 'database',  icon: 'database',  label: 'Database'    },
+]
+const PAGE_TITLE: Record<Page, string> = {
+  ringkasan: 'HOME', nshlite: 'NSH Lite', kma: 'KMA Router',
+  wma: 'WMA', kmma: 'KMMA', log: 'Log Monitor', pengaturan: 'Pengaturan', database: 'Database',
+}
+const CONN_CFG: Record<ConnStatus, { status: StatusLevel; label: string; live: boolean }> = {
+  connected:    { status: 'success', label: 'Terhubung',    live: true  },
+  connecting:   { status: 'warning', label: 'Menghubungkan',live: false },
+  disconnected: { status: 'danger',  label: 'Terputus',     live: false },
+}
 
 // ─── Icon sprite ──────────────────────────────────────────────────────────────
 
@@ -153,6 +174,8 @@ const PATHS: Record<string, string> = {
   user:          'M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
   clock:         'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2',
   power:         'M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10',
+  database:      'M3 12a9 4 0 0 0 9 4 9 4 0 0 0 9-4M3 12v6a9 4 0 0 0 9 4 9 4 0 0 0 9-4v-6M3 8a9 4 0 0 1 9-4 9 4 0 0 1 9 4 9 4 0 0 1-9 4 9 4 0 0 1-9-4z',
+  table:         'M3 3h18v18H3zM3 9h18M3 15h18M9 3v18M15 3v18',
 }
 
 const Icon = ({ name, size = 18, className = '', style }: { name: string; size?: number; className?: string; style?: React.CSSProperties }) => {
@@ -1470,6 +1493,628 @@ const PageLog = ({ logs, live }: { logs: HubLogEntry[]; live: boolean }) => {
   )
 }
 
+// ─── Database browser (phpMyAdmin mini) — read-only SQLite ───────────────────
+// Kenapa SQLite bukan PHP/MySQL: sudah ada nsh.db SQLite (WAL, tanpa server),
+// tambah PHP/MySQL = overkill (butuh XAMPP, driver, migrasi). Cukup expose
+// SQLite via hub HTTP read-only (whitelist, parameterised, limit/offset).
+function hubHttpBase(hubUrl: string): string {
+  try {
+    const u = new URL(hubUrl)
+    const host = u.hostname || location.hostname || 'localhost'
+    const port = u.port === '8765' ? '8766' : '8766'
+    return `http://${host}:${port}`
+  } catch {
+    try { return `http://${location.hostname || 'localhost'}:8766` } catch { return 'http://localhost:8766' }
+  }
+}
+
+type DbTable = { name: string; count: number; columns: string[]; pk?: string[]; indexes?: {name:string; unique:boolean; columns:string[]}[] }
+
+const DatabasePanel = ({ hubUrl }: { hubUrl: string }) => {
+  const base = hubHttpBase(hubUrl)
+  const [tables, setTables] = useState<DbTable[]>([])
+  const [sel, setSel] = useState<string>('')
+  const [cols, setCols] = useState<string[]>([])
+  const [rows, setRows] = useState<Record<string, unknown>[]>([])
+  const [total, setTotal] = useState(0)
+  const [limit] = useState(20)
+  const [offset, setOffset] = useState(0)
+  const [search, setSearch] = useState('')
+  const [searchInput, setSearchInput] = useState('')
+  const [loadingTables, setLoadingTables] = useState(false)
+  const [loadingRows, setLoadingRows] = useState(false)
+  const [err, setErr] = useState('')
+  const [editing, setEditing] = useState<{ r: number; c: string; v: string } | null>(null)
+  const [saving, setSaving] = useState(false)
+
+  const tokAuth = getAuthToken()
+  const authHdr: Record<string,string> | undefined = tokAuth ? { Authorization: `Bearer ${tokAuth}` } : undefined
+  const fetchTables = useCallback(async () => {
+    setLoadingTables(true); setErr('')
+    try {
+      const r = await fetch(`${base}/api/db/tables`, { headers: authHdr })
+      const j = await r.json()
+      if (!j.ok) throw new Error(j.msg || 'gagal')
+      setTables(j.tables || [])
+      if (!sel && j.tables?.length) setSel(j.tables[0].name)
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally { setLoadingTables(false) }
+  }, [base, sel])
+
+  const fetchRows = useCallback(async () => {
+    if (!sel) return
+    setLoadingRows(true); setErr('')
+    try {
+      const qs = new URLSearchParams({ name: sel, limit: String(limit), offset: String(offset), search })
+      const r = await fetch(`${base}/api/db/table?${qs}`, { headers: authHdr })
+      const j = await r.json()
+      if (!j.ok) throw new Error(j.msg || 'gagal')
+      setCols(j.columns || [])
+      setRows(j.rows || [])
+      setTotal(j.total || 0)
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally { setLoadingRows(false) }
+  }, [base, sel, limit, offset, search])
+
+  useEffect(() => { fetchTables() }, [fetchTables])
+  useEffect(() => { fetchRows() }, [fetchRows])
+  // debounced search
+  useEffect(() => {
+    const t = setTimeout(() => { setSearch(searchInput); setOffset(0) }, 320)
+    return () => clearTimeout(t)
+  }, [searchInput])
+  // reset offset when table changes
+  useEffect(() => { setOffset(0); setSearch(''); setSearchInput('') }, [sel])
+
+  const page = Math.floor(offset / limit) + 1
+  const pages = Math.max(1, Math.ceil(total / limit))
+  const fmt = (v: unknown) => {
+    if (v === null || v === undefined) return <span style={{ color: 'var(--color-text-dim)' }}>NULL</span>
+    const s = String(v)
+    if (s.length > 120) return s.slice(0, 120) + '…'
+    return s
+  }
+
+  const pkOfSel = tables.find(t => t.name === sel)?.pk || []
+  const startEdit = (r: number, c: string) => {
+    const v = rows[r]?.[c]
+    setEditing({ r, c, v: v == null ? '' : String(v) })
+  }
+  const cancelEdit = () => setEditing(null)
+  const saveEdit = async () => {
+    if (!editing || !sel) return
+    const { r, c, v } = editing
+    const row = rows[r]
+    if (!row) return
+    // bangun WHERE dari PK, fallback ke semua kolom bila tanpa PK (update by rowid tidak ada)
+    const whereCols = pkOfSel.length ? pkOfSel : cols
+    const whereVals = whereCols.map(k => row[k])
+    // cegah update PK itu sendiri tanpa konfirmasi? boleh, tapi tetap where pakai nilai lama
+    const esc = (x: unknown) => {
+      if (x == null) return 'NULL'
+      const s = String(x).replace(/'/g, "''")
+      return `'${s}'`
+    }
+    const setVal = v === '' ? "''" : esc(v)
+    // jika kolom yang diedit adalah bagian PK, where pakai nilai lama (row[c]), set pakai nilai baru
+    const whereClause = whereCols.map(k => {
+      const orig = row[k]
+      return `"${k.replace(/"/g, '""')}"=${orig == null ? 'NULL' : esc(orig)}`
+    }).join(' AND ')
+    const sql = `UPDATE "${sel.replace(/"/g, '""')}" SET "${c.replace(/"/g, '""')}"=${setVal} WHERE ${whereClause}`
+    if (!whereClause) { pushToast('PK kosong, tidak bisa update', 'danger'); return }
+    // konfirmasi bila tanpa WHERE spesifik? sudah ada where
+    setSaving(true)
+    try {
+      const res = await fetch(`${base}/api/db/exec`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(authHdr || {}) },
+        body: JSON.stringify({ sql }),
+      })
+      const j = await res.json()
+      if (!j.ok) throw new Error(j.msg || 'gagal')
+      pushToast(`Update ${sel}.${c} OK (${j.rowcount ?? 1})`, 'success')
+      setEditing(null)
+      await fetchRows()
+      // refresh count tabel
+      fetchTables()
+    } catch (e: unknown) {
+      pushToast(e instanceof Error ? e.message : String(e), 'danger')
+    } finally { setSaving(false) }
+  }
+
+  return (
+    <div className="card overflow-hidden" style={{ border: '1px solid var(--color-border)' }}>
+      <div className="flex items-center gap-2 px-4 py-3" style={{ borderBottom: '1px solid var(--color-border)', background: 'var(--color-bg)' }}>
+        <Icon name="database" size={14} style={{ color: 'var(--color-accent)' } as any} />
+        <span className="section-label">Browse Database — nsh.db</span>
+        <span className="rounded-full px-1.5 font-bold ml-auto" style={{ background: 'var(--color-border)', fontSize: 10 }}>{tables.length} tabel</span>
+        <button className="btn btn-ghost btn-sm" title="Muat ulang" onClick={() => { fetchTables(); fetchRows() }} disabled={loadingTables || loadingRows}>
+          <Icon name="refresh" size={13} /> {loadingTables || loadingRows ? '…' : 'Refresh'}
+        </button>
+      </div>
+      {err && (
+        <div className="flex items-center gap-2 px-4 py-2" style={{ background: 'var(--color-danger-ghost)', color: 'var(--color-danger-fg)', fontSize: 'var(--text-xs)', borderBottom: '1px solid var(--color-border)' }}>
+          <Icon name="alertTriangle" size={13} /> {err}
+        </div>
+      )}
+      <div className="grid" style={{ gridTemplateColumns: '200px 1fr', minHeight: 380 }}>
+        {/* Tabel list */}
+        <div className="overflow-y-auto" style={{ borderRight: '1px solid var(--color-border)', background: 'var(--color-panel)', maxHeight: 520 }}>
+          <div className="px-3 py-2 section-label" style={{ borderBottom: '1px solid var(--color-border-subtle)' }}>Tabel</div>
+          {loadingTables && <div className="px-3 py-3" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>Memuat…</div>}
+          {tables.map(t => (
+            <button key={t.name} onClick={() => setSel(t.name)}
+              className="w-full text-left flex items-center gap-2 px-3 py-2.5 cursor-pointer"
+              style={{
+                background: sel === t.name ? 'var(--color-nav-active)' : 'transparent',
+                borderLeft: sel === t.name ? '2px solid var(--color-accent)' : '2px solid transparent',
+                borderBottom: '1px solid var(--color-border-subtle)',
+              }}>
+              <Icon name="table" size={13} style={{ color: sel === t.name ? 'var(--color-accent)' : 'var(--color-text-muted)' } as any} />
+              <span className="font-mono truncate flex-1" style={{ fontSize: 'var(--text-xs)', color: sel === t.name ? 'var(--color-text)' : 'var(--color-text-secondary)' }}>{t.name}</span>
+              <span className="rounded-full px-1 font-bold shrink-0" style={{ background: 'var(--color-border)', fontSize: 9 }}>{t.count}</span>
+            </button>
+          ))}
+          {!loadingTables && tables.length === 0 && <div className="px-3 py-3" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-dim)' }}>Tidak ada tabel</div>}
+        </div>
+        {/* Data panel */}
+        <div className="flex flex-col min-w-0">
+          <div className="flex items-center gap-2 px-3 py-2 flex-wrap" style={{ borderBottom: '1px solid var(--color-border-subtle)', background: 'var(--color-bg)' }}>
+            <div className="flex items-center gap-1.5 flex-1 min-w-[160px]">
+              <Icon name="search" size={13} style={{ color: 'var(--color-text-muted)' } as any} />
+              <input className="input" placeholder="Filter (LIKE %…%)…" value={searchInput}
+                onChange={e => setSearchInput(e.target.value)} style={{ flex: 1, padding: '6px 10px', fontSize: 'var(--text-xs)' }} />
+            </div>
+            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>{total} baris</span>
+          </div>
+          <div className="overflow-auto" style={{ maxHeight: 400 }}>
+            <table className="data-table" style={{ minWidth: 640 }}>
+              <thead>
+                <tr>{cols.map(c => <th key={c} style={{ whiteSpace: 'nowrap' }}>{c}</th>)}
+                {cols.length === 0 && <th>—</th>}</tr>
+              </thead>
+              <tbody>
+                {loadingRows && <tr><td colSpan={Math.max(1, cols.length)} style={{ padding: 16, color: 'var(--color-text-muted)', fontSize: 'var(--text-xs)' }}>Memuat…</td></tr>}
+                {!loadingRows && rows.length === 0 && <tr><td colSpan={Math.max(1, cols.length)}><EmptyState icon="database" title="Tidak ada data" description={search ? `Tidak ada baris cocok "${search}"` : 'Tabel kosong atau hub offline'} /></td></tr>}
+                {!loadingRows && rows.map((r, i) => (
+                  <tr key={i}>
+                    {cols.map(c => {
+                      const isEdit = editing?.r === i && editing?.c === c
+                      return (
+                        <td key={c} title={String(r[c] ?? '')} style={{ maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--text-xs)' }}>
+                          {isEdit ? (
+                            <input className="input" autoFocus value={editing.v}
+                              onChange={e => setEditing({ r: i, c, v: e.target.value })}
+                              onKeyDown={e => { if (e.key === 'Enter') saveEdit(); if (e.key === 'Escape') cancelEdit() }}
+                              onBlur={saveEdit}
+                              onClick={e => e.stopPropagation()}
+                              style={{ padding: '4px 6px', fontSize: 'var(--text-xs)', minWidth: 120 }}
+                              disabled={saving} />
+                          ) : (
+                            <div className="flex items-center gap-1" onClick={() => !saving && startEdit(i, c)} style={{ cursor: 'pointer' }}>
+                              <span className="font-mono truncate flex-1" style={{ color: r[c] == null ? 'var(--color-text-dim)' : 'var(--color-text-secondary)' }}>{fmt(r[c])}</span>
+                            </div>
+                          )}
+                        </td>
+                      )
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex items-center gap-2 px-3 py-2 mt-auto" style={{ borderTop: '1px solid var(--color-border-subtle)', background: 'var(--color-bg)' }}>
+            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>Hal {page}/{pages} • {total} baris</span>
+            <div className="ml-auto flex items-center gap-1.5">
+              <button className="btn btn-ghost btn-sm" disabled={offset === 0} onClick={() => setOffset(o => Math.max(0, o - limit))}>
+                <Icon name="chevronLeft" size={13} /> Prev
+              </button>
+              <span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', minWidth: 64, textAlign: 'center' }}>{offset + 1}–{Math.min(offset + limit, total)} / {total}</span>
+              <button className="btn btn-ghost btn-sm" disabled={offset + limit >= total} onClick={() => setOffset(o => o + limit)}>
+                Next <Icon name="chevronRight" size={13} />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── PageDatabase: Tab Kiri admin only — Table + Schema + SQL Editor ──────────
+const PageDatabase = ({ hubUrl }: { hubUrl: string }) => {
+  const role = getAuthRole()
+  if (role !== 'admin') {
+    return <EmptyState icon="database" title="Akses ditolak" description="Halaman Database hanya untuk admin" />
+  }
+  const base = hubHttpBase(hubUrl)
+  const [sub, setSub] = useState<'table'|'schema'|'sql'>('table')
+  const [tables, setTables] = useState<DbTable[]>([])
+  const [sel, setSel] = useState<string>('')
+  const [cols, setCols] = useState<string[]>([])
+  const [rows, setRows] = useState<Record<string, unknown>[]>([])
+  const [total, setTotal] = useState(0)
+  const [limit] = useState(20)
+  const [offset, setOffset] = useState(0)
+  const [search, setSearch] = useState('')
+  const [searchInput, setSearchInput] = useState('')
+  const [loadingTables, setLoadingTables] = useState(false)
+  const [loadingRows, setLoadingRows] = useState(false)
+  const [err, setErr] = useState('')
+  const [editing, setEditing] = useState<{ r: number; c: string; v: string } | null>(null)
+  const [saving, setSaving] = useState(false)
+  // SQL editor
+  const [sql, setSql] = useState('SELECT * FROM wma_entries LIMIT 20')
+  const [sqlRunning, setSqlRunning] = useState(false)
+  const [sqlErr, setSqlErr] = useState('')
+  const [sqlCols, setSqlCols] = useState<string[]>([])
+  const [sqlRows, setSqlRows] = useState<Record<string,unknown>[]>([])
+  const [sqlRowCount, setSqlRowCount] = useState<number| null>(null)
+  const [sqlLastId, setSqlLastId] = useState<number| null>(null)
+
+  const tok = getAuthToken()
+  const hdr: Record<string,string> = tok ? { Authorization: `Bearer ${tok}` } : {}
+  const hdrJson: Record<string,string> = { 'Content-Type': 'application/json', ...hdr }
+
+  const fetchTables = useCallback(async () => {
+    setLoadingTables(true); setErr('')
+    try {
+      const tok2 = getAuthToken()
+      const h2: Record<string,string> | undefined = tok2 ? { Authorization: `Bearer ${tok2}` } : undefined
+      const r = await fetch(`${base}/api/db/tables`, { headers: h2 })
+      const j = await r.json()
+      if (!j.ok) throw new Error(j.msg||'gagal')
+      setTables(j.tables||[])
+      if (!sel && j.tables?.length) setSel(j.tables[0].name)
+    } catch(e:unknown){ setErr(e instanceof Error?e.message:String(e)) }
+    finally{ setLoadingTables(false) }
+  }, [base, sel])
+
+  const fetchRows = useCallback(async () => {
+    if (!sel) return
+    setLoadingRows(true); setErr('')
+    try {
+      const tok2 = getAuthToken()
+      const h2: Record<string,string> | undefined = tok2 ? { Authorization: `Bearer ${tok2}` } : undefined
+      const qs = new URLSearchParams({ name: sel, limit: String(limit), offset: String(offset), search })
+      const r = await fetch(`${base}/api/db/table?${qs}`, { headers: h2 })
+      const j = await r.json()
+      if (!j.ok) throw new Error(j.msg||'gagal')
+      setCols(j.columns||[]); setRows(j.rows||[]); setTotal(j.total||0)
+    } catch(e:unknown){ setErr(e instanceof Error?e.message:String(e)) }
+    finally{ setLoadingRows(false) }
+  }, [base, sel, limit, offset, search])
+
+  useEffect(()=>{ fetchTables() }, [fetchTables])
+  useEffect(()=>{ if(sub==='table') fetchRows() }, [fetchRows, sub])
+  useEffect(()=>{ const t=setTimeout(()=>{ setSearch(searchInput); setOffset(0)},320); return()=>clearTimeout(t)},[searchInput])
+  useEffect(()=>{ setOffset(0); setSearch(''); setSearchInput('') }, [sel])
+
+  const runSql = async () => {
+    const s = sql.trim()
+    if (!s) { pushToast('SQL kosong','warning'); return }
+    // confirm untuk INSERT/UPDATE/DELETE tanpa WHERE atau berpotensi besar
+    const upper = s.toUpperCase()
+    const needsWhere = /\b(UPDATE|DELETE)\b/.test(upper) && !/\bWHERE\b/.test(upper)
+    const isWrite = /\b(INSERT|UPDATE|DELETE)\b/.test(upper)
+    if (isWrite) {
+      const msg = needsWhere
+        ? `${upper.includes('DELETE')?'DELETE':'UPDATE'} tanpa WHERE akan mengubah semua baris. Lanjutkan?`
+        : `${isWrite?'Perintah WRITE akan mengubah data':'Eksekusi'} — lanjutkan?`
+      if (!window.confirm(msg)) return
+    }
+    setSqlRunning(true); setSqlErr(''); setSqlCols([]); setSqlRows([]); setSqlRowCount(null); setSqlLastId(null)
+    try {
+      const tok3=getAuthToken()
+      const h3: Record<string,string> = {'Content-Type':'application/json'}
+      if(tok3) h3['Authorization']=`Bearer ${tok3}`
+      const r = await fetch(`${base}/api/db/exec`, { method:'POST', headers: h3, body: JSON.stringify({ sql: s }) })
+      const j = await r.json()
+      if (!j.ok) throw new Error(j.msg||'gagal')
+      setSqlCols(j.columns||[]); setSqlRows(j.rows||[]); setSqlRowCount(j.rowcount??null); setSqlLastId(j.lastRowId??null)
+      if (j.rowcount!=null && j.rowcount>100) pushToast(`rowCount ${j.rowcount} — operasi besar, periksa kembali`,'warning')
+      else pushToast(j.columns?.length? `OK ${j.rows?.length||0} baris` : `OK rowCount ${j.rowcount}`, 'success')
+      // refresh table count after write
+      if (isWrite) fetchTables()
+    } catch(e:unknown){
+      const m = e instanceof Error?e.message:String(e)
+      setSqlErr(m); pushToast(m,'danger')
+    } finally { setSqlRunning(false) }
+  }
+
+  const selTable = tables.find(t=>t.name===sel)
+  const fmt = (v:unknown)=> {
+    if (v===null||v===undefined) return <span style={{color:'var(--color-text-dim)'}}>NULL</span>
+    const s=String(v); return s.length>120?s.slice(0,120)+'…':s
+  }
+  const pkOfSel = selTable?.pk || []
+  const startEdit = (r:number, c:string) => {
+    const v = rows[r]?.[c]
+    setEditing({ r, c, v: v==null ? '' : String(v) })
+  }
+  const cancelEdit = () => setEditing(null)
+  const saveEdit = async () => {
+    if (!editing || !sel) return
+    const { r, c, v } = editing
+    const row = rows[r]
+    if (!row) return
+    const whereCols = pkOfSel.length ? pkOfSel : cols
+    if (!whereCols.length) { pushToast('PK kosong, tidak bisa update', 'danger'); return }
+    const esc = (x:unknown) => {
+      if (x==null) return 'NULL'
+      const s=String(x).replace(/'/g,"''")
+      return `'${s}'`
+    }
+    const setVal = v==='' ? "''" : esc(v)
+    const whereClause = whereCols.map(k=>{
+      const orig=row[k]
+      return orig==null ? `"${k.replace(/"/g,'""')}" IS NULL` : `"${k.replace(/"/g,'""')}"=${esc(orig)}`
+    }).join(' AND ')
+    const sql = `UPDATE "${sel.replace(/"/g,'""')}" SET "${c.replace(/"/g,'""')}"=${setVal} WHERE ${whereClause}`
+    setSaving(true)
+    try{
+      const hdr2: Record<string,string> = {}
+      const tok2=getAuthToken()
+      if(tok2) hdr2['Authorization']=`Bearer ${tok2}`
+      hdr2['Content-Type']='application/json'
+      const res=await fetch(`${base}/api/db/exec`,{method:'POST', headers: hdr2, body: JSON.stringify({sql})})
+      const j=await res.json()
+      if(!j.ok) throw new Error(j.msg||'gagal')
+      pushToast(`Update ${sel}.${c} OK (${j.rowcount??1})`,'success')
+      setEditing(null)
+      await fetchRows()
+      fetchTables()
+    }catch(e:unknown){ pushToast(e instanceof Error?e.message:String(e),'danger') }
+    finally{ setSaving(false) }
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center gap-2 flex-wrap">
+        {(['table','schema','sql'] as const).map(t=> (
+          <button key={t} className="chip font-mono" onClick={()=>setSub(t)}
+            style={{ background: sub===t?'var(--color-nav-active)':'var(--color-panel)', color: sub===t?'var(--color-accent)':'var(--color-text-secondary)', border:`1px solid ${sub===t?'var(--color-accent-ghost)':'var(--color-border)'}` }}>
+            {t==='table'?'Table':t==='schema'?'Schema':'SQL Editor'}
+          </button>
+        ))}
+        <span className="ml-auto rounded px-1.5 py-0.5 font-mono" style={{fontSize:10, background:'var(--color-violet-ghost)', color:'var(--color-violet-fg)', border:'1px solid var(--color-violet)'}}>admin only</span>
+        <button className="btn btn-ghost btn-sm" onClick={fetchTables} disabled={loadingTables}><Icon name="refresh" size={13}/> Refresh</button>
+      </div>
+      {err && <div className="flex items-center gap-2 px-4 py-2 rounded" style={{background:'var(--color-danger-ghost)', color:'var(--color-danger-fg)', fontSize:'var(--text-xs)'}}><Icon name="alertTriangle" size={13}/>{err}</div>}
+
+      {sub==='table' && (
+        <div className="card overflow-hidden" style={{border:'1px solid var(--color-border)'}}>
+          <div className="grid" style={{gridTemplateColumns:'200px 1fr', minHeight:420}}>
+            <div className="overflow-y-auto" style={{borderRight:'1px solid var(--color-border)', background:'var(--color-panel)', maxHeight:560}}>
+              <div className="px-3 py-2 section-label" style={{borderBottom:'1px solid var(--color-border-subtle)'}}>Tabel</div>
+              {loadingTables && <div className="px-3 py-3" style={{fontSize:'var(--text-xs)', color:'var(--color-text-muted)'}}>Memuat…</div>}
+              {tables.map(t=>(
+                <button key={t.name} onClick={()=>setSel(t.name)} className="w-full text-left flex items-center gap-2 px-3 py-2.5 cursor-pointer"
+                  style={{background: sel===t.name?'var(--color-nav-active)':'transparent', borderLeft: sel===t.name?'2px solid var(--color-accent)':'2px solid transparent', borderBottom:'1px solid var(--color-border-subtle)'}}>
+                  <Icon name="table" size={13} style={{color: sel===t.name?'var(--color-accent)':'var(--color-text-muted)'} as any}/>
+                  <span className="font-mono truncate flex-1" style={{fontSize:'var(--text-xs)', color: sel===t.name?'var(--color-text)':'var(--color-text-secondary)'}}>{t.name}</span>
+                  <span className="rounded-full px-1 font-bold shrink-0" style={{background:'var(--color-border)', fontSize:9}}>{t.count}</span>
+                </button>
+              ))}
+            </div>
+            <div className="flex flex-col min-w-0">
+              <div className="flex items-center gap-2 px-3 py-2 flex-wrap" style={{borderBottom:'1px solid var(--color-border-subtle)', background:'var(--color-bg)'}}>
+                <div className="flex items-center gap-1.5 flex-1 min-w-[160px]">
+                  <Icon name="search" size={13} style={{color:'var(--color-text-muted)'} as any}/>
+                  <input className="input" placeholder="Filter LIKE %…%…" value={searchInput} onChange={e=>setSearchInput(e.target.value)} style={{flex:1, padding:'6px 10px', fontSize:'var(--text-xs)'}}/>
+                </div>
+                <span style={{fontSize:'var(--text-xs)', color:'var(--color-text-muted)'}}>{total} baris</span>
+              </div>
+              <div className="overflow-auto" style={{maxHeight:420}}>
+                <table className="data-table" style={{minWidth:640}}>
+                  <thead><tr>{cols.map(c=><th key={c} style={{whiteSpace:'nowrap'}}>{c}</th>)}{cols.length===0&&<th>—</th>}</tr></thead>
+                  <tbody>
+                    {loadingRows && <tr><td colSpan={Math.max(1,cols.length)} style={{padding:16, color:'var(--color-text-muted)', fontSize:'var(--text-xs)'}}>Memuat…</td></tr>}
+                    {!loadingRows && rows.length===0 && <tr><td colSpan={Math.max(1,cols.length)}><EmptyState icon="database" title="Tidak ada data" description={search?`Tidak ada baris cocok "${search}"`:'Tabel kosong'}/></td></tr>}
+                    {!loadingRows && rows.map((r,i)=>(
+                      <tr key={i}>{cols.map(c=>{
+                        const isEdit = editing?.r===i && editing?.c===c
+                        return (
+                          <td key={c} title={String(r[c]??'')} style={{maxWidth:240, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', fontSize:'var(--text-xs)', cursor: isEdit ? 'default' : 'pointer'}}
+                            onClick={()=>!isEdit && !saving && startEdit(i,c)}>
+                            {isEdit ? (
+                              <input className="input" autoFocus value={editing.v} onChange={e=>setEditing({r:i,c,v:e.target.value})} onKeyDown={e=>{if(e.key==='Enter') saveEdit(); if(e.key==='Escape') cancelEdit()}} onBlur={saveEdit} onClick={e=>e.stopPropagation()} style={{padding:'4px 6px', fontSize:'var(--text-xs)', minWidth:120}} disabled={saving} />
+                            ) : (
+                              <span className="font-mono truncate" style={{color: r[c]==null?'var(--color-text-dim)':'var(--color-text-secondary)'}}>{fmt(r[c])}</span>
+                            )}
+                          </td>
+                        )
+                      })}</tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="flex items-center gap-2 px-3 py-2 mt-auto" style={{borderTop:'1px solid var(--color-border-subtle)', background:'var(--color-bg)'}}>
+                <span style={{fontSize:'var(--text-xs)', color:'var(--color-text-muted)'}}>Hal {Math.floor(offset/limit)+1}/{Math.max(1,Math.ceil(total/limit))} • {total} baris</span>
+                <div className="ml-auto flex items-center gap-1.5">
+                  <button className="btn btn-ghost btn-sm" disabled={offset===0} onClick={()=>setOffset(o=>Math.max(0,o-limit))}><Icon name="chevronLeft" size={13}/> Prev</button>
+                  <span className="font-mono" style={{fontSize:'var(--text-xs)', color:'var(--color-text-muted)', minWidth:64, textAlign:'center'}}>{offset+1}–{Math.min(offset+limit,total)} / {total}</span>
+                  <button className="btn btn-ghost btn-sm" disabled={offset+limit>=total} onClick={()=>setOffset(o=>o+limit)}>Next <Icon name="chevronRight" size={13}/></button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {sub==='schema' && (
+        <div className="card p-5 flex flex-col gap-4">
+          <SectionHeader label="Schema" action={<span style={{fontSize:'var(--text-xs)', color:'var(--color-text-muted)'}}>{tables.length} tabel • via /api/db/tables</span>} />
+          <div className="grid gap-3" style={{gridTemplateColumns:'repeat(auto-fill, minmax(300px,1fr))'}}>
+            {tables.map(t=>(
+              <div key={t.name} className="rounded-lg p-3.5" style={{background:'var(--color-bg)', border:'1px solid var(--color-border)'}}>
+                <div className="flex items-center gap-2 mb-2">
+                  <Icon name="table" size={14} style={{color:'var(--color-accent)'} as any}/>
+                  <span className="font-mono font-bold" style={{fontSize:'var(--text-sm)'}}>{t.name}</span>
+                  <span className="rounded-full px-1.5 font-bold ml-auto" style={{background:'var(--color-border)', fontSize:10}}>{t.count}</span>
+                </div>
+                <div className="section-label mb-1">Kolom {t.pk?.length ? `(PK: ${t.pk.join(', ')})` : ''}</div>
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {t.columns.map(c=>(
+                    <span key={c} className="rounded px-1.5 py-0.5 font-mono" style={{fontSize:11, background: t.pk?.includes(c)?'var(--color-accent-ghost)':'var(--color-panel)', color: t.pk?.includes(c)?'var(--color-accent)':'var(--color-text-secondary)', border:`1px solid ${t.pk?.includes(c)?'var(--color-accent)':'var(--color-border)'}`}}>{c}{t.pk?.includes(c)?' ★':''}</span>
+                  ))}
+                </div>
+                {t.indexes?.length ? (
+                  <div>
+                    <div className="section-label mb-1">Index</div>
+                    <div className="flex flex-col gap-1">
+                      {t.indexes.map(ix=>(
+                        <div key={ix.name} className="font-mono" style={{fontSize:11, color:'var(--color-text-muted)'}}>{ix.name}{ix.unique?' (unique)':''}: {ix.columns.join(', ')||'—'}</div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {sub==='sql' && (
+        <div className="card p-5 flex flex-col gap-3">
+          <SectionHeader label="SQL Editor (admin)" action={<span className="rounded px-1.5 py-0.5 font-mono" style={{fontSize:10, background:'var(--color-warning-ghost)', color:'var(--color-warning-fg)', border:'1px solid var(--color-warning)'}}>INSERT/UPDATE/DELETE memerlukan konfirmasi</span>} />
+          <textarea className="input font-mono" value={sql} onChange={e=>setSql(e.target.value)} rows={4} spellCheck={false} placeholder="SELECT * FROM wma_entries LIMIT 20" style={{fontSize:'var(--text-sm)', lineHeight:'1.5'}} />
+          <div className="flex items-center gap-2 flex-wrap">
+            <button className="btn btn-primary btn-sm" onClick={runSql} disabled={sqlRunning}><Icon name="send" size={13}/> {sqlRunning?'Menjalankan…':'Run'}</button>
+            <button className="btn btn-ghost btn-sm" onClick={()=>setSql('SELECT * FROM wma_entries LIMIT 20')}>Contoh: wma_entries</button>
+            <button className="btn btn-ghost btn-sm" onClick={()=>setSql('SELECT name FROM sqlite_master WHERE type=\'table\'')}>List tables</button>
+            <span style={{fontSize:10, color:'var(--color-text-dim)'}}>1 statement / klik • limit 100 baris • timeout 5s • transaction commit/rollback</span>
+          </div>
+          {sqlErr && <div className="flex items-center gap-2 px-3 py-2 rounded" style={{background:'var(--color-danger-ghost)', color:'var(--color-danger-fg)', fontSize:'var(--text-xs)'}}><Icon name="alertTriangle" size={13}/>{sqlErr}</div>}
+          {(sqlCols.length>0 || sqlRowCount!==null) && (
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-2" style={{fontSize:'var(--text-xs)', color:'var(--color-text-muted)'}}>
+                <span>rowCount: {sqlRowCount??'—'}</span>
+                {sqlLastId ? <span>lastRowId: {sqlLastId}</span> : null}
+                <span>cols: {sqlCols.join(', ')||'—'}</span>
+                {sqlRows.length>=100 && <span style={{color:'var(--color-warning-fg)'}}>truncated 100</span>}
+              </div>
+              <div className="overflow-auto" style={{maxHeight:400, border:'1px solid var(--color-border)', borderRadius:8}}>
+                <table className="data-table" style={{minWidth:560}}>
+                  <thead><tr>{sqlCols.map(c=><th key={c}>{c}</th>)}{sqlCols.length===0&&<th>result</th>}</tr></thead>
+                  <tbody>
+                    {sqlRows.length===0 && <tr><td colSpan={Math.max(1,sqlCols.length)}><EmptyState icon="database" title="Tidak ada baris" description={sqlErr?'Perbaiki SQL dan Run lagi':'No rows'}/></td></tr>}
+                    {sqlRows.map((r,i)=>(
+                      <tr key={i}>{sqlCols.map(c=>(
+                        <td key={c} title={String(r[c]??'')} style={{maxWidth:240, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', fontSize:'var(--text-xs)'}}><span className="font-mono">{fmt(r[c])}</span></td>
+                      ))}</tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Manajemen User (admin only) ──────────────────────────────────────────
+const UserManagementPanel = () => {
+  const role = getAuthRole()
+  const selfUser = getAuthUser()
+  const [users, setUsers] = useState<{username:string;role:string;created_at:number;created_by:string}[]>([])
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState('')
+  const [newUser, setNewUser] = useState('')
+  const [newPass, setNewPass] = useState('')
+  const [newRole, setNewRole] = useState<'admin'|'user'>('user')
+  if (role !== 'admin') return null
+  const base = (()=>{ try{ const h=location.hostname||'localhost'; return `http://${h}:8766` }catch{return 'http://localhost:8766'} })()
+  const token = getAuthToken()
+  const hdr: Record<string,string> = { 'Content-Type':'application/json', ...(token?{ Authorization: `Bearer ${token}` }: {}) }
+  const fetchUsers = useCallback(async () => {
+    setLoading(true); setErr('')
+    try {
+      const r = await fetch(`${base}/api/users`, { headers: hdr })
+      const j = await r.json()
+      if (!j.ok) throw new Error(j.msg||'gagal')
+      setUsers(j.users||[])
+    } catch(e:unknown){ setErr(e instanceof Error?e.message:String(e)) }
+    finally{ setLoading(false) }
+  }, [base, token])
+  useEffect(()=>{ fetchUsers() }, [fetchUsers])
+  const add = async () => {
+    if (!newUser.trim()||!newPass) { pushToast('Username & password wajib','warning'); return }
+    try{
+      const r = await fetch(`${base}/api/users`, { method:'POST', headers: hdr, body: JSON.stringify({ username:newUser.trim(), password:newPass, role:newRole }) })
+      const j = await r.json()
+      if (!j.ok) throw new Error(j.msg)
+      pushToast(`User ${newUser} dibuat`,'success'); setNewUser(''); setNewPass(''); fetchUsers()
+    }catch(e:unknown){ pushToast(e instanceof Error?e.message:String(e),'danger') }
+  }
+  const del = async (u:string) => {
+    if (u.toLowerCase()===selfUser.toLowerCase()) { pushToast('Tidak bisa hapus diri sendiri','warning'); return }
+    if (!confirm(`Hapus user ${u}?`)) return
+    try{
+      let r = await fetch(`${base}/api/users/${encodeURIComponent(u)}`, { method:'DELETE', headers: hdr })
+      if (r.status===404||r.status===405) {
+        r = await fetch(`${base}/api/users/delete`, { method:'POST', headers: hdr, body: JSON.stringify({ username:u }) })
+      }
+      const j = await r.json()
+      if (!j.ok) throw new Error(j.msg)
+      pushToast(`User ${u} dihapus`,'success'); fetchUsers()
+    }catch(e:unknown){ pushToast(e instanceof Error?e.message:String(e),'danger') }
+  }
+  const reset = async (u:string) => {
+    const np = prompt(`Password baru untuk ${u} (min 6 char):`)
+    if (!np) return
+    try{
+      const r = await fetch(`${base}/api/users/reset`, { method:'POST', headers: hdr, body: JSON.stringify({ username:u, password:np }) })
+      const j = await r.json()
+      if (!j.ok) throw new Error(j.msg)
+      pushToast(`Password ${u} direset`,'success')
+    }catch(e:unknown){ pushToast(e instanceof Error?e.message:String(e),'danger') }
+  }
+  return (
+    <div className="card p-6 flex flex-col gap-4">
+      <SectionHeader label="Manajemen User (admin)" action={<button className="btn btn-ghost btn-sm" onClick={fetchUsers}><Icon name="refresh" size={13}/> Refresh</button>} />
+      {err && <div style={{color:'var(--color-danger-fg)', fontSize:'var(--text-xs)'}}>{err}</div>}
+      <div className="grid gap-2" style={{gridTemplateColumns:'1fr 1fr 120px auto'}}>
+        <input className="input" placeholder="username (3-32 a-z0-9._-)" value={newUser} onChange={e=>setNewUser(e.target.value)} />
+        <input className="input" type="password" placeholder="password min 6" value={newPass} onChange={e=>setNewPass(e.target.value)} />
+        <select className="input" value={newRole} onChange={e=>setNewRole(e.target.value as any)}>
+          <option value="user">user</option><option value="admin">admin</option>
+        </select>
+        <button className="btn btn-primary btn-sm" onClick={add}>Tambah</button>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="data-table">
+          <thead><tr><th>Username</th><th>Role</th><th>Dibuat</th><th>Aksi</th></tr></thead>
+          <tbody>
+            {loading && <tr><td colSpan={4} style={{color:'var(--color-text-muted)', fontSize:'var(--text-xs)'}}>Memuat…</td></tr>}
+            {!loading && users.length===0 && <tr><td colSpan={4}><EmptyState icon="user" title="Belum ada user" description="Tambah user via form di atas"/></td></tr>}
+            {users.map(u=>(
+              <tr key={u.username}>
+                <td><span className="font-mono" style={{color:'var(--color-accent-fg)'}}>{u.username}</span> {u.username===selfUser && <span style={{fontSize:10, background:'var(--color-accent-ghost)', color:'var(--color-accent)', padding:'2px 6px', borderRadius:4}}>YOU</span>}</td>
+                <td><Badge label={u.role.toUpperCase()} status={u.role==='admin'?'violet':'muted'} /></td>
+                <td style={{fontSize:'var(--text-xs)', color:'var(--color-text-muted)'}}>{u.created_by||'-'}</td>
+                <td>
+                  <div className="flex gap-1.5">
+                    <button className="btn btn-ghost btn-sm" onClick={()=>reset(u.username)}><Icon name="refresh" size={12}/> Reset</button>
+                    <button className="btn btn-ghost btn-sm" disabled={u.username===selfUser} onClick={()=>del(u.username)} style={{color:'var(--color-danger)'}}><Icon name="x" size={12}/> Hapus</button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+let _hubUrlRefVal = ''
+function hubUrlRef(){ return _hubUrlRefVal }
+
 // ─── Page: Pengaturan ─────────────────────────────────────────────────────────
 
 const PagePengaturan = ({ hubUrl, logCap, onApply }: {
@@ -1490,7 +2135,7 @@ const PagePengaturan = ({ hubUrl, logCap, onApply }: {
   }
 
   return (
-    <div className="flex flex-col gap-5" style={{ maxWidth: 560 }}>
+    <div className="flex flex-col gap-5" style={{ maxWidth: 760 }}>
       <div className="card p-6 flex flex-col gap-4">
         <SectionHeader label="Koneksi Hub" />
         <div>
@@ -1529,31 +2174,10 @@ const PagePengaturan = ({ hubUrl, logCap, onApply }: {
           Reset
         </button>
       </div>
+
+      <UserManagementPanel />
     </div>
   )
-}
-
-// ─── Sidebar ──────────────────────────────────────────────────────────────────
-
-const NAV: { id: Page; icon: string; label: string }[] = [
-  { id: 'ringkasan',  icon: 'dashboard', label: 'HOME'        },
-  { id: 'nshlite',   icon: 'layers',    label: 'NSH Lite'    },
-  { id: 'kma',       icon: 'router',    label: 'KMA'         },
-  { id: 'wma',       icon: 'workflow',  label: 'WMA'         },
-  { id: 'kmma',      icon: 'package',   label: 'KMMA'        },
-  { id: 'log',       icon: 'terminal',  label: 'Log'         },
-  { id: 'pengaturan',icon: 'settings',  label: 'Pengaturan'  },
-]
-
-const PAGE_TITLE: Record<Page, string> = {
-  ringkasan: 'HOME', nshlite: 'NSH Lite', kma: 'KMA Router',
-  wma: 'WMA', kmma: 'KMMA', log: 'Log Monitor', pengaturan: 'Pengaturan',
-}
-
-const CONN_CFG: Record<ConnStatus, { status: StatusLevel; label: string; live: boolean }> = {
-  connected:    { status: 'success', label: 'Terhubung',    live: true  },
-  connecting:   { status: 'warning', label: 'Menghubungkan',live: false },
-  disconnected: { status: 'danger',  label: 'Terputus',     live: false },
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
@@ -1566,7 +2190,6 @@ export default function App() {
     try {
       const saved = localStorage.getItem('nsh-hub-url')
       if (!saved) return fallback
-      // localStorage per-origin: simpanan localhost salah saat halaman dibuka via IP LAN
       if (/localhost|127\.0\.0\.1/.test(saved)) {
         const host = location.hostname
         if (host && !/localhost|127\.0\.0\.1/.test(host)) return fallback
@@ -1579,8 +2202,26 @@ export default function App() {
     catch { return 200 }
   })
   const [mobileNav, setMobileNav] = useState(false)
+  const [authChecked, setAuthChecked] = useState(false)
+  const [isAuthed, setIsAuthed] = useState(false)
+  const isLoginPath = (()=>{ try{ return location.pathname==='/login' || location.hash==='#/login' }catch{return false}})()
 
-  const hub = useHub(hubUrl, logCap)
+  useEffect(()=>{
+    const tok = getAuthToken()
+    if (!tok) { setAuthChecked(true); setIsAuthed(false); return }
+    const base = (()=>{ try{ const h=location.hostname||'localhost'; return `http://${h}:8766` }catch{return 'http://localhost:8766'} })()
+    fetch(`${base}/api/me`, { headers: { Authorization: `Bearer ${tok}` } })
+      .then(r=>{ if(r.status===401) throw new Error('unauth'); return r.json() })
+      .then(j=>{
+        if (j.ok) setIsAuthed(true)
+        else { clearAuth(); setIsAuthed(false) }
+      }).catch(()=>{ clearAuth(); setIsAuthed(false) })
+      .finally(()=> setAuthChecked(true))
+  },[])
+
+  // derive ws url with token
+  const hubWsUrl = (()=>{ try{ const u=new URL(hubUrl); const tok=getAuthToken(); if(tok) u.searchParams.set('token', tok); return u.toString(); }catch{ const tok=getAuthToken(); if(tok) return hubUrl + (hubUrl.includes('?')?'&':'?') + `token=${encodeURIComponent(tok)}`; return hubUrl }})()
+  const hub = useHub(hubWsUrl, logCap)
   const connStatus: ConnStatus =
     hub.conn === 'open' ? 'connected' : hub.conn === 'connecting' ? 'connecting' : 'disconnected'
 
@@ -1617,11 +2258,31 @@ export default function App() {
     } catch { /* storage tidak tersedia */ }
   }
 
+  const doLogout = async () => {
+    const token = getAuthToken()
+    try{
+      const base = (()=>{ try{ const h=location.hostname||'localhost'; return `http://${h}:8766` }catch{return 'http://localhost:8766'} })()
+      await fetch(`${base}/api/logout`, { method:'POST', headers: { 'Content-Type':'application/json', ...(token?{Authorization:`Bearer ${token}`}:{}) }, body: JSON.stringify({ token }) })
+    }catch{}
+    clearAuth()
+    location.href = '/login'
+  }
+
   const conn    = CONN_CFG[connStatus]
   const connected = connStatus === 'connected'
   const sidebarW  = collapsed ? 56 : 240
 
-  const SidebarInner = ({ mobile = false }: { mobile?: boolean }) => (
+  // Guard: belum auth -> LoginPage
+  if (!authChecked) {
+    return <div className="flex items-center justify-center" style={{height:'100vh', background:'var(--color-bg)', color:'var(--color-text-muted)'}}>Memeriksa sesi…</div>
+  }
+  if (!isAuthed || isLoginPath) {
+    return <><LoginPage onSuccess={()=>{ location.href='/'}} /><ToastContainer /></>
+  }
+
+  const SidebarInner = ({ mobile = false }: { mobile?: boolean }) => {
+    const visibleNav = getAuthRole()==='admin' ? NAV : NAV.filter((n: typeof NAV[number])=>n.id!=='database')
+    return (
     <div className="flex flex-col overflow-hidden h-full"
       style={{
         width: mobile ? 240 : sidebarW,
@@ -1664,9 +2325,9 @@ export default function App() {
         )}
       </div>
 
-      {/* Nav items */}
+      {/* Nav items - Database hanya admin */}
       <div className="flex-1 flex flex-col gap-0.5 px-2 py-2.5">
-        {NAV.map(item => (
+        {visibleNav.map(item => (
           <button key={item.id}
             className={`nav-item w-full border-none text-left ${page === item.id ? 'active' : ''}`}
             onClick={() => { setPage(item.id); setMobileNav(false) }}
@@ -1697,7 +2358,8 @@ export default function App() {
         )}
       </div>
     </div>
-  )
+    )
+  }
 
   return (
     <div className="flex overflow-hidden" style={{ height: '100vh', background: 'var(--color-bg)' }}>
@@ -1752,10 +2414,13 @@ export default function App() {
               </span>
             </div>
             <LiveClock />
-            {/* Avatar */}
-            <div className="flex items-center justify-center rounded-full cursor-pointer"
-              style={{ width: 34, height: 34, background: 'linear-gradient(135deg, var(--color-accent), var(--color-violet))' }}>
-              <Icon name="user" size={16} style={{ color: '#fff', strokeWidth: 2 } as any} />
+            <div className="flex items-center gap-2">
+              <span className="hidden md:inline font-semibold" style={{fontSize:'var(--text-sm)', color:'var(--color-text)'}}>{getAuthUser()||'user'}</span>
+              <span className="hidden md:inline rounded-full px-1.5 py-0.5 font-bold uppercase" style={{fontSize:10, background:getAuthRole()==='admin'?'var(--color-violet-ghost)':'var(--color-muted-ghost)', color:getAuthRole()==='admin'?'var(--color-violet-fg)':'var(--color-muted-fg)'}}>{getAuthRole()||'user'}</span>
+              <div className="flex items-center justify-center rounded-full" style={{ width: 34, height: 34, background: 'linear-gradient(135deg, var(--color-accent), var(--color-violet))' }}>
+                <Icon name="user" size={16} style={{ color: '#fff', strokeWidth: 2 } as any} />
+              </div>
+              <button className="btn btn-ghost btn-sm" onClick={doLogout} title="Logout"><Icon name="x" size={14}/> Logout</button>
             </div>
           </div>
         </header>
@@ -1770,6 +2435,7 @@ export default function App() {
             {page === 'kmma'      && <PageKmma entries={hub.entries} statuses={hub.statuses} details={hub.details} live={connected} sendCommand={hub.sendCommand} results={hub.results} timer={hub.kmmaTimer} />}
             {page === 'log'       && <PageLog logs={hub.logs} live={connected} />}
             {page === 'pengaturan'&& <PagePengaturan hubUrl={hubUrl} logCap={logCap} onApply={applySettings} />}
+            {page === 'database'  && <PageDatabase hubUrl={hubUrl} />}
           </div>
         </main>
       </div>

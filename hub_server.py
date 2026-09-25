@@ -9,12 +9,17 @@ KMA (route.py NSH Lite) melapor via POST /ingest (tanpa dependensi baru).
 """
 import asyncio
 import datetime
+import hashlib
+import hmac
 import json
 import os
+import re
+import secrets
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 import http.server
 import logging
@@ -44,6 +49,18 @@ PID_FILE = BASE_DIR / "supervise_pids.json"
 MANAGED_MODULES = ("lite", "kma", "wma", "kmma")
 MODULE_ACTIONS = ("module_on", "module_off", "module_restart")
 FORWARD_ACTIONS = ("retry", "skip", "process_all")
+
+# ── Auth (4-Fase login) ───────────────────────────────────────────
+# bcrypt bila ada else pbkdf2 260k, rate-limit 5/menit/IP, cookie httpOnly, session 2d/7d
+AUTH_MAX_AGE = 2 * 86400
+AUTH_MAX_AGE_REMEMBER = 7 * 86400
+AUTH_RATE_LIMIT = 5
+AUTH_RATE_WINDOW = 60
+_login_attempts: dict = {}  # ip -> [ts,...]
+
+# RBAC: admin-only vs user-allowed
+ADMIN_ONLY_ACTIONS = {"hub_restart", "set_folders", "db_write", "db_exec", "users_create", "users_delete", "users_reset", "module_on", "module_off", "module_restart"}
+USER_ALLOWED_ACTIONS = {"get_folders", "list_output", "move_output", "verify", "db_query", "db_tables"}
 
 
 def _default_modules(ws_port):
@@ -244,6 +261,99 @@ def handle_hub_restart():
     return True, "HUB restart ±15 detik (dashboard reconnect otomatis)"
 
 
+# ── Auth helpers (hub + db bridge) ─────────────────────────────────
+def _auth_ip(req_ip: str) -> str:
+    return (req_ip or "unknown").strip() or "unknown"
+
+
+def _auth_rate_ok(ip: str) -> bool:
+    now = time.time()
+    arr = _login_attempts.get(ip, [])
+    arr = [t for t in arr if now - t < AUTH_RATE_WINDOW]
+    if len(arr) >= AUTH_RATE_LIMIT:
+        _login_attempts[ip] = arr
+        return False
+    arr.append(now)
+    _login_attempts[ip] = arr
+    return True
+
+
+def _auth_token_from_headers(headers) -> str:
+    try:
+        cookie = headers.get("Cookie") or headers.get("cookie") or ""
+        for part in str(cookie).split(";"):
+            if part.strip().startswith("nsh_token="):
+                return part.strip().split("=", 1)[1].strip()
+    except Exception:
+        pass
+    try:
+        auth = headers.get("Authorization") or headers.get("authorization") or ""
+        if str(auth).lower().startswith("bearer "):
+            return str(auth).split(" ", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _auth_token_from_ws(ws, msg_token=None):
+    # 1) msg.token
+    if msg_token:
+        return str(msg_token).strip()
+    # 2) ?token= in WS request path
+    try:
+        req = getattr(ws, "request", None)
+        if req is not None:
+            path = getattr(req, "path", "") or ""
+            # Request.path may be string path including query?
+            qs = ""
+            if "?" in path:
+                qs = path.split("?", 1)[1]
+            else:
+                # fallback: try headers host query?
+                pass
+            if qs:
+                qp = urllib.parse.parse_qs(qs)
+                t = (qp.get("token") or [""])[0]
+                if t:
+                    return t.strip()
+            # 3) Cookie header
+            try:
+                hdrs = getattr(req, "headers", {}) or {}
+                c = _auth_token_from_headers(hdrs)
+                if c:
+                    return c
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ""
+
+
+def _auth_lookup(token: str):
+    if not token:
+        return None
+    try:
+        db = _hub_db()
+        if db is None:
+            return None
+        return db.session_get(token)
+    except Exception:
+        return None
+
+
+def _auth_required_role(action: str, role: str) -> bool:
+    if role == "admin":
+        return True
+    if action in ADMIN_ONLY_ACTIONS:
+        return False
+    # user allowed actions; unknown forward actions default deny for user
+    if action in USER_ALLOWED_ACTIONS:
+        return True
+    if action in FORWARD_ACTIONS:
+        return True  # retry/skip handled downstream but allowed for user
+    return False
+
+
 # ══════════════════════════════════════════════════════════════
 # FOLDER CONFIG (dashboard ↔ lite.json / route.json)
 # ══════════════════════════════════════════════════════════════
@@ -355,22 +465,36 @@ def _push_moves_to_watcher(items, operator):
         today = datetime.date.today().isoformat()
         yest = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
         by_name = {}
-        for d in (today, yest):
-            try:
-                _, data = _watcher_api(
-                    "GET", f"/api/files?date_from={d}&date_to={d}", timeout=5)
-                rows = data if isinstance(data, list) else (data.get("value") or [])
-                for r in rows:
-                    if r.get("filename") and r.get("id") and r["filename"] not in by_name:
-                        by_name[r["filename"]] = r["id"]
-            except Exception:
-                pass
-        matched = [(fname, machine) for fname, machine in items if fname in by_name]
+        # file baru dipindah perlu waktu watcher indeks (poll), coba beberapa kali
+        for attempt in range(3):
+            by_name.clear()
+            for d in (today, yest):
+                try:
+                    _, data = _watcher_api(
+                        "GET", f"/api/files?date_from={d}&date_to={d}", timeout=5)
+                    rows = data if isinstance(data, list) else (data.get("value") or [])
+                    for r in rows:
+                        if r.get("filename") and r.get("id") and r["filename"] not in by_name:
+                            by_name[r["filename"]] = r["id"]
+                except Exception:
+                    pass
+            matched = []
+            for fname, machine in items:
+                fid = by_name.get(fname)
+                if not fid and fname.lower().endswith("-ipy.pdf"):
+                    # file impose ada suffix -ipy, cari nama aslinya di watcher
+                    base = fname[:-8] + ".pdf"
+                    fid = by_name.get(base)
+                if fid:
+                    matched.append((fname, machine, fid))
+            if len(matched) == len(items) or attempt == 2:
+                break
+            time.sleep(2)
         ok_n = 0
         err = ""
-        for fname, machine in matched:
+        for fname, machine, fid in matched:
             try:
-                st, _ = _watcher_api("POST", f"/api/files/{by_name[fname]}",
+                st, _ = _watcher_api("POST", f"/api/files/{fid}",
                                      {"status": "done", "operator": operator,
                                       "machine_name": machine}, timeout=4)
                 if 200 <= st < 300:
@@ -522,6 +646,190 @@ def handle_output_command(action, msg):
         return False, f"aksi tak dikenal: {action}", []
     except Exception as e:
         return False, f"error: {e}", []
+
+
+# ── DB read-only (phpMyAdmin mini) ─────────────────────────────────────
+# Whitelist tabel yang boleh di-browse (read-only, anti SQL injection).
+DB_ALLOWED = {
+    "kmma_state", "wma_entries", "wma_seen", "kma_stats", "kma_events",
+    "km_orders", "wma_verified", "config", "output_moves", "validasi", "events",
+}
+
+def _db_list_tables():
+    """Return [{name, count, columns, pk, indexes}] untuk tabel whitelist yang ada."""
+    try:
+        db = _hub_db()
+        if db is None:
+            return []
+        con = db.get_conn()
+        try:
+            existing = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            out = []
+            for tbl in sorted(DB_ALLOWED):
+                if tbl not in existing:
+                    continue
+                try:
+                    cnt = con.execute(f'SELECT COUNT(*) FROM "{tbl}"').fetchone()[0]
+                except Exception:
+                    cnt = 0
+                try:
+                    info = con.execute(f'PRAGMA table_info("{tbl}")').fetchall()
+                    cols = [r[1] for r in info]
+                    pk = [r[1] for r in info if r[5]]
+                except Exception:
+                    cols = []
+                    pk = []
+                try:
+                    idx_rows = con.execute(f'PRAGMA index_list("{tbl}")').fetchall()
+                    indexes = []
+                    for ir in idx_rows:
+                        iname = ir[1] if len(ir) > 1 else str(ir[0])
+                        try:
+                            ii = con.execute(f'PRAGMA index_info("{iname}")').fetchall()
+                            icols = [x[2] for x in ii]
+                        except Exception:
+                            icols = []
+                        indexes.append({"name": iname, "unique": bool(ir[2]) if len(ir) > 2 else False, "columns": icols})
+                except Exception:
+                    indexes = []
+                out.append({"name": tbl, "count": int(cnt or 0), "columns": cols, "pk": pk, "indexes": indexes})
+            return out
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+    except Exception:
+        return []
+
+
+# ── SQL exec admin (POST /api/db/exec) ──────────────────────────────────
+_FORBIDDEN_SQL = re.compile(r"\b(DROP|ALTER|TRUNCATE|ATTACH|DETACH|VACUUM|REINDEX|PRAGMA)\b", re.I)
+_ALLOWED_START = re.compile(r"^\s*(SELECT|INSERT|UPDATE|DELETE)\b", re.I)
+
+def _db_exec_sql(sql: str):
+    """Validasi + eksekusi 1 statement admin. Return dict {ok, columns, rows, rowcount, lastRowId}."""
+    raw = (sql or "").strip()
+    if not raw:
+        return False, "sql kosong"
+    # split ; limit 1 statement per klik (allow trailing ;)
+    stmts = [s.strip() for s in raw.split(";") if s.strip()]
+    if len(stmts) != 1:
+        return False, "hanya 1 statement per eksekusi (hapus ; berlebih)"
+    stmt = stmts[0]
+    if _FORBIDDEN_SQL.search(stmt):
+        return False, "statement terlarang (DROP/ALTER/PRAGMA/VACUUM/ATTACH tidak diizinkan)"
+    if not _ALLOWED_START.match(stmt):
+        return False, "hanya SELECT/INSERT/UPDATE/DELETE yang diizinkan"
+    # exec dengan timeout 5s + transaction
+    try:
+        db = _hub_db()
+        if db is None:
+            return False, "DB tidak tersedia"
+        con = db.get_conn()
+        con.execute("PRAGMA busy_timeout=5000;")
+        # timeout via progress handler not needed; sqlite busy_timeout + python timeout via signal is enough
+        # optional backup before big write: VACUUM INTO skipped (cheap) - log only
+        is_select = bool(re.match(r"^\s*SELECT\b", stmt, re.I))
+        try:
+            cur = con.execute("BEGIN IMMEDIATE")
+        except Exception:
+            pass
+        try:
+            if is_select:
+                cur = con.execute(stmt)
+                cols = [d[0] for d in cur.description] if cur.description else []
+                rows_raw = cur.fetchmany(101)
+                # limit 100 rows
+                truncated = len(rows_raw) > 100
+                rows = rows_raw[:100]
+                # dict rows
+                dict_rows = [dict(zip(cols, r)) if not isinstance(r, dict) else r for r in rows]
+                # stringify bytes
+                for d in dict_rows:
+                    for k, v in list(d.items()):
+                        if isinstance(v, bytes):
+                            try:
+                                d[k] = v.decode("utf-8", errors="replace")
+                            except Exception:
+                                d[k] = str(v)
+                con.execute("COMMIT")
+                return True, {"columns": cols, "rows": dict_rows, "rowcount": len(dict_rows), "truncated": truncated, "lastRowId": cur.lastrowid or 0}
+            else:
+                cur = con.execute(stmt)
+                rc = cur.rowcount if cur.rowcount != -1 else 0
+                lid = cur.lastrowid or 0
+                con.execute("COMMIT")
+                return True, {"columns": [], "rows": [], "rowcount": int(rc), "lastRowId": int(lid)}
+        except Exception as e:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
+            return False, f"SQL error: {e}"
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+    except Exception as e:
+        return False, f"error: {e}"
+
+
+def _db_query_table(name, limit=20, offset=0, search=""):
+    """Read-only paginated query. Return (ok, payload|msg)."""
+    if name not in DB_ALLOWED:
+        return False, "tabel tidak diizinkan"
+    try:
+        limit = max(1, min(100, int(limit or 20)))
+    except Exception:
+        limit = 20
+    try:
+        offset = max(0, int(offset or 0))
+    except Exception:
+        offset = 0
+    search = (search or "").strip()
+    try:
+        db = _hub_db()
+        if db is None:
+            return False, "DB tidak tersedia"
+        con = db.get_conn()
+        try:
+            cols = [r[1] for r in con.execute(f'PRAGMA table_info("{name}")').fetchall()]
+            if not cols:
+                return False, f"tabel {name} tidak ada"
+            where = ""
+            params: list = []
+            if search:
+                conds = []
+                for c in cols:
+                    conds.append(f'CAST("{c}" AS TEXT) LIKE ?')
+                    params.append(f"%{search}%")
+                where = " WHERE " + " OR ".join(conds)
+            total = con.execute(f'SELECT COUNT(*) FROM "{name}"' + where, params).fetchone()[0]
+            rows = []
+            q = f'SELECT * FROM "{name}"' + where + f' ORDER BY rowid DESC LIMIT ? OFFSET ?'
+            q_params = params + [limit, offset]
+            for r in con.execute(q, q_params):
+                d = dict(r)
+                # stringify bytes / json-ish untuk aman di JSON
+                for k, v in list(d.items()):
+                    if isinstance(v, bytes):
+                        try:
+                            d[k] = v.decode("utf-8", errors="replace")
+                        except Exception:
+                            d[k] = str(v)
+                rows.append(d)
+            return True, {"name": name, "columns": cols, "rows": rows, "total": int(total or 0),
+                          "limit": limit, "offset": offset, "search": search}
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+    except Exception as e:
+        return False, f"error: {e}"
 
 
 def refresh_supervised_status():
@@ -777,18 +1085,141 @@ connect();
 # ══════════════════════════════════════════════════════════════
 class DashboardHandler(http.server.BaseHTTPRequestHandler):
     def _cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        origin = self.headers.get("Origin")
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        else:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Credentials", "true")
 
     def do_OPTIONS(self):
         self.send_response(204)
         self._cors_headers()
         self.end_headers()
 
+    def _send_json(self, code, obj, set_cookie=None, clear_cookie=False):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self._cors_headers()
+        self.send_header("Content-Length", str(len(body)))
+        if set_cookie:
+            tok, max_age = set_cookie
+            self.send_header("Set-Cookie", f"nsh_token={tok}; HttpOnly; Path=/; Max-Age={max_age}; SameSite=Lax")
+        if clear_cookie:
+            self.send_header("Set-Cookie", "nsh_token=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _get_token(self):
+        # Cookie, Authorization, ?token=
+        tok = _auth_token_from_headers(self.headers)
+        if tok:
+            return tok
+        try:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            t = (qs.get("token") or [""])[0]
+            if t:
+                return t.strip()
+        except Exception:
+            pass
+        return ""
+
+    def _require_auth(self, admin_only=False):
+        tok = self._get_token()
+        sess = _auth_lookup(tok)
+        if not sess:
+            return None, False
+        if admin_only and sess["user"]["role"] != "admin":
+            return sess, False
+        return sess, True
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        # ── Auth endpoints ──────────────────────────────────────────
+        if parsed.path == "/api/me":
+            tok = self._get_token()
+            sess = _auth_lookup(tok)
+            if not sess:
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+            self._send_json(200, {"ok": True, "user": sess["user"], "expires_at": sess["expires_at"], "remember": sess["remember"]})
+            return
+        if parsed.path == "/api/users":
+            sess, ok = self._require_auth(admin_only=True)
+            if sess is None:
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+            if not ok:
+                self._send_json(403, {"ok": False, "msg": "admin only"})
+                return
+            try:
+                db = _hub_db()
+                users = db.user_list() if db else []
+                # sanitize: only username/role/created
+                out = [{"username": u["username"], "role": u["role"], "created_at": u["created_at"], "created_by": u["created_by"]} for u in users]
+                self._send_json(200, {"ok": True, "users": out})
+                return
+            except Exception as e:
+                self._send_json(500, {"ok": False, "msg": str(e)})
+                return
+        # ── DB browse (read-only, like phpMyAdmin) ─────────────────
+        if parsed.path == "/api/db/tables":
+            tok = self._get_token()
+            if not _auth_lookup(tok):
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+            try:
+                tables = _db_list_tables()
+                body = json.dumps({"ok": True, "tables": tables}, ensure_ascii=False).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self._cors_headers()
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            except Exception as e:
+                body = json.dumps({"ok": False, "msg": str(e)}).encode()
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(body)
+                return
+        if parsed.path == "/api/db/table":
+            tok = self._get_token()
+            if not _auth_lookup(tok):
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+            qs = urllib.parse.parse_qs(parsed.query)
+            name = (qs.get("name", [""])[0] or "").strip()
+            search = (qs.get("search", [""])[0] or "").strip()
+            try:
+                limit = int(qs.get("limit", ["20"])[0] or 20)
+            except Exception:
+                limit = 20
+            try:
+                offset = int(qs.get("offset", ["0"])[0] or 0)
+            except Exception:
+                offset = 0
+            ok, payload = _db_query_table(name, limit, offset, search)
+            body = json.dumps({"ok": ok, **(payload if ok else {"msg": payload})}, ensure_ascii=False).encode()
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self._cors_headers()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path == "/api/output-file":
+            tok = self._get_token()
+            if not _auth_lookup(tok):
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
             qs = urllib.parse.parse_qs(parsed.query)
             name = (qs.get("name", [""])[0] or "").strip()
             # validasi ketat: basename saja, .pdf
@@ -853,23 +1284,260 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(DASHBOARD_HTML.encode())
 
     def do_POST(self):
-        if self.path.split("?")[0] != "/ingest":
-            self.send_response(404)
-            self.end_headers()
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        # ── Auth: login ───────────────────────────────────────────
+        if path == "/api/login":
+            ip = _auth_ip(self.client_address[0] if self.client_address else "")
+            if not _auth_rate_ok(ip):
+                self._send_json(429, {"ok": False, "msg": "terlalu banyak percobaan, coba 1 menit lagi"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+                data = json.loads(raw) if raw.strip() else {}
+            except Exception:
+                self._send_json(400, {"ok": False, "msg": "json tidak valid"})
+                return
+            username = (data.get("username") or "").strip()
+            password = (data.get("password") or "")
+            remember = bool(data.get("remember"))
+            try:
+                # normalize + validate
+                db_tmp = _hub_db()
+                if db_tmp is None:
+                    raise RuntimeError("DB tidak tersedia")
+                # inline validate to give rate-limited msg before db
+                n = db_tmp.normalize_username(username) if hasattr(db_tmp, "normalize_username") else username.strip().lower()
+                if not username or not password:
+                    raise ValueError("username & password wajib")
+                if len(password) < 6:
+                    raise ValueError("password min 6")
+                u = db_tmp.user_get_by_username(username)
+                if not u or not db_tmp.verify_password(password, u["pass_hash"]):
+                    self._send_json(401, {"ok": False, "msg": "username / password salah"})
+                    return
+                token, exp, max_age = db_tmp.session_create(u["id"], remember)
+                must_change = (u["username"] == "admin" and password == "admin123")
+                self._send_json(200, {"ok": True, "token": token, "role": u["role"], "username": u["username"], "expires_at": exp, "must_change": must_change}, set_cookie=(token, max_age))
+                return
+            except ValueError as ve:
+                self._send_json(400, {"ok": False, "msg": str(ve)})
+                return
+            except Exception as e:
+                self._send_json(500, {"ok": False, "msg": f"error: {e}"})
+                return
+        if path == "/api/logout":
+            tok = self._get_token()
+            try:
+                body_len = int(self.headers.get("Content-Length", 0) or 0)
+                if body_len:
+                    try:
+                        braw = self.rfile.read(body_len).decode("utf-8")
+                        j = json.loads(braw) if braw.strip() else {}
+                        if j.get("token"):
+                            tok = str(j.get("token")).strip() or tok
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if tok:
+                try:
+                    db = _hub_db()
+                    if db:
+                        db.session_delete(tok)
+                except Exception:
+                    pass
+            self._send_json(200, {"ok": True, "msg": "logout"}, clear_cookie=True)
             return
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(length).decode("utf-8"))
-        except Exception:
-            data = None
-        ok = ingest_kma(data)
-        body = json.dumps({"ok": ok}).encode()
-        self.send_response(200 if ok else 400)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
+        # users CRUD (admin only)
+        if path == "/api/users":
+            sess, ok = self._require_auth(admin_only=True)
+            if sess is None:
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+            if not ok:
+                self._send_json(403, {"ok": False, "msg": "admin only"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+                data = json.loads(raw) if raw.strip() else {}
+            except Exception:
+                self._send_json(400, {"ok": False, "msg": "json tidak valid"})
+                return
+            try:
+                username = (data.get("username") or "").strip()
+                password = (data.get("password") or "")
+                role = (data.get("role") or "user").strip().lower()
+                db = _hub_db()
+                res = db.user_create(username, password, role, created_by=sess["user"]["username"])
+                self._send_json(200, {"ok": True, "user": res})
+                return
+            except ValueError as ve:
+                self._send_json(400, {"ok": False, "msg": str(ve)})
+                return
+            except Exception as e:
+                self._send_json(500, {"ok": False, "msg": str(e)})
+                return
+        if path == "/api/users/reset":
+            sess, ok = self._require_auth(admin_only=True)
+            if sess is None:
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+            if not ok:
+                self._send_json(403, {"ok": False, "msg": "admin only"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+                data = json.loads(raw) if raw.strip() else {}
+            except Exception:
+                self._send_json(400, {"ok": False, "msg": "json tidak valid"})
+                return
+            username = (data.get("username") or "").strip()
+            new_password = (data.get("password") or data.get("new_password") or "")
+            if not username or not new_password:
+                self._send_json(400, {"ok": False, "msg": "username & password wajib"})
+                return
+            try:
+                db = _hub_db()
+                if not db.user_get_by_username(username):
+                    self._send_json(404, {"ok": False, "msg": "user tidak ada"})
+                    return
+                db.user_set_password(username, new_password)
+                self._send_json(200, {"ok": True, "msg": "password direset"})
+                return
+            except ValueError as ve:
+                self._send_json(400, {"ok": False, "msg": str(ve)})
+                return
+            except Exception as e:
+                self._send_json(500, {"ok": False, "msg": str(e)})
+                return
+        if path == "/api/users/delete":
+            sess, ok = self._require_auth(admin_only=True)
+            if sess is None:
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+            if not ok:
+                self._send_json(403, {"ok": False, "msg": "admin only"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+                data = json.loads(raw) if raw.strip() else {}
+            except Exception:
+                self._send_json(400, {"ok": False, "msg": "json tidak valid"})
+                return
+            username = (data.get("username") or "").strip()
+            if not username:
+                self._send_json(400, {"ok": False, "msg": "username wajib"})
+                return
+            if username.strip().lower() == sess["user"]["username"].lower():
+                self._send_json(400, {"ok": False, "msg": "tidak bisa hapus diri sendiri"})
+                return
+            try:
+                db = _hub_db()
+                if not db.user_get_by_username(username):
+                    self._send_json(404, {"ok": False, "msg": "user tidak ada"})
+                    return
+                db.user_delete(username)
+                self._send_json(200, {"ok": True, "msg": "user dihapus"})
+                return
+            except Exception as e:
+                self._send_json(500, {"ok": False, "msg": str(e)})
+                return
+        if path.startswith("/api/users/") and len(path) > len("/api/users/"):
+            pass
+        if path == "/api/db/exec":
+            sess, ok = self._require_auth(admin_only=True)
+            if sess is None:
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+            if not ok:
+                self._send_json(403, {"ok": False, "msg": "admin only"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+                data = json.loads(raw) if raw.strip() else {}
+            except Exception:
+                self._send_json(400, {"ok": False, "msg": "json tidak valid"})
+                return
+            sql = (data.get("sql") or "").strip()
+            if not sql:
+                self._send_json(400, {"ok": False, "msg": "sql kosong"})
+                return
+            ok2, payload = _db_exec_sql(sql)
+            if ok2:
+                self._send_json(200, {"ok": True, **payload})
+            else:
+                self._send_json(400, {"ok": False, "msg": str(payload)})
+            return
+        if path == "/ingest" or path.startswith("/ingest"):
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                data = json.loads(self.rfile.read(length).decode("utf-8"))
+            except Exception:
+                data = None
+            ok = ingest_kma(data)
+            body = json.dumps({"ok": ok}).encode()
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
         self.end_headers()
-        self.wfile.write(body)
+
+    def do_DELETE(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path.startswith("/api/users"):
+            sess, ok = self._require_auth(admin_only=True)
+            if sess is None:
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+            if not ok:
+                self._send_json(403, {"ok": False, "msg": "admin only"})
+                return
+            # username from path /api/users/<name> or query ?username=
+            username = ""
+            if len(path) > len("/api/users/"):
+                username = urllib.parse.unquote(path[len("/api/users/"):]).strip()
+            if not username:
+                qs = urllib.parse.parse_qs(parsed.query)
+                username = (qs.get("username") or [""])[0].strip()
+            if not username:
+                try:
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                    if length:
+                        raw = self.rfile.read(length).decode("utf-8")
+                        j = json.loads(raw) if raw.strip() else {}
+                        username = (j.get("username") or "").strip()
+                except Exception:
+                    pass
+            if not username:
+                self._send_json(400, {"ok": False, "msg": "username wajib"})
+                return
+            if username.strip().lower() == sess["user"]["username"].lower():
+                self._send_json(400, {"ok": False, "msg": "tidak bisa hapus diri sendiri"})
+                return
+            try:
+                db = _hub_db()
+                if not db.user_get_by_username(username):
+                    self._send_json(404, {"ok": False, "msg": "user tidak ada"})
+                    return
+                db.user_delete(username)
+                self._send_json(200, {"ok": True, "msg": "user dihapus"})
+                return
+            except Exception as e:
+                self._send_json(500, {"ok": False, "msg": str(e)})
+                return
+        self.send_response(404)
+        self.end_headers()
 
     def log_message(self, format, *args):
         pass  # suppress HTTP logs
@@ -899,7 +1567,24 @@ async def handler(connection):
             if msg_type == "subscribe":
                 role = msg.get("role", "dashboard")
                 client_id = msg.get("id", "")
-                clients[ws] = {"role": role, "id": client_id}
+                # auth: dashboard wajib token; wma/kmma/kma dikecualikan (trusted internal)
+                sess = None
+                tok = ""
+                if role == "dashboard":
+                    tok = str(msg.get("token") or "").strip()
+                    if not tok:
+                        tok = _auth_token_from_ws(ws, None)
+                    sess = _auth_lookup(tok) if tok else None
+                    if not sess:
+                        try:
+                            await ws.close(code=4401, reason="unauthorized")
+                        except Exception:
+                            pass
+                        return
+                    clients[ws] = {"role": role, "id": client_id, "user": sess["user"], "token": tok}
+                else:
+                    # allow internal modules without auth
+                    clients[ws] = {"role": role, "id": client_id}
 
                 # dashboard: kirim init dulu (riwayat TANPA baris connect sendiri → tak dobel)
                 if role == "dashboard":
@@ -994,8 +1679,51 @@ async def handler(connection):
             # ── dashboard → modul commands ──
             elif msg_type == "command":
                 action = msg.get("action", "")
+                # ── auth / RBAC ──────────────────────────────────
+                # resolve user from stored client + msg.token
+                _info = clients.get(ws, {})
+                _user = _info.get("user")
+                _tok_msg = str(msg.get("token") or "").strip()
+                if _tok_msg:
+                    _sess_tmp = _auth_lookup(_tok_msg)
+                    if _sess_tmp:
+                        _user = _sess_tmp["user"]
+                        _info["user"] = _user
+                        _info["token"] = _tok_msg
+                        clients[ws] = _info
+                # untuk dashboard, validasi session masih hidup bila ada token tersimpan
+                if _user and _info.get("token"):
+                    _sess_check = _auth_lookup(_info.get("token"))
+                    if not _sess_check:
+                        _user = None
+                        # hapus user expired
+                        try:
+                            del _info["user"]
+                        except Exception:
+                            pass
+                user_role = (_user or {}).get("role", "") if _user else ""
+                is_dashboard = (_info.get("role") == "dashboard")
+                # internal modules bypass RBAC
+                needs_auth = is_dashboard
+                # helper to deny
+                async def _deny(msg_text):
+                    await _safe_send(ws, json.dumps({
+                        "type": "command_result",
+                        "id": msg.get("id", ""),
+                        "action": action,
+                        "ok": False,
+                        "msg": msg_text,
+                    }, ensure_ascii=False))
+
+                if needs_auth and not _user:
+                    await _deny("login dulu (token tidak valid/expired)")
+                    continue
+                if needs_auth and not _auth_required_role(action, user_role):
+                    await _deny("admin only")
+                    continue
+                # ── per-action handling ─────────────────────────
                 if action in FOLDER_ACTIONS:
-                    # KONSUMSI di hub (baca/tulis lite.json/route.json).
+                    # get_folders: user boleh, set_folders: admin only (sudah dicek RBAC)
                     ok, res, current = handle_folders_command(
                         action, msg.get("module", ""), msg.get("folders"))
                     await _safe_send(ws, json.dumps({
@@ -1008,7 +1736,7 @@ async def handler(connection):
                         "msg": res,
                     }, ensure_ascii=False))
                 elif action in OUTPUT_ACTIONS:
-                    # KONSUMSI di hub (watcher + pindah file OUTPUT lite).
+                    # list_output & move_output: user boleh
                     ok, res, files = handle_output_command(action, msg)
                     await _safe_send(ws, json.dumps({
                         "type": "command_result",
@@ -1019,7 +1747,7 @@ async def handler(connection):
                         "msg": res,
                     }, ensure_ascii=False))
                 elif action == "verify":
-                    # per-baris: jika payload bawa bahan/sides/lam/test/proc, verifikasi 1 baris; else semua varian nota tsb
+                    # user boleh
                     ok, res = _mark_verified(
                         msg.get("nota", ""), msg.get("bahan"), msg.get("sides"),
                         msg.get("laminating"), msg.get("test"), msg.get("process_type"))
@@ -1033,12 +1761,11 @@ async def handler(connection):
                         "msg": res,
                     }, ensure_ascii=False))
                 elif action == "hub_restart":
-                    # KONSUMSI di hub (tombol Restart HUB). Hanya peran dashboard.
                     if role != "dashboard":
                         ok, res = False, "hanya dashboard boleh restart HUB"
                     else:
                         ok, res = handle_hub_restart()
-                    add_log("HUB", f"hub_restart ({role}) -> {res}")
+                    add_log("HUB", f"hub_restart ({role}/{user_role}) -> {res}")
                     await _safe_send(ws, json.dumps({
                         "type": "command_result",
                         "id": msg.get("id", ""),
@@ -1046,13 +1773,40 @@ async def handler(connection):
                         "ok": bool(ok),
                         "msg": res,
                     }, ensure_ascii=False))
+                elif action == "db_tables":
+                    tables = _db_list_tables()
+                    await _safe_send(ws, json.dumps({
+                        "type": "command_result",
+                        "id": msg.get("id", ""),
+                        "action": action,
+                        "ok": True,
+                        "msg": "ok",
+                        "tables": tables,
+                    }, ensure_ascii=False))
+                elif action == "db_query":
+                    _tbl = (msg.get("table") or msg.get("name") or "").strip()
+                    ok, payload = _db_query_table(_tbl, msg.get("limit", 20), msg.get("offset", 0), msg.get("search", ""))
+                    if ok:
+                        await _safe_send(ws, json.dumps({
+                            "type": "command_result",
+                            "id": msg.get("id", ""),
+                            "action": action,
+                            "ok": True,
+                            "msg": "ok",
+                            **payload,
+                        }, ensure_ascii=False))
+                    else:
+                        await _safe_send(ws, json.dumps({
+                            "type": "command_result",
+                            "id": msg.get("id", ""),
+                            "action": action,
+                            "ok": False,
+                            "msg": str(payload),
+                        }, ensure_ascii=False))
                 elif action in MODULE_ACTIONS:
-                    # KONSUMSI di hub (supervisor proses), jangan teruskan.
                     ok, res = handle_module_command(action, msg.get("module", ""))
                     changed = set(refresh_supervised_status())
                     _mod = msg.get("module", "")
-                    # Status terkini modul target selalu disiarkan (sinkronisasi
-                    # dashboard; restart cepat tak selalu terlihat poller 2 dtk).
                     if _mod in module_status:
                         changed.add(_mod)
                     for _n in changed:
