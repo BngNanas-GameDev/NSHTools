@@ -142,7 +142,15 @@
     "ON202609250023||Ap120gr||1s||||0||": "2026-09-25T09:51:37.731531",
     "ON202609250030||Concord||2s||||0||": "2026-09-25T09:53:58.014756",
     "ON202609250035||Ac260gr||1s||||0||": "2026-09-25T10:03:00.102966",
-    "ON202609250035||Ac260gr||2s||||0||": "2026-09-25T10:06:00.384998"
+    "ON202609250035||Ac260gr||2s||||0||": "2026-09-25T10:06:00.384998",
+    "ON202609250049||Ac260gr||1s||glossy||0||": "2026-09-25T10:48:01.331802",
+    "ON202609250056||Ap150gr||1s||||0||": "2026-09-25T10:51:39.566393",
+    "ON202609250050||Ac190gr||1s||||0||": "2026-09-25T10:51:54.517903",
+    "ON202609250050||Ac260gr||1s||||0||": "2026-09-25T10:54:24.859694",
+    "ON202609250060||Stiker Kromo||1s||||0||kisscut": "2026-09-25T10:57:35.154849",
+    "ON202609250051||Hologram||1s||||0||kisscut": "2026-09-25T10:58:00.231324",
+    "ON202609250058||Ac260gr||1s||||0||": "2026-09-25T11:00:25.535037",
+    "ON202609250060||Hvs100gr||1s||||0||": "2026-09-25T11:00:40.644838"
   },
   "skip_forever": {
     "ON202609240103": "manual dari dashboard",
@@ -477,6 +485,46 @@
       "reason": "kode tidak ada di list KM",
       "last_try": "2026-09-25T09:47:44.010713",
       "count": 2
+    },
+    "ON202609250049||Ac260gr||1s||glossy||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T10:44:47.926520",
+      "count": 8
+    },
+    "ON202609250050||Ac260gr||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T10:47:47.973483",
+      "count": 4
+    },
+    "ON202609250050||Ac190gr||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T10:47:49.035788",
+      "count": 4
+    },
+    "ON202609250056||Ap150gr||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T10:47:46.942549",
+      "count": 1
+    },
+    "ON202609250058||Ac260gr||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T10:57:10.864958",
+      "count": 1
+    },
+    "ON202609250065||Ac260gr||1s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T11:00:11.121054",
+      "count": 1
+    },
+    "ON202609250061||Ac310gr||1s||glossy||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T11:00:12.191458",
+      "count": 1
+    },
+    "ON202609250061||Ac260gr||2s||||0||": {
+      "reason": "kode tidak ada di list KM",
+      "last_try": "2026-09-25T11:00:13.246080",
+      "count": 1
     }
   },
   "manual": {
@@ -495,6 +543,14 @@
     "ON202609250035||Ac260gr||2s||||0||": {
       "reason": "jumlah tidak sesuai: 5 vs 1 (override qty manual / lewati)",
       "updated_at": "2026-09-25T10:02:46.749157"
+    },
+    "ON202609250050||Ac260gr||1s||||0||": {
+      "reason": "bahan tidak sesuai: Ac260gr vs Art Carton 190gr Fullcolor",
+      "updated_at": "2026-09-25T10:51:40.618501"
+    },
+    "ON202609250060||Hvs100gr||1s||||0||": {
+      "reason": "bahan tidak sesuai: Hvs100gr vs Sticker Kromo + Kisscut (A3+)",
+      "updated_at": "2026-09-25T10:57:36.203684"
     }
   }
 }

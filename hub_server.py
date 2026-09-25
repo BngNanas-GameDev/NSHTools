@@ -776,9 +776,78 @@ connect();
 # HTTP SERVER (dashboard only, separate thread)
 # ══════════════════════════════════════════════════════════════
 class DashboardHandler(http.server.BaseHTTPRequestHandler):
+    def _cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors_headers()
+        self.end_headers()
+
     def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/output-file":
+            qs = urllib.parse.parse_qs(parsed.query)
+            name = (qs.get("name", [""])[0] or "").strip()
+            # validasi ketat: basename saja, .pdf
+            if not name or name != os.path.basename(name) or not name.lower().endswith(".pdf"):
+                self.send_response(400)
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(b"nama file tidak valid")
+                return
+            try:
+                lite_cfg = _read_folders_file("lite")
+                outdir = os.path.realpath((lite_cfg.get("output_folder") or "").strip())
+                if not outdir or not os.path.isdir(outdir):
+                    raise FileNotFoundError
+                fpath = os.path.realpath(os.path.join(outdir, name))
+                if not fpath.startswith(outdir + os.sep) or not os.path.isfile(fpath):
+                    # fallback: cari di sekitar aaDevelop (mis. file dari hari sebelumnya masih di list)
+                    parent = os.path.dirname(outdir)
+                    found = None
+                    try:
+                        for r, _, files in os.walk(parent):
+                            if name in files:
+                                cand = os.path.realpath(os.path.join(r, name))
+                                if cand.startswith(os.path.realpath(parent) + os.sep) and os.path.isfile(cand):
+                                    found = cand
+                                    break
+                            # batasi kedalaman agar tidak scan terlalu jauh
+                            if r.count(os.sep) - parent.count(os.sep) > 3:
+                                dirs[:] = []
+                    except Exception:
+                        found = None
+                    if found:
+                        fpath = found
+                    else:
+                        raise FileNotFoundError
+                self.send_response(200)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header("Content-Length", str(os.path.getsize(fpath)))
+                self.send_header("Content-Disposition", f'inline; filename="{name}"')
+                self._cors_headers()
+                self.end_headers()
+                with open(fpath, "rb") as fh:
+                    shutil.copyfileobj(fh, self.wfile)
+                return
+            except FileNotFoundError:
+                self.send_response(404)
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write("file tidak ditemukan di OUTPUT (mungkin sudah dipindah ke DEVELOP/RICOH atau ganti hari)".encode())
+                return
+            except Exception as e:
+                self.send_response(500)
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(f"error: {e}".encode()[:200])
+                return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self._cors_headers()
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(DASHBOARD_HTML.encode())

@@ -578,13 +578,14 @@ function fmtSize(n?: number): string {
 
 // Watcher file OUTPUT lite: pilih batch -> kirim ke DEVELOP / RICOH (via hub).
 // Dipakai sebagai blok Hasil Impose tab NSH Lite.
-function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil Impose', subtitle }: {
+function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil Impose', subtitle, onPreview }: {
   connected: boolean
   sendCommand: (action: string, opts?: SendCommandOpts) => string | null
   results: CommandResult[]
   files: OutputFile[]
   title?: string
   subtitle?: string
+  onPreview?: (file: OutputFile) => void
 }) {
   const [sel, setSel] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(false)
@@ -677,7 +678,7 @@ function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil 
           <label key={f.name} className="flex items-center gap-2 rounded-lg px-2.5 py-2 cursor-pointer"
             style={{ background: sel.has(f.name) ? 'var(--color-nav-active)' : 'var(--color-bg)' }}>
             <input type="checkbox" checked={sel.has(f.name)} onChange={() => toggle(f.name)} />
-            <span className="font-mono truncate flex-1" title={f.name} style={{ fontSize: 'var(--text-xs)' }}>{f.name}</span>
+            <span className="font-mono truncate flex-1 hover:underline" title={f.name} style={{ fontSize: 'var(--text-xs)', cursor: 'pointer' }} onClick={() => onPreview?.(f)}>{f.name}</span>
             <span className="font-mono shrink-0" style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>{fmtSize(f.size)}</span>
           </label>
         ))}
@@ -725,6 +726,7 @@ const PageNshLite = ({ connected, sendCommand, results, outputFiles }: {
   outputFiles: OutputFile[]
 }) => {
   const folders = useModuleFolders('lite', connected, sendCommand, results)
+  const [previewFile, setPreviewFile] = useState<OutputFile | null>(null)
 
   return (
     <div className="flex flex-col gap-4">
@@ -748,9 +750,47 @@ const PageNshLite = ({ connected, sendCommand, results, outputFiles }: {
         onSave={() => folders.save(folders.values)}
         saving={folders.saving}
       />
-      {/* Hasil Impose: file OUTPUT siap kirim */}
-      <OutputWatcher connected={connected} sendCommand={sendCommand} results={results} files={outputFiles}
-        title="Hasil Impose" subtitle="File di OUTPUT siap kirim ke DEVELOP / RICOH" />
+      <div className="grid gap-4" style={{ gridTemplateColumns: '1fr 360px' }}>
+        <OutputWatcher connected={connected} sendCommand={sendCommand} results={results} files={outputFiles}
+          title="Hasil Impose" subtitle="File di OUTPUT siap kirim ke DEVELOP / RICOH" onPreview={setPreviewFile} />
+        <PreviewPanel file={previewFile} />
+      </div>
+    </div>
+  )
+}
+
+// Preview Panel untuk NSH Lite — 1 halaman, tanpa scroll, Next/Back Page 1-2, fit, tanpa rounded
+function PreviewPanel({ file }: { file: OutputFile | null }) {
+  const [page, setPage] = useState(0)
+  useEffect(() => { setPage(0) }, [file?.name])
+  const hubHttp = (() => {
+    try { return `http://${location.hostname}:8766` } catch { return 'http://localhost:8766' }
+  })()
+  const pdfSrc = file ? `${hubHttp}/api/output-file?name=${encodeURIComponent(file.name)}#page=${page + 1}` : null
+  return (
+    <div className="card p-5 flex flex-col gap-3 h-fit">
+      <SectionHeader label="Preview Panel" />
+      {!file ? (
+        <div style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-dim)', padding: '24px 0', textAlign: 'center' }}>
+          Klik file di Hasil Impose untuk preview
+        </div>
+      ) : (
+        <>
+          <div className="font-mono truncate" title={file.name} style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent)' }}>{file.name}</div>
+          <div style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', height: 520, overflow: 'hidden' }}>
+            <iframe key={pdfSrc ?? ''} src={pdfSrc ?? ''} title={file.name} style={{ width: '100%', height: '100%', border: 'none' }} />
+          </div>
+          <div className="flex items-center justify-between">
+            <button className="btn btn-ghost btn-sm" disabled={page === 0} onClick={() => setPage(p => Math.max(0, p - 1))}>
+              <Icon name="chevronLeft" size={14} /> Back
+            </button>
+            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>Page {page + 1}</span>
+            <button className="btn btn-ghost btn-sm" onClick={() => setPage(p => p + 1)}>
+              Next <Icon name="chevronRight" size={14} />
+            </button>
+          </div>
+        </>
+      )}
     </div>
   )
 }
@@ -779,7 +819,7 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
     <EmptyState icon="wifiOff" title="Hub Offline" description="Jalankan route.py --hub untuk mengaktifkan modul KMA Router" />
   )
 
-  const files = routes.map((r, i) => ({ ...r, ...kmaStatus(r.status), key: `${r.file}||${r.ts}||${i}` }))
+  const files = [...routes].reverse().map((r, i) => ({ ...r, ...kmaStatus(r.status), key: `${r.file}||${r.ts}||${i}` }))
 
   return (
     <div className="flex flex-col gap-4">
@@ -795,44 +835,10 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
         onSave={() => folders.save(folders.values)}
         saving={folders.saving}
       />
-      <div className="grid gap-4 two-col" style={{ gridTemplateColumns: '380px 1fr' }}>
-      {/* File list */}
-      <div className="card overflow-hidden">
-        <div className="px-5 py-3.5" style={{ borderBottom: '1px solid var(--color-border)' }}>
-          <SectionHeader label="Daftar File Router" />
-        </div>
-        <div className="overflow-x-auto">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Nama File</th><th>Bahan</th><th>Hotfolder</th><th>Waktu</th><th>Status</th><th>Mesin</th>
-              </tr>
-            </thead>
-            <tbody>
-              {files.length === 0 && (
-                <tr><td colSpan={6}>
-                  <EmptyState icon="router" title="Belum ada file" description="Router belum memproses file apa pun sesi ini" />
-                </td></tr>
-              )}
-              {files.map((f) => (
-                <tr key={f.key}>
-                  <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent-fg)' }}>{f.file}</span></td>
-                  <td><CategoryBadge label={f.category} /></td>
-                  <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>→ {f.dest}</span></td>
-                  <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>{f.ts}</span></td>
-                  <td><Badge label={f.label} status={f.level} /></td>
-                  <td><span className="font-mono font-semibold" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent-fg)' }}>{f.machine ?? '—'}</span></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Status printer — dipindah ke atas, bersebelahan seperti HOME */}
-      <div className="card p-5 h-fit" style={{ order: -1 }}>
+      {/* Status printer — di atas Daftar File, 3 blok bersebelahan */}
+      <div className="card p-5">
         <SectionHeader label="Status Printer" />
-          <div className="flex flex-col gap-2.5">
+          <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
             {printers.length === 0 && (
               <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-dim)' }}>Menunggu status printer…</div>
             )}
@@ -849,7 +855,7 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
                     <Icon name="printer" size={16} style={{ color: 'var(--color-text-secondary)' } as any} />
                     <span className="font-bold font-mono" style={{ fontSize: 'var(--text-base)' }}>{p.ip}</span>
                     <span className="section-label">{isRicoh ? 'WATCHER' : (p.machine || '')}</span>
-                    {p.active && (
+                    {p.active && p.ip !== '192.168.10.158' && (
                       <span className="rounded font-bold"
                         style={{ fontSize: 10, background: 'var(--color-success-ghost)', color: 'var(--color-success-fg)', padding: '2px 6px' }}>
                         AKTIF
@@ -881,6 +887,37 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
               )
             })}
           </div>
+        </div>
+      {/* File list */}
+      <div className="card overflow-hidden">
+        <div className="px-5 py-3.5" style={{ borderBottom: '1px solid var(--color-border)' }}>
+          <SectionHeader label="Daftar File Router" />
+        </div>
+        <div className="overflow-x-auto">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Nama File</th><th>Bahan</th><th>Hotfolder</th><th>Waktu</th><th>Status</th><th>Mesin</th>
+              </tr>
+            </thead>
+            <tbody>
+              {files.length === 0 && (
+                <tr><td colSpan={6}>
+                  <EmptyState icon="router" title="Belum ada file" description="Router belum memproses file apa pun sesi ini" />
+                </td></tr>
+              )}
+              {files.map((f) => (
+                <tr key={f.key}>
+                  <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent-fg)' }}>{f.file}</span></td>
+                  <td><CategoryBadge label={f.category} /></td>
+                  <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>→ {f.dest}</span></td>
+                  <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>{f.ts}</span></td>
+                  <td><Badge label={f.label} status={f.level} /></td>
+                  <td><span className="font-mono font-semibold" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent-fg)' }}>{f.machine ?? '—'}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
     </div>

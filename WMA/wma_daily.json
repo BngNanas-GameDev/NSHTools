@@ -2,6 +2,86 @@
   "date": "2026-09-25",
   "entries": [
     {
+      "nota": "ON202609250065",
+      "bahan": "Ac260gr",
+      "customer": "Lidiya01",
+      "test": false,
+      "sides": "1s",
+      "laminating": "",
+      "total_qty": 1,
+      "jenis": "BESAR",
+      "process_type": null,
+      "operator": "Nanas",
+      "machine": "Develop 2",
+      "files": [
+        "Lidiya01_Ac260gr 1s (uk.320x480mm) (1d1 = 1 KECIL) - (Potong) TOTAL = 1 BESAR (1s) (F688777L - ON202609250065).pdf"
+      ]
+    },
+    {
+      "nota": "ON202609250061",
+      "bahan": "Ac310gr",
+      "customer": "Bacoot02",
+      "test": false,
+      "sides": "1s",
+      "laminating": "glossy",
+      "total_qty": 1,
+      "jenis": "BESAR",
+      "process_type": null,
+      "operator": "Rahmadi",
+      "machine": "Ricoh",
+      "files": [
+        "Bacoot02 _Ac310gr 1s (uk.148x210mm) (1d4 = 4 KECIL) - (Glossy 2s+Manual Cutter) TOTAL = 1 BESAR (1s) (L689001LTF-ON202609250061).pdf"
+      ]
+    },
+    {
+      "nota": "ON202609250061",
+      "bahan": "Ac260gr",
+      "customer": "Bacoot01",
+      "test": false,
+      "sides": "2s",
+      "laminating": "",
+      "total_qty": 2,
+      "jenis": "BESAR",
+      "process_type": null,
+      "operator": "Rahmadi",
+      "machine": "Ricoh",
+      "files": [
+        "Bacoot01 _Ac260gr  2s (uk.148x210mm) (1d4 = @1 KECIL) - (Manual Cutter) TOTAL = 2 BESAR (2s) (L689001LTF-ON202609250061).pdf"
+      ]
+    },
+    {
+      "nota": "ON202609250058",
+      "bahan": "Ac260gr",
+      "customer": "Ima01",
+      "test": false,
+      "sides": "1s",
+      "laminating": "",
+      "total_qty": 1,
+      "jenis": "BESAR",
+      "process_type": null,
+      "operator": "Nanas",
+      "machine": "Ricoh",
+      "files": [
+        "Ima01_Ac260gr  1s (uk.210x297mm) (1d2 = @1 KECIL) - (Press Tebal+Manual Cutter) TOTAL = 1 BESAR (1s) (A688955L- ON202609250058).pdf"
+      ]
+    },
+    {
+      "nota": "ON202609250060",
+      "bahan": "Hvs100gr",
+      "customer": "AngkasaLangit03",
+      "test": false,
+      "sides": "1s",
+      "laminating": "",
+      "total_qty": 1,
+      "jenis": "BESAR",
+      "process_type": null,
+      "operator": "Nanas",
+      "machine": "Ricoh",
+      "files": [
+        "AngkasaLangit03_HVS 100gr 1s (uk.148x210mm) (1d4 = 4 KECIL) - (Manual Cutter) TOTAL = 1 BESAR (1s) (m688910BL - ON202609250060).pdf"
+      ]
+    },
+    {
       "nota": "ON202609250041",
       "bahan": "Ac260gr",
       "customer": "AstonHotel01_TEST1",
