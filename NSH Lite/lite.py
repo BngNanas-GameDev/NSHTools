@@ -19,6 +19,7 @@ _IMPOSED = set()       # nama file yang sudah diimpose di sesi ini (untuk deteks
 _COOLDOWN = {}  # nama file -> timestamp gagal terakhir
 _FAIL_COUNT = {}  # nama file -> jumlah gagal berturut (diluar cooldown)
 _SEEN = {}  # path.lower() -> timestamp pertama kali terlihat (untuk delay impose)
+_KC_OFF_LOGGED = set()  # file kisscut yg sudah dilog "copy OFF" (anti-spam per sesi)
 COOLDOWN_S = 5
 COOLDOWN_BEFORE = 10  # delay HANYA di impose, deteksi langsung
 MAX_FAIL = 3
@@ -231,7 +232,18 @@ def process_one(fn, bridge, outdir, udadir):
     first = _SEEN.get(str(Path(fn)).lower())
     if first and (_time.time() - first) < COOLDOWN_BEFORE:
         return False  # masih cooldown, skip tapi jangan log
+    # --- gate flag: file normal butuh auto_impose ON, kisscut butuh copy_kisscut ON.
+    # Keduanya independen: impose OFF tidak menghentikan copy kisscut (dan sebaliknya).
+    if not is_kc and not _AUTO_IMPOSE:
+        return False  # impose otomatis OFF: file normal dibiarkan di Input (diam, tanpa tandai)
     if is_kc:
+        if not _COPY_KISSCUT:
+            # copy kisscut/diecut OFF: biarkan file di INPUT (jangan copy,
+            # jangan pindah ke uda, jangan tandai permanen supaya bisa jalan lagi saat ON).
+            if name not in _KC_OFF_LOGGED:
+                _log(Y, "[KC-OFF]", _short(name), "copy kisscut/diecut OFF -> dibiarkan di Input")
+                _KC_OFF_LOGGED.add(name)
+            return False
         return _handle_kisscut(fn, name, outdir, udadir)
     try:
         dst = outdir / name
@@ -354,6 +366,30 @@ def save_cfg(cfg):
                                     encoding="utf-8")
 
 
+def _flag(cfg, key, default=True):
+    """Baca flag on/off dari config (toleran: True/1/'1'/'true'/'on' = ON).
+    Default ON agar perilaku lama (otomatis jalan) tetap bila kunci belum ada."""
+    v = (cfg or {}).get(key, None)
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    return str(v).strip().lower() in ("1", "true", "on", "ya", "y")
+
+
+def lite_flags(cfg=None):
+    """(auto_impose, copy_kisscut) dari config. Keduanya default ON."""
+    cfg = cfg if cfg is not None else load_cfg()
+    return _flag(cfg, "auto_impose", True), _flag(cfg, "copy_kisscut", True)
+
+
+# Flag efektif sesi ini (diisi watch_loop/main dari config; default ON = perilaku lama).
+_AUTO_IMPOSE = True
+_COPY_KISSCUT = True
+
+
 def ask_folders():
     cfg = load_cfg()
     ind = Path(cfg.get("input_folder", str(BASE / "input")))
@@ -422,11 +458,14 @@ def watch_loop():
     print(f"  Legenda: {G}[ OK ] berhasil{RST}  {Y}[SKIP] skip{RST}  {Y}[E030] locked{RST}  {R}[E031/E032] gagal->.txt{RST}  {D}| Ctrl+C stop{RST}")
     print(f"  ------------------------------------------------------")
     cfg_mtime = _cfg_mtime()
+    _off_notice = False  # notice "auto-impose OFF" 1x per perubahan flag
     try:
         while True:
             if _cfg_mtime() != cfg_mtime:
                 _restart_self("lite.json berubah")
                 return  # tak tercapai bila exec sukses
+            global _AUTO_IMPOSE, _COPY_KISSCUT
+            _AUTO_IMPOSE, _COPY_KISSCUT = lite_flags()
             seen = {}
             for f in list(indir.glob("*.pdf")) + list(indir.glob("*.PDF")):
                 seen[str(f).lower()] = f
@@ -434,6 +473,11 @@ def watch_loop():
                 if k not in seen:
                     _SEEN.pop(k, None)
             n = 0
+            if not _AUTO_IMPOSE and seen and not _off_notice:
+                print(f"  {Y}Auto-Impose OFF — file normal dibiarkan di Input (kisscut ikut flag Copy).{RST}")
+                _off_notice = True
+            elif _AUTO_IMPOSE or not seen:
+                _off_notice = False
             for key, f in seen.items():
                 # record waktu pertama kali terlihat
                 if key not in _SEEN:
@@ -456,6 +500,8 @@ def main():
     if not args:
         watch_loop()
         return
+    global _AUTO_IMPOSE, _COPY_KISSCUT
+    _AUTO_IMPOSE, _COPY_KISSCUT = lite_flags()
     bridge = None
     if do_impose:
         from imposition_bridge import impose_file

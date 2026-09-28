@@ -64,11 +64,14 @@ class WSClient:
 
     async def _connect_forever(self):
         import websockets
+        backoff = 1  # 1→2→4→…→60s; reset hanya bila koneksi bertahan >30s
         while True:
+            connected_at = 0.0
             try:
-                async with websockets.connect(self.hub_url) as ws:
+                async with websockets.connect(self.hub_url, ping_interval=20, ping_timeout=180) as ws:
+                    connected_at = time.time()
                     self._ws = ws
-                    self._connected = True
+                    self._send_queue.clear()  # jangan kirim antrean basi ke koneksi baru
                     print(f"  [WS] {self.role} connected to {self.hub_url}")
 
                     # subscribe
@@ -77,6 +80,7 @@ class WSClient:
                         "role": self.role,
                         "id": self.role,
                     }))
+                    self._connected = True
 
                     # flush queue
                     while self._send_queue:
@@ -92,7 +96,13 @@ class WSClient:
                 self._connected = False
                 self._ws = None
                 print(f"  [WS] {self.role} disconnected: {e}")
-            await asyncio.sleep(3)
+            finally:
+                self._connected = False
+                self._ws = None
+                if connected_at and (time.time() - connected_at) > 30:
+                    backoff = 1  # koneksi stabil → mulai lagi dari 1s
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
     async def _handle(self, msg):
         msg_type = msg.get("type", "")

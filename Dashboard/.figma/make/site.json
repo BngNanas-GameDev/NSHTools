@@ -1,4 +1,5 @@
 {
+  "title": "NSH Dashboard",
   "description": "Monitor and manage print-shop operations with real-time status, live activity feeds, and detailed job tracking in a modern, responsive dashboard.",
   "robots": {
     "index": false

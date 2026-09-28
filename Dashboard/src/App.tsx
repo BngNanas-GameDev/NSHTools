@@ -691,18 +691,21 @@ function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil 
       </div>
       <div className="flex flex-col gap-1.5 overflow-y-auto" style={{ maxHeight: 380 }}>
         {files.length > 0 && (
-          <label className="flex items-center gap-2 cursor-pointer"
-            style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>
+          // Baris master bahasa sama dengan baris file — logika checked/onChange tidak berubah
+          <label className="flex items-center gap-2 rounded-lg px-2.5 py-2 cursor-pointer"
+            style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', background: 'var(--color-bg)', border: '1px solid var(--color-border)' }}>
             <input type="checkbox" checked={sel.size === files.length && files.length > 0} onChange={toggleAll} />
             Pilih semua
+            <span className="rounded-full font-mono font-semibold shrink-0" style={{ background: 'var(--color-border)', color: 'var(--color-text-secondary)', fontSize: 10, padding: '1px 8px' }}>{sel.size}/{files.length}</span>
           </label>
         )}
-        {files.map(f => (
-          <label key={f.name} className="flex items-center gap-2 rounded-lg px-2.5 py-2 cursor-pointer"
-            style={{ background: sel.has(f.name) ? 'var(--color-nav-active)' : 'var(--color-bg)' }}>
+        {files.map((f, i) => (
+          // Animasi masuk saat mount via utilitas yang ada; key stabil agar centang hanya ubah warna tanpa mengulang animasi
+          <label key={f.name} className="animate-fade-rise flex items-center gap-2 rounded-lg px-2.5 py-2 cursor-pointer"
+            style={{ animationDelay: `${Math.min(i * 30, 300)}ms`, background: sel.has(f.name) ? 'var(--color-nav-active)' : 'var(--color-bg)', border: sel.has(f.name) ? '1px solid var(--color-accent-ghost)' : '1px solid var(--color-border)' }}>
             <input type="checkbox" checked={sel.has(f.name)} onChange={() => toggle(f.name)} />
             <span className="font-mono truncate flex-1 hover:underline" title={f.name} style={{ fontSize: 'var(--text-xs)', cursor: 'pointer' }} onClick={() => onPreview?.(f)}>{f.name}</span>
-            <span className="font-mono shrink-0" style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>{fmtSize(f.size)}</span>
+            <span className="font-mono rounded-full shrink-0" style={{ fontSize: 10, color: 'var(--color-text-dim)', background: 'var(--color-panel)', border: '1px solid var(--color-border)', padding: '1px 8px' }}>{fmtSize(f.size)}</span>
           </label>
         ))}
         {files.length === 0 && !loading && (
@@ -711,28 +714,38 @@ function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil 
           </div>
         )}
       </div>
-      <div className="grid grid-cols-2 gap-2">
-        <button className="btn btn-primary btn-sm" disabled={sel.size === 0} onClick={() => doMove('develop')}>
-          <Icon name="send" size={13} /> DEVELOP ({sel.size})
-        </button>
-        <button className="btn btn-secondary btn-sm" disabled={sel.size === 0} onClick={() => doMove('ricoh')}>
-          <Icon name="send" size={13} /> RICOH ({sel.size})
-        </button>
-      </div>
-      <div>
-        <div className="section-label mb-1.5">Operator</div>
-        <div className="flex gap-1.5 flex-wrap">
-          {['Nanas', 'Eric', 'Rahmadi'].map(op => (
-            <button key={op} className="chip"
-              onClick={() => pickOperator(op)}
-              style={{
-                background: operator === op ? 'var(--color-nav-active)' : 'var(--color-panel)',
-                color:      operator === op ? 'var(--color-accent)'     : 'var(--color-text-secondary)',
-                border: `1px solid ${operator === op ? 'var(--color-accent-ghost)' : 'var(--color-border)'}`,
-              }}>{op}</button>
-          ))}
+      {sel.size > 0 ? (
+        // Bar batch hanya muncul saat ada pilihan — animasi sekali saat mount via utilitas yang ada
+        <div className="animate-fade-rise flex flex-wrap items-center gap-2.5" style={{ background: 'var(--color-nav-active)', border: '1px solid var(--color-border)', borderRadius: 10, padding: '12px 14px' }}>
+          <span className="rounded-full font-semibold shrink-0" style={{ background: 'var(--color-accent-ghost)', color: 'var(--color-accent)', fontSize: 'var(--text-xs)', padding: '3px 10px' }}>{sel.size} dipilih</span>
+          <div className="flex gap-1.5 flex-wrap items-center">
+            <span className="section-label">Operator</span>
+            {['Nanas', 'Eric', 'Rahmadi'].map(op => (
+              <button key={op} className="chip"
+                onClick={() => pickOperator(op)}
+                style={{
+                  background: operator === op ? 'var(--color-nav-active)' : 'var(--color-panel)',
+                  color:      operator === op ? 'var(--color-accent)'     : 'var(--color-text-secondary)',
+                  border: `1px solid ${operator === op ? 'var(--color-accent-ghost)' : 'var(--color-border)'}`,
+                }}>{op}</button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2 ml-auto">
+            <button className="btn btn-primary btn-sm" onClick={() => doMove('develop')}>
+              <Icon name="send" size={13} /> DEVELOP
+            </button>
+            <button className="btn btn-secondary btn-sm" onClick={() => doMove('ricoh')}>
+              <Icon name="send" size={13} /> RICOH
+            </button>
+            <button className="btn btn-ghost btn-sm" title="Batalkan pilihan" onClick={() => setSel(new Set())}>
+              <Icon name="x" size={13} />
+            </button>
+          </div>
         </div>
-      </div>
+      ) : (
+        // Petunjuk ramping saat belum ada pilihan agar layout tidak lompat
+        <div style={{ fontSize: 10, color: 'var(--color-text-dim)', padding: '2px 0' }}>Pilih file untuk memindah batch…</div>
+      )}
       <div style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>ke folder DEVELOP / RICOH (setelan KMA) • tercatat + Selesai di .54</div>
       </div>
     </div>
@@ -750,6 +763,12 @@ const PageNshLite = ({ connected, sendCommand, results, outputFiles }: {
 }) => {
   const folders = useModuleFolders('lite', connected, sendCommand, results)
   const [previewFile, setPreviewFile] = useState<OutputFile | null>(null)
+  const flagOn = (k: string) => (folders.values[k] ?? '1') !== '0'
+  const setFlag = (k: string, on: boolean) => {
+    const next = { ...folders.values, [k]: on ? '1' : '0' }
+    folders.setValues(next)
+    folders.save(next)
+  }
 
   return (
     <div className="flex flex-col gap-4">
@@ -761,6 +780,36 @@ const PageNshLite = ({ connected, sendCommand, results, outputFiles }: {
           <span style={{ color: 'var(--color-text-secondary)' }}>— modul Lite belum ada backend</span>
         </div>
       )}
+      {/* Otomatisasi Lite */}
+      <div className="card px-5 py-4">
+        <SectionHeader label="Otomatisasi" />
+        <div className="flex gap-2.5 flex-wrap">
+          {[
+            { key: 'auto_impose', label: 'Impose Otomatis' },
+            { key: 'copy_kisscut', label: 'Copy Kisscut/Diecut' },
+          ].map(t => {
+            const on = flagOn(t.key)
+            return (
+              <button key={t.key} className="btn btn-sm"
+                onClick={() => setFlag(t.key, !on)}
+                style={{
+                  background: on ? 'var(--color-success-ghost)' : 'var(--color-panel)',
+                  color: on ? 'var(--color-success-fg)' : 'var(--color-text-dim)',
+                  border: '1px solid var(--color-border)',
+                }}>
+                <span className="rounded-full" style={{
+                  width: 8, height: 8,
+                  background: on ? 'var(--color-success)' : 'var(--color-text-dim)',
+                }} />
+                {t.label}: {on ? 'ON' : 'OFF'}
+              </button>
+            )
+          })}
+        </div>
+        <div style={{ fontSize: 10, color: 'var(--color-text-dim)', marginTop: 6 }}>
+          OFF = file dibiarkan di INPUT (tidak di-impose / tidak di-copy) • Lite restart otomatis ±30 dtk
+        </div>
+      </div>
       {/* Path folder */}
       <PathBar
         fields={[
@@ -992,6 +1041,12 @@ const PageWma = ({ entriesAll = [], statuses = {}, verified = [], live, sendComm
     return (s === 'ok' || s === 'error' || s === 'manual') && !isVerified(e)
   })
   const right = entriesAll.filter(e => isVerified(e))
+  const [selesaiSearch, setSelesaiSearch] = useState('')
+  const rightFiltered = right.filter(e => {
+    if (!selesaiSearch) return true
+    const q = selesaiSearch.toLowerCase()
+    return e.nota.toLowerCase().includes(q) || (e.customer || '').toLowerCase().includes(q) || (e.bahan || '').toLowerCase().includes(q)
+  })
 
   const wmaReason = (e: WmaEntry): string | null => {
     const st = stOf(statuses, e)
@@ -1076,7 +1131,24 @@ const PageWma = ({ entriesAll = [], statuses = {}, verified = [], live, sendComm
     <div className="grid gap-4 wma-racks" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
       {rack('Antrian', 'Belum diproses KMMA', 'accent', left, false, live ? 'Antrean kosong' : 'Menunggu hub…')}
       {rack('Menunggu Aksi', 'Sudah diproses — perlu verifikasi', 'warning', mid, true, 'Tidak ada yang menunggu')}
-      {rack('Selesai', 'Sudah diverifikasi', 'success', right, false, 'Belum ada yang selesai')}
+      <div className="card p-4 flex flex-col gap-2.5">
+        <div className="flex items-center gap-2">
+          <StatusDot status="success" live={live} />
+          <span className="section-label">Selesai</span>
+          <span className="rounded-full px-1.5 font-bold" style={{ background: 'var(--color-border)', fontSize: 10 }}>{rightFiltered.length}/{right.length}</span>
+        </div>
+        <div style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>Sudah diverifikasi</div>
+        <div className="relative">
+          <Icon name="search" size={13} style={{ color: 'var(--color-text-muted)', position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)' } as any} />
+          <input className="input" placeholder="Cari nota / pelanggan / bahan…" value={selesaiSearch} onChange={e => setSelesaiSearch(e.target.value)} style={{ paddingLeft: 28, fontSize: 'var(--text-xs)' }} />
+        </div>
+        <div className="flex flex-col gap-2 overflow-y-auto" style={{ maxHeight: 420 }}>
+          {rightFiltered.length === 0 && (
+            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-dim)' }}>{selesaiSearch ? `Tidak ada hasil untuk "${selesaiSearch}"` : 'Belum ada yang selesai'}</div>
+          )}
+          {rightFiltered.map(e => row(e, false))}
+        </div>
+      </div>
     </div>
   )
 }

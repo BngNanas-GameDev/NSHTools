@@ -108,6 +108,10 @@ def _load_module_override():
 # ══════════════════════════════════════════════════════════════
 SUPERVISE = False
 SUPERVISED = {}  # nama → {"command": [...], "cwd": str, "proc": Popen|None}
+AUTO_RESTART = True        # modul mati -> dinyalakan lagi (anti "connect/disconnect" forever)
+RESTART_BACKOFF_S = (5, 10, 20, 40, 60, 120)  # naik sampai 120s, lalu mengulang
+_MANUAL_OFF = set()   # modul yang operator matikan lewat module_off (JANGAN auto-restart)
+_RESTART_STATE = {}  # nama → {"fails": int, "next": epoch_ts, "at": epoch_ts}
 
 
 def supervise_init(ws_port):
@@ -148,22 +152,56 @@ def _write_pids():
         pass
 
 
+def _module_log_path(name, info):
+    """Path log per-modul: <cwd modul>/<nama>.log.
+
+    Pakai info["cwd"] (str, bisa berisi spasi mis. "NSH Lite") supaya path-nya
+    persis di folder kerja modul — tempat file keluaran modul juga.dump."""
+    try:
+        return Path(info["cwd"]) / f"{name}.log"
+    except Exception:
+        return None
+
+
 def start_module(name):
-    """Start modul sebagai subprocess (console sendiri). Return (ok, msg)."""
+    """Start modul sebagai subprocess (log ke <cwd>/<nama>.log). Return (ok, msg)."""
     info = SUPERVISED.get(name)
     if not info:
         return False, f"modul tak dikenal: {name}"
     if module_alive(name):
         return True, f"{name} sudah berjalan (pid {info['proc'].pid})"
+    # stdout/stderr -> file log (append, utf-8 lenient) supaya output tak hilang
+    # dan encoding tak pernah jadi alasan print gagal.
+    log_fh = None
+    log_path = _module_log_path(name, info)
+    if log_path is not None:
+        try:
+            log_fh = open(log_path, "a", encoding="utf-8", errors="replace")
+        except Exception:
+            log_fh = None
+    # Tanpa console baru: pythonw + CREATE_NEW_CONSOLE justru bikin handle
+    # stdout tak valid (OSError Errno 22). Log file = handle valid, dan operator
+    # tetap bisa baca lewat file. Bila file log tak bisa dibuka, jatuh ke
+    # DEVNULL (bukan console) — karena DEVNULL selalu punya handle yang valid.
     try:
         proc = subprocess.Popen(
             info["command"],
             cwd=info["cwd"],
             stdin=subprocess.DEVNULL,  # non-interaktif: ask_folders() via EOFError
-            creationflags=_new_console_flags(),
+            stdout=log_fh if log_fh is not None else subprocess.DEVNULL,
+            stderr=log_fh if log_fh is not None else subprocess.DEVNULL,
+            creationflags=0,
         )
     except Exception as e:
         return False, f"gagal start {name}: {e}"
+    finally:
+        # Popen sudah menduplikasi handle untuk child, jadi handle induk boleh
+        # ditutup di sini tanpa memutus stdout child (dibatasi Windows: dup).
+        if log_fh is not None:
+            try:
+                log_fh.close()
+            except Exception:
+                pass
     info["proc"] = proc
     _write_pids()
     return True, f"{name} dijalankan (pid {proc.pid})"
@@ -212,10 +250,40 @@ def handle_module_command(action, module):
     if not SUPERVISE:
         return False, "supervisor mati (hub tanpa --supervise)"
     if action == "module_on":
+        _MANUAL_OFF.discard(module)
         return start_module(module)
     if action == "module_off":
+        _MANUAL_OFF.add(module)
         return stop_module(module)
+    _MANUAL_OFF.discard(module)
+    _RESTART_STATE.pop(module, None)  # restart manual = ulang dari backoff nol
     return restart_module(module)
+
+
+def auto_restart_dead():
+    """Nyalakan lagi modul yang mati mendadak (bukan operator-off).
+    Backoff naik supaya modul crash-loop tak membanjiri hub/dashboard."""
+    now = time.time()
+    restarted = []
+    for name in MANAGED_MODULES:
+        if name not in SUPERVISED or name in _MANUAL_OFF:
+            continue
+        if module_alive(name):
+            _RESTART_STATE.pop(name, None)
+            continue
+        st = _RESTART_STATE.setdefault(name, {"fails": 0, "next": 0.0, "at": 0.0})
+        if now < st["next"]:
+            continue
+        ok, msg = start_module(name)
+        if ok:
+            restarted.append(name)
+            print(f"  [supervise] auto-restart {msg}")
+        st["fails"] += 1
+        delay = RESTART_BACKOFF_S[min(st["fails"], len(RESTART_BACKOFF_S)) - 1]
+        st["at"] = now
+        st["next"] = now + delay
+        add_log("supervise", f"{name} mati (fails ke-{st['fails']}), coba lagi {delay}s")
+    return restarted
 
 
 def stop_all_modules():
@@ -368,6 +436,9 @@ FOLDER_KEYS = {
     "lite": ["input_folder", "output_folder", "uda_folder"],
     "kma": ["input_folder", "return_folder", "uda_folder", "ricoh_folder"],
 }
+# Kunci on/off (bukan path) khusus lite: "1" = ON, "0" = OFF. Default ON
+# bila kunci belum ada (perilaku lama = otomatis jalan).
+LITE_FLAGS = ["auto_impose", "copy_kisscut"]
 # boleh kosong (= fitur mati; watcher RICOH off bila kosong)
 FOLDER_OPTIONAL = {
     "lite": [],
@@ -381,12 +452,31 @@ def _folders_path(module):
     return BASE_DIR / FOLDER_FILES[module]
 
 
+def _norm_flag(v):
+    """Normalisasi flag on/off -> '1' (ON) atau '0' (OFF). Default ON
+    (kunci tak ada / tak dikenal = perilaku lama: otomatis jalan)."""
+    if v is None:
+        return "1"
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (int, float)):
+        return "0" if v == 0 else "1"
+    s = str(v).strip().lower()
+    if s in ("0", "false", "off", "tidak", "no", "n"):
+        return "0"
+    return "1"
+
+
 def _read_folders_file(module):
     try:
         data = json.loads(_folders_path(module).read_text(encoding="utf-8"))
     except Exception:
         data = {}
-    return {k: str(data.get(k, "")) for k in FOLDER_KEYS[module]}
+    out = {k: str(data.get(k, "")) for k in FOLDER_KEYS[module]}
+    if module == "lite":
+        for k in LITE_FLAGS:
+            out[k] = _norm_flag(data.get(k, "1"))
+    return out
 
 
 def handle_folders_command(action, module, folders=None):
@@ -408,6 +498,12 @@ def handle_folders_command(action, module, folders=None):
     optional = FOLDER_OPTIONAL.get(module, [])
     cleaned = {k: str(folders.get(k, "")).strip().strip('"').strip("'")
                for k in keys}
+    # flag on/off lite (auto_impose, copy_kisscut): bukan path, dinormalisasi "1"/"0"
+    flag_vals = {}
+    if module == "lite":
+        for k in LITE_FLAGS:
+            if k in folders:
+                flag_vals[k] = _norm_flag(folders.get(k))
     required = [k for k in keys if k not in optional]
     if any(not cleaned[k] for k in required):
         return False, "semua path wajib diisi", _read_folders_file(module)
@@ -428,13 +524,16 @@ def handle_folders_command(action, module, folders=None):
         except Exception:
             pass
         data.update(cleaned)
+        data.update(flag_vals)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
         return False, f"gagal tulis config: {e}", _read_folders_file(module)
     try:
         sys.path.insert(0, str(BASE_DIR / "Database"))
         import db as nshdb
-        nshdb.config_set(module, cleaned)
+        merged = dict(cleaned)
+        merged.update(flag_vals)
+        nshdb.config_set(module, merged)
     except Exception:
         pass
     add_log("HUB", f"folders {module} disimpan — restart modul agar berlaku")
@@ -1875,7 +1974,10 @@ async def handler(connection):
     finally:
         info = clients.pop(ws, {})
         disc_role = info.get("role", "?")
-        if disc_role in ("wma", "kmma", "kma"):
+        # socket lama yg closes tak boleh menimpa "connected" milik socket
+        # lain dgn role sama (restart overlap) → badge berkedip merah/ hijau
+        still_live = any(c.get("role") == disc_role for c in clients.values())
+        if disc_role in ("wma", "kmma", "kma") and not still_live:
             add_log(disc_role.upper(), f"{disc_role} disconnected")
             module_status[disc_role] = {"connected": False, "ts": ts()}
             broadcast(json.dumps({"type": "module_status", "module": disc_role, "connected": False, "ts": ts()}))
@@ -1887,12 +1989,15 @@ async def handler(connection):
 # MAIN
 # ══════════════════════════════════════════════════════════════
 async def _supervisor_poller():
-    """Poll liveness proses tiap 2 dtk; broadcast module_status bila berubah."""
+    """Poll liveness tiap 2 dtk; broadcast module_status bila berubah;
+    nyalakan lagi modul yg mati mendadak (auto-restart ber-backoff)."""
     while True:
         await asyncio.sleep(2)
         try:
             if not SUPERVISE:
                 continue
+            if AUTO_RESTART:
+                auto_restart_dead()
             for _n in refresh_supervised_status():
                 broadcast(json.dumps({"type": "module_status", "module": _n,
                                       "connected": module_status[_n]["connected"],
@@ -2197,7 +2302,12 @@ async def main():
             if not http_ok:
                 start_http_server(http_port)
                 http_ok = True
-            server = await websockets.serve(handler, HOST, ws_port)
+            # keepalive longgar: handler ini jalanin I/O blocking (shutil.move ke
+            # L:\ + urllib ke watcher .54) yg bisa >20s → default 20/20 bunuh
+            # WMA+KMMA+dashboard bareng (1011). Naikkan timeout, bukan interval.
+            server = await websockets.serve(handler, HOST, ws_port,
+                                             ping_interval=20, ping_timeout=180,
+                                             close_timeout=10, max_queue=64)
             break
         except OSError as e:
             print(f"  [hub] port sibuk ({e}), coba lagi {2 * (_attempt + 1)}s...")

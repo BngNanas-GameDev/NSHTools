@@ -18,6 +18,116 @@ def enable_ansi():
 
 enable_ansi()
 
+
+# ── Stream Aman (stdout/stderr tak boleh matikan proses) ──────────────
+class _SafeStream:
+    """Pembungkus stdout/stderr asli: print() SELALU aman, tak pernah melempar.
+
+    Kasus nakal: hub jalan via `pythonw hub_server.py --supervise` lalu modul
+    dijalankan dengan CREATE_NEW_CONSOLE. Proses pythonw (GUI-subsystem) yang
+    dapat console baru ended up punya handle stdout tak valid -> write/flush
+    buffered naik `OSError: [Errno 22] Invalid argument` saat buffer dibuang.
+    Karena print() ada di dalam loop, satu error = satu batch mati.
+
+    Di sini semua error (OSError, ValueError stream tertutup, apa pun) ditelan
+    diam-diam: modul HARUS tetap hidup walau tak bisa bicara ke console.
+    Tanda `_nsh_safe` dipakai installer agar tak membungkus dua kali.
+    """
+    _nsh_safe = True
+
+    def __init__(self, stream, name):
+        self._stream = stream
+        self._name = name
+
+    def write(self, s):
+        try:
+            return self._stream.write(s)
+        except Exception:
+            # Buang, tapi balas len(s) supaya print() tak salah hitung.
+            try:
+                return len(s)
+            except Exception:
+                return 0
+
+    def writelines(self, lines):
+        try:
+            self._stream.writelines(lines)
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except Exception:
+            return False
+
+    def fileno(self):
+        # Sengaja biarkan error apa adanya: kode yang benar-benar butuh fd
+        # (mis. subprocess/select) lebih baik gagal chaining daripada diam.
+        return self._stream.fileno()
+
+    def writable(self):
+        try:
+            return self._stream.writable()
+        except Exception:
+            return True
+
+    def readable(self):
+        try:
+            return self._stream.readable()
+        except Exception:
+            return False
+
+    def seekable(self):
+        try:
+            return self._stream.seekable()
+        except Exception:
+            return False
+
+    def close(self):
+        """JANGAN tutup stream asli — shutdown interpreter tetap butuh membacanya."""
+        pass
+
+    def __getattr__(self, item):
+        # Sisanya (encoding, errors, buffer, name, ...) terus-terusan lempar.
+        # Guard: __init__ belum jalan -> jangan sentuh self._stream (akan rekursi).
+        if item.startswith("_"):
+            raise AttributeError(item)
+        try:
+            return getattr(self.__dict__["_stream"], item)
+        except Exception:
+            raise AttributeError(item)
+
+
+def install_safe_streams():
+    """Pasang _SafeStream ke sys.stdout & sys.stderr. Aman dipanggil berulang."""
+    for name in ("stdout", "stderr"):
+        try:
+            cur = getattr(sys, name, None)
+        except Exception:
+            cur = None
+        if cur is None:
+            # pythonw tanpa console: tak ada stream -> buka devnullappend.
+            try:
+                cur = open(os.devnull, "a", encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+        elif getattr(cur, "_nsh_safe", False):
+            continue  # sudah dibungkus — jangan bungkus lagi (hindari rekursi)
+        try:
+            setattr(sys, name, _SafeStream(cur, name))
+        except Exception:
+            pass
+
+
+install_safe_streams()
+
 # ── Colors ──────────────────────────────────────────────
 RESET   = "\033[0m"
 BOLD    = "\033[1m"

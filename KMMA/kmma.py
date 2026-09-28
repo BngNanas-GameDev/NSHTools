@@ -10,11 +10,13 @@ Pakai:
 """
 import datetime
 import json
+import os
 import queue
 import re
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -69,6 +71,34 @@ ACTION_DELAY = 1
 API_DELAY = 5
 NOTA_RETRY = 180  # jeda retry bila nota tak ada di KM
 AUTO_INTERVAL = 180  # proses ulang otomatis tiap 3 menit (watch mode)
+
+CRASH_LOG = BASE / "kmma_crash.log"  # pythonw tak ada console -> traceback wajib ditulis file
+
+# Print [DEBUG ...] dulu nyala terus & membanjiri console modul.
+# Sekarang WAJIB pakai env var KM_DEBUG=1 (atau apa saja selain ""/0/false).
+DEBUG = os.environ.get("KM_DEBUG", "").strip() not in ("", "0", "false", "False")
+
+
+def _dbg(text):
+    """Print debug hanya bila KM_DEBUG aktif. Teksnya apa adanya."""
+    if DEBUG:
+        print(text)
+
+
+def log_crash(tag: str):
+    """Catat traceback ke console + file, lalu_return. Modul HARUS tetap hidup:
+    dulu exception di loop utama mematikan proses -> WS ke hub putus -> reconnect."""
+    tb = traceback.format_exc()
+    try:
+        print(f"  {err(f'[ERROR] {tag} — modul tetap jalan, lihat {CRASH_LOG.name}')}")
+        print(tb)
+    except Exception:
+        pass
+    try:
+        with open(CRASH_LOG, "a", encoding="utf-8", errors="replace") as f:
+            f.write(f"\n=== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} {tag} ===\n{tb}")
+    except Exception:
+        pass
 
 try:
     from bahan_dict import CANONICAL as _CANONICAL_KMMA
@@ -406,7 +436,7 @@ class KMClient:
                 return resp
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")[:300]
-            print(f"  [DEBUG HTTP] {e.code} {method} {path}: {err_body}")
+            _dbg(f"  [DEBUG HTTP] {e.code} {method} {path}: {err_body}")
             return None
         except Exception:
             return None
@@ -435,19 +465,19 @@ class KMClient:
         self._password = password
         self.cookie = None
         self.preflight()
-        print(f"  [DEBUG login] cookie={self.cookie[:30] if self.cookie else 'None'} csrf={self._csrf_token[:20] if self._csrf_token else 'None'}")
+        _dbg(f"  [DEBUG login] cookie={self.cookie[:30] if self.cookie else 'None'} csrf={self._csrf_token[:20] if self._csrf_token else 'None'}")
         html = self._request("POST", "login/process", {
             "username": username, "password": password,
             "ci_csrf_token": self._csrf_token,
         }, check_login=True)
         if html and ("logout" in html.lower() or "home" in html.lower()):
             if self._is_login_page(html):
-                print(f"  [DEBUG login] response is login page despite having logout/home")
+                _dbg(f"  [DEBUG login] response is login page despite having logout/home")
                 self.cookie = None
                 return False
             self._fetch_csrf_from_workflow()
             return True
-        print(f"  [DEBUG login] login failed, html={'login_page' if html and self._is_login_page(html) else 'None' if not html else 'no_logout_found'} len={len(html) if html else 0}")
+        _dbg(f"  [DEBUG login] login failed, html={'login_page' if html and self._is_login_page(html) else 'None' if not html else 'no_logout_found'} len={len(html) if html else 0}")
         self.cookie = None
         return False
 
@@ -457,7 +487,7 @@ class KMClient:
             m = re.search(r'name="ci_csrf_token"\s+value="([^"]*)"', html)
             if m and m.group(1):
                 self._csrf_token = m.group(1)
-                print(f"  [DEBUG] CSRF token updated from workflow page: {self._csrf_token[:20]}...")
+                _dbg(f"  [DEBUG] CSRF token updated from workflow page: {self._csrf_token[:20]}...")
 
     def fetch_orders_page(self):
         orders = []
@@ -529,7 +559,7 @@ class KMClient:
             # debug: print flow steps
             if data.get("flow"):
                 for i, s in enumerate(data["flow"]):
-                    print(f"  [DEBUG detail] step[{i}]: id={s.get('idproduct_step')} name={s.get('step_name') or s.get('name')} id_td={s.get('idtransaction_detail')}")
+                    _dbg(f"  [DEBUG detail] step[{i}]: id={s.get('idproduct_step')} name={s.get('step_name') or s.get('name')} id_td={s.get('idtransaction_detail')}")
             return data
         except Exception:
             return None
@@ -545,12 +575,12 @@ class KMClient:
             data = json.loads(resp)
             if data.get("err_code") == 0:
                 # debug: print keys untuk lihat semua field yang tersedia
-                print(f"  [DEBUG detail_flow] keys: {list(data.keys())}")
+                _dbg(f"  [DEBUG detail_flow] keys: {list(data.keys())}")
                 # print flow jika ada
                 if "flow" in data:
-                    print(f"  [DEBUG detail_flow] flow: {json.dumps(data['flow'], ensure_ascii=False)[:500]}")
+                    _dbg(f"  [DEBUG detail_flow] flow: {json.dumps(data['flow'], ensure_ascii=False)[:500]}")
                 if "step" in data:
-                    print(f"  [DEBUG detail_flow] step: {json.dumps(data['step'], ensure_ascii=False)[:500]}")
+                    _dbg(f"  [DEBUG detail_flow] step: {json.dumps(data['step'], ensure_ascii=False)[:500]}")
                 return data
         except Exception:
             pass
@@ -561,7 +591,7 @@ class KMClient:
         resp = self._request("POST", "workflow_production/save_flow", payload)
         if not resp:
             # retry: re-login then try once more
-            print("  [DEBUG save_flow] no response, re-login & retry...")
+            _dbg("  [DEBUG save_flow] no response, re-login & retry...")
             self.cookie = None
             if self._username and self._password:
                 self.login(self._username, self._password)
@@ -570,10 +600,10 @@ class KMClient:
         if not resp:
             return False, "network error"
         # debug: print full response
-        print(f"  [DEBUG save_flow] response ({len(resp)} bytes): {resp[:500]}")
+        _dbg(f"  [DEBUG save_flow] response ({len(resp)} bytes): {resp[:500]}")
         try:
             data = json.loads(resp)
-            print(f"  [DEBUG save_flow] json: {json.dumps(data, ensure_ascii=False)[:500]}")
+            _dbg(f"  [DEBUG save_flow] json: {json.dumps(data, ensure_ascii=False)[:500]}")
             if data.get("err_code") == 0:
                 return True, "ok"
             return False, data.get("err_message", "unknown")
@@ -891,7 +921,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
     # ── untuk kisscut/diecut: proses Digital A3+ dulu, lalu step-nya ──
     if proc_type and len(detail["flow"]) > 1:
         for si, sv in enumerate(detail.get("step", [])):
-            print(f"  [DEBUG step_state] step[{si}] id={sv.get('idproduct_step')} name={sv.get('step_name', sv.get('name',''))} err_code={sv.get('err_code', '?')} qty_final={sv.get('qty_final', '?')}")
+            _dbg(f"  [DEBUG step_state] step[{si}] id={sv.get('idproduct_step')} name={sv.get('step_name', sv.get('name',''))} err_code={sv.get('err_code', '?')} qty_final={sv.get('qty_final', '?')}")
         digital_step = detail["flow"][0]
         finish_step = None
         for s in detail["flow"]:
@@ -909,7 +939,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
         d_td = digital_step.get("idtransaction_detail", "") or id_td_order
         digital_flow = client.get_detail_flow(digital_step["idproduct_step"], d_td)
         if not digital_flow and d_td != id_td_order:
-            print(f"  [DEBUG] retry get_detail_flow Digital A3+ with order id_td={id_td_order}")
+            _dbg(f"  [DEBUG] retry get_detail_flow Digital A3+ with order id_td={id_td_order}")
             digital_flow = client.get_detail_flow(digital_step["idproduct_step"], id_td_order)
         if not digital_flow:
             print(f"    {err(f'{nota} gagal ambil form Digital A3+')}")
@@ -919,7 +949,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
         f_td = finish_step.get("idtransaction_detail", "") or id_td_order
         finish_flow = client.get_detail_flow(finish_step["idproduct_step"], f_td)
         if not finish_flow and f_td != id_td_order:
-            print(f"  [DEBUG] retry get_detail_flow {proc_type.upper()} with order id_td={id_td_order}")
+            _dbg(f"  [DEBUG] retry get_detail_flow {proc_type.upper()} with order id_td={id_td_order}")
             finish_flow = client.get_detail_flow(finish_step["idproduct_step"], id_td_order)
         if not finish_flow:
             print(f"    {err(f'{nota} gagal ambil form {proc_type.upper()}')}")
@@ -1030,7 +1060,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
             if mat_idm:
                 payload["flow_material_0[]"] = mat_idm
                 payload["is_flow_material_manual_0[]"] = "0"
-            print(f"  [DEBUG payload] {json.dumps(payload, ensure_ascii=False)}")
+            _dbg(f"  [DEBUG payload] {json.dumps(payload, ensure_ascii=False)}")
             ok_flag, msg = client.save_flow(payload)
             if ok_flag:
                 print(f"    {ok(f'{nota} [{label}] SIMPAN OK')}")
@@ -1102,7 +1132,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
         id_td_step = step.get("idtransaction_detail", "")
         id_td = id_td_order if id_td_order else id_td_step
 
-        print(f"  [DEBUG] id_td_order={id_td_order} id_td_step={id_td_step} -> using {id_td}")
+        _dbg(f"  [DEBUG] id_td_order={id_td_order} id_td_step={id_td_step} -> using {id_td}")
 
         flow = client.get_detail_flow(id_step, id_td_step)
         if not flow:
@@ -1199,7 +1229,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
             "flow_material_0[]": mat_idmaterial,
             "is_flow_material_manual_0[]": "0",
         }
-        print(f"  [DEBUG payload] {json.dumps(payload, ensure_ascii=False)}")
+        _dbg(f"  [DEBUG payload] {json.dumps(payload, ensure_ascii=False)}")
 
         ok_flag, msg = client.save_flow(payload)
         if ok_flag:
@@ -1219,15 +1249,21 @@ def run_entries(client, entries, orders_cache, username, password, ws_client=Non
     """Proses daftar entries (dipakai process_now dan command handler)."""
     print(section("PROSES"))
     for i, entry in enumerate(entries, 1):
-        if client.cookie is None:
-            print(f"  {warn('session expired, re-login...')}")
-            if not client.login(username, password):
-                print(f"  {err('re-login gagal, skip sisa entries')}")
-                break
-        files_str = ", ".join(f[:30] for f in entry.get("files", [])[:2])
-        print(f"  {progress(i, len(entries))} {dim(entry.get('nota', '?') + ' ' + files_str[:45])}")
-        process_entry(client, entry, orders_cache, ws_client=ws_client, qty_override=qty_override)
-        time.sleep(ACTION_DELAY)
+        # Satu entry bermasalah (print/parse/HTTP) tak boleh.skip sisa batch:
+        # catat crash lalu lanjut entry berikutnya.
+        try:
+            if client.cookie is None:
+                print(f"  {warn('session expired, re-login...')}")
+                if not client.login(username, password):
+                    print(f"  {err('re-login gagal, skip sisa entries')}")
+                    break
+            files_str = ", ".join(f[:30] for f in entry.get("files", [])[:2])
+            print(f"  {progress(i, len(entries))} {dim(entry.get('nota', '?') + ' ' + files_str[:45])}")
+            process_entry(client, entry, orders_cache, ws_client=ws_client, qty_override=qty_override)
+            time.sleep(ACTION_DELAY)
+        except Exception:
+            log_crash(f"run_entries entry {entry.get('nota', '?')}")
+            continue
 
 
 def _find_entries_nota(nota):
@@ -1368,8 +1404,7 @@ def _run_watch(username, password, ws_client=None):
     print()
 
     client = KMClient()
-    login_fail_count = 0
-    MAX_LOGIN_FAIL = 10
+    login_fail_count = 0  # beruntun; backoff max 600s, tak pernah stop permanen
     cmd_queue = queue.Queue()
     if ws_client:
         ws_client.on_command = cmd_queue.put
@@ -1382,6 +1417,8 @@ def _run_watch(username, password, ws_client=None):
             return
         try:
             _process_now_inner()
+        except Exception:
+            log_crash("process_now/_process_now_inner")
         finally:
             _process_lock.release()
 
@@ -1401,12 +1438,12 @@ def _run_watch(username, password, ws_client=None):
         if not client.cookie:
             print(f"  {waiting('login KonsepMedia...')}")
             if not client.login(username, password):
+                # JANGAN pernah stop permanen: 10x gagal beruntun (mis. internet
+                # putus 30 mnt) dulu berarti modul diam selamanya sampai restart
+                # manual. Backoff dibatasi 600s, coba lagi siklus berikut.
                 login_fail_count += 1
-                if login_fail_count >= MAX_LOGIN_FAIL:
-                    print(f"  {err(f'login gagal {login_fail_count}x, stop.')}")
-                    return
                 backoff = min(60 * login_fail_count, 600)
-                print(f"  {err(f'login gagal ({login_fail_count}/{MAX_LOGIN_FAIL}), retry {backoff}s...')}")
+                print(f"  {err(f'login gagal ({login_fail_count}x beruntun), retry {backoff}s...')}")
                 time.sleep(backoff)
                 return
             login_fail_count = 0
@@ -1414,6 +1451,16 @@ def _run_watch(username, password, ws_client=None):
 
         print(f"  {waiting('ambil daftar order...')}")
         orders_cache = client.fetch_orders_page()
+        if not orders_cache:
+            # Sesi bisa mati di sisi server (cookie ada tapi server kasih halaman
+            # login -> fetch_orders_page mengosongkan cookie): paksa login ulang
+            # 1x dalam siklus yang sama sebelum menyerah (kasus 08:54 tadi).
+            if client.cookie is None:
+                print(f"  {waiting('sesi habis, login ulang...')}")
+                if client.login(username, password):
+                    login_fail_count = 0
+                    print(f"  {ok('login OK')}")
+                    orders_cache = client.fetch_orders_page()
         if not orders_cache:
             print(f"  {err('gagal ambil daftar order')}")
             return
@@ -1462,19 +1509,23 @@ def _run_watch(username, password, ws_client=None):
                 cmd = cmd_queue.get_nowait()
             except queue.Empty:
                 cmd = None
-            if cmd is not None:
-                handle_kmma_command(cmd, client, username, password, ws_client=ws_client)
-            if time.time() - _last_auto >= AUTO_INTERVAL:
-                print(f"\n  {dim('proses ulang otomatis (3 mnt)')}")
-                process_now()
-            tick += 1
-            if ws_client and tick % 5 == 0:
-                try:
-                    if ws_client.connected:
-                        remain = max(0, int(AUTO_INTERVAL - (time.time() - _last_auto)))
-                        ws_client.send_timer(remain, AUTO_INTERVAL)
-                except Exception:
-                    pass
+            try:
+                if cmd is not None:
+                    handle_kmma_command(cmd, client, username, password, ws_client=ws_client)
+                if time.time() - _last_auto >= AUTO_INTERVAL:
+                    print(f"\n  {dim('proses ulang otomatis (3 mnt)')}")
+                    process_now()
+                tick += 1
+                if ws_client and tick % 5 == 0:
+                    try:
+                        if ws_client.connected:
+                            remain = max(0, int(AUTO_INTERVAL - (time.time() - _last_auto)))
+                            ws_client.send_timer(remain, AUTO_INTERVAL)
+                    except Exception:
+                        pass
+            except Exception:
+                # tanpa barrier ini 1 error = proses mati = WS putus = reconnect
+                log_crash("watch-loop tick")
             time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
@@ -1519,52 +1570,57 @@ def run():
     MAX_LOGIN_FAIL = 10
 
     while True:
-        entries = load_daily()
-        if not entries:
-            ts = datetime.datetime.now().strftime("%H:%M:%S")
-            print(f"  {dim(f'[{ts}] wma_daily.json kosong, tunggu {POLL_INTERVAL//60} menit...')}")
-            time.sleep(POLL_INTERVAL)
-            continue
-
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
-        print(f"\n  {bold(f'[{ts}]')} {bold(f'{len(entries)} entries')} dari WMA")
-
-        if not client.cookie:
-            print(f"  {waiting('login KonsepMedia...')}")
-            if not client.login(username, password):
-                login_fail_count += 1
-                if login_fail_count >= MAX_LOGIN_FAIL:
-                    print(f"  {err(f'login gagal {login_fail_count}x, stop.')}")
-                    return
-                backoff = min(60 * login_fail_count, 600)
-                print(f"  {err(f'login gagal ({login_fail_count}/{MAX_LOGIN_FAIL}), retry {backoff}s...')}")
-                time.sleep(backoff)
+        try:
+            entries = load_daily()
+            if not entries:
+                ts = datetime.datetime.now().strftime("%H:%M:%S")
+                print(f"  {dim(f'[{ts}] wma_daily.json kosong, tunggu {POLL_INTERVAL//60} menit...')}")
+                time.sleep(POLL_INTERVAL)
                 continue
-            login_fail_count = 0
-            print(f"  {ok('login OK')}")
 
-        print(f"  {waiting('ambil daftar order...')}")
-        orders_cache = client.fetch_orders_page()
-        if not orders_cache:
-            print(f"  {err('gagal ambil daftar order')}")
-            time.sleep(POLL_INTERVAL)
-            continue
-        print(f"  {ok(f'{len(orders_cache)} order di KM')}")
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            print(f"\n  {bold(f'[{ts}]')} {bold(f'{len(entries)} entries')} dari WMA")
 
-        print(section("PROSES"))
-        for i, entry in enumerate(entries, 1):
-            if client.cookie is None:
-                print(f"  {warn('session expired, re-login...')}")
+            if not client.cookie:
+                print(f"  {waiting('login KonsepMedia...')}")
                 if not client.login(username, password):
-                    print(f"  {err('re-login gagal, skip sisa entries')}")
-                    break
-            files_str = ", ".join(f[:30] for f in entry.get("files", [])[:2])
-            print(f"  {progress(i, len(entries))} {dim(entry.get('nota', '?') + ' ' + files_str[:45])}")
-            process_entry(client, entry, orders_cache, ws_client=ws_client)
-            time.sleep(ACTION_DELAY)
+                    login_fail_count += 1
+                    if login_fail_count >= MAX_LOGIN_FAIL:
+                        print(f"  {err(f'login gagal {login_fail_count}x, stop.')}")
+                        return
+                    backoff = min(60 * login_fail_count, 600)
+                    print(f"  {err(f'login gagal ({login_fail_count}/{MAX_LOGIN_FAIL}), retry {backoff}s...')}")
+                    time.sleep(backoff)
+                    continue
+                login_fail_count = 0
+                print(f"  {ok('login OK')}")
 
-        print(f"\n  {ok(f'selesai, tunggu {POLL_INTERVAL//60} menit...')}")
-        time.sleep(POLL_INTERVAL)
+            print(f"  {waiting('ambil daftar order...')}")
+            orders_cache = client.fetch_orders_page()
+            if not orders_cache:
+                print(f"  {err('gagal ambil daftar order')}")
+                time.sleep(POLL_INTERVAL)
+                continue
+            print(f"  {ok(f'{len(orders_cache)} order di KM')}")
+
+            print(section("PROSES"))
+            for i, entry in enumerate(entries, 1):
+                if client.cookie is None:
+                    print(f"  {warn('session expired, re-login...')}")
+                    if not client.login(username, password):
+                        print(f"  {err('re-login gagal, skip sisa entries')}")
+                        break
+                files_str = ", ".join(f[:30] for f in entry.get("files", [])[:2])
+                print(f"  {progress(i, len(entries))} {dim(entry.get('nota', '?') + ' ' + files_str[:45])}")
+                process_entry(client, entry, orders_cache, ws_client=ws_client)
+                time.sleep(ACTION_DELAY)
+
+            print(f"\n  {ok(f'selesai, tunggu {POLL_INTERVAL//60} menit...')}")
+            time.sleep(POLL_INTERVAL)
+        except Exception:
+            # barrier: error satu entry tak boleh mematikan proses (WS jadi putus)
+            log_crash("run/poll-loop")
+            time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
@@ -1572,3 +1628,5 @@ if __name__ == "__main__":
         run()
     except KeyboardInterrupt:
         print("\n  stop.")
+    except Exception:
+        log_crash("__main__")

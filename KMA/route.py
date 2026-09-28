@@ -84,6 +84,7 @@ _HUB = False
 _HUB_URL = "http://localhost:8766"
 _EVENTS = deque(maxlen=500)  # ring: {file, category, dest, status, msg, ts}
 _EV_LAST = {}  # file -> (status, dest) terakhir (anti-duplikat)
+_EV_SAVED = {}  # file -> bool event terakhir benar2 tersimpan di DB (False = retry)
 _PRINTER_STATE = {}  # ip -> True/False (hasil cek terakhir)
 _FOLDERS = {}  # input/return/uda (diisi watch_loop/--once)
 
@@ -111,7 +112,9 @@ def _machine():
 def _ev(fname, category, dest, status, msg="", machine=None):
     """Catat event routing (dedupe per file+status+dest) → memori + DB harian.
     DB-first: tetap dicatat walau tanpa --hub, agar restart tak nol.
-    Return True bila baris BARU (nama sama tak menaikkan count)."""
+    Return True bila baris BARU (nama sama tak menaikkan count).
+    Gagal simpan DB TIDAK fatal buat memori/UI, tapi ditandai di _EV_SAVED
+    dan penanda dedupe dilepas → file bisa dicoba ulang (retry-able)."""
     day = _ensure_day()
     key = (status, dest)
     if _EV_LAST.get(fname) == key:
@@ -122,11 +125,20 @@ def _ev(fname, category, dest, status, msg="", machine=None):
           "dest": dest, "status": status, "msg": msg, "ts": _now(), "machine": mc}
     _EVENTS.append(ev)
     db = _kma_db()
-    if db is not None:
-        try:
-            db.kma_event_add(day, fname, category, dest, status, msg, ev["ts"], mc)
-        except Exception:
-            pass
+    if db is None:
+        # tanpa DB memang tak ketahan restart: tandai saja, tak dilog tiap scan
+        _EV_SAVED[fname] = False
+        return True
+    try:
+        db.kma_event_add(day, fname, category, dest, status, msg, ev["ts"], mc)
+        _EV_SAVED[fname] = True
+    except Exception as e:
+        # tak fatal buat memori, tapi lepas penanda dedupe supaya file yg
+        # gagal disimpan bisa dicoba ulang di scan berikutnya.
+        _EV_SAVED[fname] = False
+        _EV_LAST.pop(fname, None)
+        _log_quiet(("KMA-E10", fname), R, "[KMA-E10]", _short(fname),
+                   f"simpan event DB gagal: {str(e)[:60]}")
     return True
 
 
@@ -693,7 +705,9 @@ _RICOH_WAKE = threading.Event()  # dinyalakan watcher saat RICOH berubah
 
 
 def _ricoh_scan(ricohdir: Path, seen: set):
-    """Sekali scan folder RICOH: catat PDF baru ke DB (tanpa dipindah/diapa-apakan)."""
+    """Sekali scan folder RICOH: catat PDF baru ke DB (tanpa dipindah/diapa-apakan).
+    Nama baru masuk `seen` HANYA setelah event benar-benar tersimpan, jadi file
+    yg gagal di-DB (atau error lain) tidak hilang: di-coba lagi di scan berikut."""
     try:
         files = _list_pdfs(ricohdir)
     except Exception:
@@ -701,10 +715,18 @@ def _ricoh_scan(ricohdir: Path, seen: set):
     for fn in files:
         if fn.name in seen:
             continue
-        seen.add(fn.name)
-        _log(C, "[RICOH]", _short(fn.name), "file ricoh tercatat")
-        _ev(fn.name, guess_bahan(fn.name) or "Ricoh", "RICOH", "ricoh",
-            "watcher", machine="RICOH")
+        try:
+            new = _ev(fn.name, guess_bahan(fn.name) or "Ricoh", "RICOH", "ricoh",
+                      "watcher", machine="RICOH")
+            saved = bool(_EV_SAVED.get(fn.name))
+            if saved:
+                seen.add(fn.name)  # tandai SESUDAH sukses, bukan sebelum
+            if new and saved:
+                _log(C, "[RICOH]", _short(fn.name), "file ricoh tercatat")
+            # saved False -> tak masuk seen, dicoba lagi di scan berikutnya
+        except Exception as e:
+            # satu file rusak tak boleh membatalkan sisa batch & mengotori seen
+            _log(R, "[RICOH-E]", _short(fn.name), str(e)[:60])
     return seen
 
 

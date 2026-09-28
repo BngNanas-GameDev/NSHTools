@@ -21,6 +21,7 @@ import json
 import re
 import sys
 import time
+import traceback
 import urllib.request
 from pathlib import Path
 
@@ -60,6 +61,24 @@ KMMA_PATH = BASE.parent / "KMMA" / "kmma.json"
 WMA_VERSION = "2"
 DASH_TIMEOUT_S = 15
 SYNC_INTERVAL_S = 60
+
+CRASH_LOG = BASE / "wma_crash.log"  # pythonw tak ada console -> traceback wajib ditulis file
+
+
+def log_crash(tag: str):
+    """Catat traceback ke console + file. Modul HARUS tetap hidup: dulu exception
+    di loop utama mematikan proses -> WS ke hub putus -> reconnect terus-menerus."""
+    tb = traceback.format_exc()
+    try:
+        print(f"  {err(f'[ERROR] {tag} — modul tetap jalan, lihat {CRASH_LOG.name}')}")
+        print(tb)
+    except Exception:
+        pass
+    try:
+        with open(CRASH_LOG, "a", encoding="utf-8", errors="replace") as f:
+            f.write(f"\n=== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} {tag} ===\n{tb}")
+    except Exception:
+        pass
 
 # ════════════════════════════════════════════════════════════════
 # SECTION 2: REGEX — parse PDF filename
@@ -535,32 +554,40 @@ def sync(date_str=None, ws_client=None):
             ws_client.send_entries([])
         return
 
-    for i, e in enumerate(entries, 1):
-        nota = e.get("nota", "?")
-        bahan = e.get("bahan", "?")
-        qty = e.get("total_qty", 0)
-        jenis = e.get("jenis", "?")
-        proc = e.get("process_type") or "digital"
-        op = e.get("operator", "?")
-        mac = e.get("machine", "?")
-        cust = e.get("customer", "") or "-"
-        sides = e.get("sides", "") or ""
-        lam = e.get("laminating", "") or ""
-        tag = f" [{sides.upper()}" + (f"/{lam.upper()}" if lam else "") + "]" if sides or lam else ""
-        tag += " [TEST]" if e.get("test") else ""
-
-        cat = proc.upper()
-        print(f"  {i:>2}. {BOLD}{nota}{RESET}  [{CYAN}{cat}{RESET}]  {cust} | {bahan} x {qty} {jenis}  |  {op}  |  {mac}{tag}")
-
-    # save
+    # Simpan + dorong ke hub DULUAN, baru display.
+    # Dulu display dulu lalu save: satu print yg gagal (stdout tak valid saat
+    # pythonw dapat console baru) berarti wma_daily.json tak pernah ditulis
+    # dan antrean tak pernah sampai ke hub. Output cosmetik tak boleh membatalkan
+    # persistence.
     save_daily(entries, date_str)
+    if ws_client and ws_client.connected:
+        ws_client.send_entries(entries)
+
+    for i, e in enumerate(entries, 1):
+        try:
+            nota = e.get("nota", "?")
+            bahan = e.get("bahan", "?")
+            qty = e.get("total_qty", 0)
+            jenis = e.get("jenis", "?")
+            proc = e.get("process_type") or "digital"
+            op = e.get("operator", "?")
+            mac = e.get("machine", "?")
+            cust = e.get("customer", "") or "-"
+            sides = e.get("sides", "") or ""
+            lam = e.get("laminating", "") or ""
+            tag = f" [{sides.upper()}" + (f"/{lam.upper()}" if lam else "") + "]" if sides or lam else ""
+            tag += " [TEST]" if e.get("test") else ""
+
+            cat = proc.upper()
+            print(f"  {i:>2}. {BOLD}{nota}{RESET}  [{CYAN}{cat}{RESET}]  {cust} | {bahan} x {qty} {jenis}  |  {op}  |  {mac}{tag}")
+        except Exception:
+            continue  # 1 baris display gagal? lanjut baris berikutnya.
+
     print()
     print(f"  {ok(f'saved -> {DAILY_PATH.name}')}")
     print()
 
-    # push to hub via WebSocket
     if ws_client and ws_client.connected:
-        ws_client.send_entries(entries)
         print(f"  {ok(f'pushed ke hub ({len(entries)} entries)')}")
         print()
 
@@ -624,6 +651,10 @@ def main():
             except KeyboardInterrupt:
                 print(f"\n  {ok('stopped')}")
                 break
+            except Exception:
+                # barrier: 1 error sync tak boleh mematikan proses (WS jadi putus)
+                log_crash("loop-mode")
+                time.sleep(SYNC_INTERVAL_S)
         return
 
     # --watch: event-driven, sync hanya saat ada file baru
@@ -651,6 +682,10 @@ def main():
             except KeyboardInterrupt:
                 print(f"\n  {ok('stopped')}")
                 break
+            except Exception:
+                # barrier: 1 error fetch/sync tak boleh mematikan proses (WS jadi putus)
+                log_crash("watch-mode")
+                time.sleep(SYNC_INTERVAL_S)
         return
 
     # default: sync sekali
@@ -658,4 +693,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n  stop.")
+    except Exception:
+        log_crash("__main__")
