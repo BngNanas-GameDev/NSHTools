@@ -9,17 +9,27 @@ Alur:
   4. Agregasi per (nota, bahan) — gabung hanya jika nota DAN bahan sama
   5. Output wma_daily.json
 
+Sumber data (Eye Of Wisdom FASE 3 — hub primer, .54 cadangan):
+  1. hub-sendiri (PRIMER): baca langsung Database/nsh.db → we_printed_day
+     (hub HTTP butuh Bearer yg tak dimiliki WMA — lihat fetch_printed_from_hub)
+  2. .54-cadangan (FALLBACK): HTTP dashboard .54 → fetch_completed
+  GAGAL semua sumber = skip siklus (jangan hapus antrean!)
+
 Pakai:
   python wma.py              → sync sekali, exit
   python wma.py --loop       → sync tiap 60 detik
   python wma.py --watch      → event-driven: poll API tiap 10s
   python wma.py --date DATE  → sync tanggal tertentu
   python wma.py --show       → tampilkan isi wma_daily.json
+  python wma.py --compare [--date DATE] [--hub-base URL|auto]
+                             → bandingkan kedua sumber, read-only, exit
 """
 import datetime
 import json
+import os
 import re
 import sys
+import threading
 import time
 import traceback
 import urllib.request
@@ -61,8 +71,32 @@ KMMA_PATH = BASE.parent / "KMMA" / "kmma.json"
 WMA_VERSION = "2"
 DASH_TIMEOUT_S = 15
 SYNC_INTERVAL_S = 60
+WE_DEBOUNCE_S = 5  # jeda min antar sync yg dipicu event WE (anti badai fetch)
+
+# Pemicu realtime: hub menyiarkan we_update tiap WE berubah -> WS thread
+# memanggil balik -> loop utama bangun & sync seketika (bukan nunggu 60 dtk).
+_WE_TRIGGER = threading.Event()
+_WE_LAST_POLL = 0.0  # ts poll terakhir (untuk debounce)
+
+# Override diagnostik (khusus tes/paralel-run, TANPA ubah file config):
+#   WMA_DASH_URL → ganti base .54 yg dipakai fetch_completed bila set
+#   WMA_HUB_BASE → paksa fetch hub via HTTP bila set ("auto" = turunkan dari --hub-url/hub.json)
+DASH_URL_ENV = "WMA_DASH_URL"
+HUB_BASE_ENV = "WMA_HUB_BASE"
+
+# Nilai --hub-url CLI (diisi main(), dipakai turunan base HTTP hub bila "auto")
+_HUB_URL_CLI = None
 
 CRASH_LOG = BASE / "wma_crash.log"  # pythonw tak ada console -> traceback wajib ditulis file
+
+
+def _we_changed(msg=None):
+    """Callback WS thread saat hub siarkan we_update: bangunkan loop utama
+    agar sync seketika. Cepat + tak pernah raise (dipanggil dari thread WS)."""
+    try:
+        _WE_TRIGGER.set()
+    except Exception:
+        pass
 
 
 def log_crash(tag: str):
@@ -170,8 +204,40 @@ def save_cfg(cfg):
 
 
 def get_dash_url():
+    # Hook override diagnostik (tes/paralel-run): env menang bila set,
+    # produksi tak berubah (env normalnya kosong → wma.json → default .54)
+    env = (os.environ.get(DASH_URL_ENV) or "").strip()
+    if env:
+        return env.rstrip("/")
     cfg = load_cfg()
     return cfg.get("dash_url", "http://192.168.5.54:5000")
+
+
+def get_hub_http_base(hub_url=None):
+    """Turunkan base HTTP hub dari URL WS (--hub-url / hub.json):
+    ws://host:port → http://host:port+1 (hub: WS 8765 + HTTP 8766,
+    lihat hub_server.py WS_PORT/HTTP_PORT). WMA kenal URL hub via
+    --hub-url (opsional) atau hub.json (default WSClient).
+    Dipakai HANYA jalur HTTP opsional (--compare --hub-base auto);
+    sync rutin TIDAK pakai ini (primer = baca DB langsung)."""
+    import urllib.parse
+    raw = ((hub_url if hub_url is not None else _HUB_URL_CLI) or "").strip()
+    if not raw:
+        try:
+            raw = (json.loads((BASE.parent / "hub.json").read_text(encoding="utf-8")).get("url") or "").strip()
+        except Exception:
+            raw = ""
+    if not raw:
+        raw = "ws://localhost:8765"
+    try:
+        p = urllib.parse.urlsplit(raw if "://" in raw else "ws://" + raw)
+        host = p.hostname or "localhost"
+        port = p.port
+        port = (port + 1) if port else 8766  # default WS 8765 → HTTP 8766
+        scheme = "https" if (p.scheme or "").lower() in ("wss", "https") else "http"
+        return f"{scheme}://{host}:{port}"
+    except Exception:
+        return "http://localhost:8766"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -180,9 +246,9 @@ def get_dash_url():
 
 _API_LAST_ERR = ""
 
-def _api_get(path, retries=3):
+def _api_get(path, retries=3, base=None):
     global _API_LAST_ERR
-    url = get_dash_url() + path
+    url = (base or get_dash_url()) + path
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(url, timeout=DASH_TIMEOUT_S) as r:
@@ -276,34 +342,138 @@ def parse_pdf_filename(filename):
 # SECTION 6: FETCH & FILTER
 # ════════════════════════════════════════════════════════════════
 
-def fetch_completed(date_str):
-    """Fetch file selesai dari dashboard: status=done + verified + .pdf only."""
+def fetch_completed(date_str, base_url=None):
+    """Fetch file selesai dari dashboard .54 (CADANGAN): status=done + .pdf only.
+    BEDA error vs kosong (penjaga data-loss FASE 3):
+      None = transport/parse GAGAL → panggil WAJIB skip siklus (jangan tulis/hapus apa pun!)
+      []   = sumber positif lapor nol baris → perilaku kosong lama (save_daily([])) berlaku."""
     path = f"/api/files?date_from={date_str}&date_to={date_str}"
-    data = _api_get(path)
-    if not data:
+    data = _api_get(path, base=(base_url or None))
+    if data is None:
         print(f"  {err(f'gagal fetch dashboard ({_API_LAST_ERR})')}")
-        return []
+        return None
 
     # API bisa return list langsung atau {"value": [...]}
     if isinstance(data, list):
         rows = data
-    elif isinstance(data, dict) and "value" in data:
+    elif isinstance(data, dict) and isinstance(data.get("value"), list):
         rows = data["value"]
     else:
+        _set_api_err("format response tidak dikenal")
         print(f"  {err('format response tidak dikenal')}")
-        return []
+        return None
 
     completed = []
     for r in rows:
+        if not isinstance(r, dict):
+            continue
         # filter: status done + pdf only (bukan verified)
         if r.get("status") != "done":
             continue
         fname = r.get("filename", "")
-        if not R_PDF.search(fname):
+        if not R_PDF.search(fname or ""):
             continue
         completed.append(r)
 
     return completed
+
+
+def _set_api_err(msg):
+    global _API_LAST_ERR
+    _API_LAST_ERR = str(msg)[:100]
+
+
+def _norm_hub_rows(printed):
+    """Samakan bentuk baris hub (we_printed) dgn baris .54 pasca-filter
+    fetch_completed: {filename, operator, machine_name, status} agar
+    aggregate_by_nota/filter/save/push SAMA untuk kedua sumber."""
+    out = []
+    for r in printed or []:
+        if not isinstance(r, dict):
+            continue
+        fn = (r.get("filename") or "").strip()
+        if not fn or not R_PDF.search(fn):
+            continue
+        out.append({
+            "filename": fn,
+            "operator": r.get("operator") or "",
+            # hub pakai kunci "machine", .54 pakai "machine_name"
+            "machine_name": r.get("machine") or r.get("machine_name") or "",
+            "status": "done",
+        })
+    return out
+
+
+def fetch_printed_from_hub(date_str, hub_base=None):
+    """Sumber PRIMER WMA: file tercetak dari sistem sendiri.
+    KEPUTUSAN primer = baca langsung DB (BUKAN hub HTTP), bukti di hub_server.py:
+      - GET /api/we/state WAJIB sesi Bearer: do_GET balas 401 bila _auth_lookup
+        gagal; komentar kode "user boleh" = user TERAUTENTIKASI, bukan bebas-auth.
+      - WS subscribe role=wma memang dikecualikan ("trusted internal"), tapi
+        pengecualian itu HANYA di jalur WS — tak ada padanan di jalur HTTP.
+      - WMA tak punya token/kredensial login → hub HTTP rutin tak bisa dipakai;
+        melemahkan auth hub DILARANG (hub out of scope FASE 3).
+      - Maka primer = Database/nsh.db → we_printed_day (DB yg sama dibaca hub
+        via _hub_db); hub HTTP hanya bila hub_base eksplisit (hook diagnostik
+        --compare --hub-base / env WMA_HUB_BASE, tanpa auth → 401 di produksi
+        = None → jatuh ke .54).
+    BEDA error vs kosong spt fetch_completed: None = GAGAL, [] = positif nol baris."""
+    hb = (hub_base if hub_base is not None
+          else (os.environ.get(HUB_BASE_ENV) or "").strip())
+    if hb == "auto":
+        hb = get_hub_http_base()
+    if hb:
+        # Jalur HTTP opsional (diagnostik/tes). Tanpa header auth: hub balas 401
+        # bila butuh sesi → _api_get kembalikan None → None = gagal → fallback .54.
+        data = _api_get(f"/api/we/state?date={date_str}", base=hb.rstrip("/"))
+        if not isinstance(data, dict):
+            print(f"  {err(f'gagal fetch hub HTTP ({_API_LAST_ERR})')}")
+            return None
+        printed = data.get("printed")
+        if not isinstance(printed, list):
+            _set_api_err("response hub tanpa daftar printed")
+            print(f"  {err('response hub tanpa daftar printed')}")
+            return None
+        return _norm_hub_rows(printed)
+    # Jalur PRIMER: baca langsung DB sendiri
+    if not HAVE_DB or nshdb is None:
+        _set_api_err("db pusat tak tersedia (HAVE_DB=False)")
+        print(f"  {err('db pusat tak tersedia (HAVE_DB=False)')}")
+        return None
+    try:
+        printed = nshdb.we_printed_day(date_str)
+    except Exception as e:
+        _set_api_err(f"{type(e).__name__}: {str(e)[:100]}")
+        print(f"  {err(f'gagal baca we_printed ({_API_LAST_ERR})')}")
+        return None
+    if printed is None:
+        _set_api_err("we_printed_day kembalikan None")
+        print(f"  {err('we_printed_day kembalikan None')}")
+        return None
+    return _norm_hub_rows(printed)
+
+
+def _fetch_best(date_str):
+    """Urutan sumber FASE 3: (1) hub-sendiri, (2) .54-cadangan.
+    Return (rows|None, sumber) dgn sumber = hub-sendiri / .54-cadangan / GAGAL-skip.
+    None = SEMUA sumber gagal → panggil WAJIB skip siklus (tanpa tulis/push).
+    Anti-wipe: primer [] + cadangan non-kosong → pakai cadangan. Primer []
+    bisa berarti "WE belum scan / mode TUNGGU", bukan "hari ini nol file";
+    cadangan yg masih berisi baris adalah sinyal lebih kuat. Baris basi
+    cadangan tetap aman: yg sudah completed/skip_forever terfilter di sync()."""
+    rows = fetch_printed_from_hub(date_str)
+    if rows is not None and len(rows) > 0:
+        return rows, "hub-sendiri"
+    dash = fetch_completed(date_str)
+    if dash is not None and len(dash) > 0:
+        if rows is not None:
+            print(f"  {warn('primer kosong tapi cadangan berisi — pakai .54-cadangan (anti-wipe)')}")
+        return dash, ".54-cadangan"
+    if rows is not None:
+        return rows, "hub-sendiri"  # [] asli: kedua sumber positif nol
+    if dash is not None:
+        return dash, ".54-cadangan"  # [] asli dari cadangan
+    return None, "GAGAL-skip"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -517,14 +687,22 @@ def sync(date_str=None, ws_client=None):
         print(f"  Hub: {dim('connected')}")
     print()
 
-    # fetch
-    print(f"  {dim('fetching completed files...')}")
-    rows = fetch_completed(date_str)
-    print(f"  {ok(f'{len(rows)} files selesai (PDF)')}")
+    # fetch: hub-sendiri dulu, .54 cadangan; GAGAL semua = skip siklus
+    # (JANGAN save_daily([])/DELETE/send_entries([]) saat gagal — itu wipe antrean!)
+    print(f"  {dim('fetching files tercetak...')}")
+    rows, sumber = _fetch_best(date_str)
+    if rows is None:
+        print(f"  {err(f'sumber: GAGAL-skip — semua sumber gagal ({_API_LAST_ERR}); siklus dilewat, antrean dipertahankan')}")
+        print(f"  {dim(f'sumber=GAGAL-skip, printed=?, antrean=? (skip)')}")
+        print()
+        return
+    print(f"  {ok(f'{len(rows)} files selesai (PDF) [sumber: {sumber}]')}")
     print()
 
     if not rows:
+        # Genuine-empty: sumber positif lapor nol baris (BUKAN error) → perilaku lama
         print(f"  {warn('tidak ada file selesai hari ini')}")
+        print(f"  {dim(f'sumber={sumber}, printed=0, antrean=0')}")
         save_daily([], date_str)
         # antrean live hub ikut dikosongkan agar tak jadi hantu
         if ws_client and ws_client.connected:
@@ -548,6 +726,8 @@ def sync(date_str=None, ws_client=None):
     # display
     if not entries:
         print(f"  {warn('semua nota sudah diproses KMMA')}")
+        # Genuine-state: sumber positif beri baris + semua terfilter (BUKAN error)
+        print(f"  {dim(f'sumber={sumber}, printed={len(rows)}, antrean=0')}")
         save_daily([], date_str)
         # antrean live hub ikut dikosongkan agar tak jadi hantu
         if ws_client and ws_client.connected:
@@ -585,6 +765,7 @@ def sync(date_str=None, ws_client=None):
 
     print()
     print(f"  {ok(f'saved -> {DAILY_PATH.name}')}")
+    print(f"  {dim(f'sumber={sumber}, printed={len(rows)}, antrean={len(entries)}')}")
     print()
 
     if ws_client and ws_client.connected:
@@ -593,7 +774,73 @@ def sync(date_str=None, ws_client=None):
 
 
 # ════════════════════════════════════════════════════════════════
-# SECTION 12: MAIN
+# SECTION 12: COMPARE (diagnostik paralel-run, read-only)
+# ════════════════════════════════════════════════════════════════
+
+COMPARE_DIFF_CAP = 30
+
+
+def compare_sources(date_str=None, hub_base=None):
+    """Bandingkan kedua sumber utk 1 tanggal: hitungan berdampingan + daftar
+    filename yg ada di satu sumber tapi hilang di sumber lain (cap 30 baris).
+    Murni read-only: TANPA save_daily / TANPA push hub. Selalu exit code 0
+    (dipakai operator saat paralel-run 1-2 hari hub vs .54)."""
+    if not date_str:
+        date_str = datetime.date.today().isoformat()
+
+    print()
+    print(f"  {BOLD}WMA v{WMA_VERSION} — Compare{RESET}")
+    print(f"  Date: {CYAN}{date_str}{RESET}")
+    print()
+
+    hub_rows = fetch_printed_from_hub(date_str, hub_base=hub_base)
+    dash_rows = fetch_completed(date_str)
+
+    hub_n = len(hub_rows) if hub_rows is not None else None
+    dash_n = len(dash_rows) if dash_rows is not None else None
+    print(f"  hub-sendiri : {GREEN}{hub_n}{RESET}" if hub_n is not None
+          else f"  hub-sendiri : {RED}GAGAL ({_API_LAST_ERR}){RESET}")
+    print(f"  .54-cadangan: {GREEN}{dash_n}{RESET}" if dash_n is not None
+          else f"  .54-cadangan: {RED}GAGAL ({_API_LAST_ERR}){RESET}")
+    print()
+
+    if hub_rows is None or dash_rows is None:
+        print(f"  {warn('satu sumber gagal — diff tak bisa dihitung')}")
+        print()
+        return 0
+
+    hub_set = {r.get("filename", "") for r in hub_rows}
+    dash_set = {r.get("filename", "") for r in dash_rows}
+    only_hub = sorted(hub_set - dash_set)
+    only_dash = sorted(dash_set - hub_set)
+
+    if not only_hub and not only_dash:
+        print(f"  {ok('identik — tak ada selisih filename')}")
+        print()
+        return 0
+
+    print(f"  hanya di hub-sendiri ({len(only_hub)}):")
+    print(f"  hanya di .54-cadangan ({len(only_dash)}):")
+    n = 0
+    for fn in only_hub:
+        if n >= COMPARE_DIFF_CAP:
+            break
+        print(f"    + {fn[:100]}")
+        n += 1
+    for fn in only_dash:
+        if n >= COMPARE_DIFF_CAP:
+            break
+        print(f"    - {fn[:100]}")
+        n += 1
+    total = len(only_hub) + len(only_dash)
+    if total > COMPARE_DIFF_CAP:
+        print(f"  {dim(f'... +{total - COMPARE_DIFF_CAP} baris selisih lain (cap {COMPARE_DIFF_CAP})')}")
+    print()
+    return 0
+
+
+# ════════════════════════════════════════════════════════════════
+# SECTION 13: MAIN
 # ════════════════════════════════════════════════════════════════
 
 def _wait_ws(ws_client, timeout=8.0):
@@ -607,8 +854,44 @@ def _wait_ws(ws_client, timeout=8.0):
     return bool(ws_client is not None and ws_client.connected)
 
 
+def _wait_trigger_or_timeout():
+    """Tunggu pemicu WE (realtime) atau timeout interval (jaring pengaman).
+
+    Return True = poll sekarang (event segar ATAU timeout 60 dtk tercapai),
+    False = event terlalu rapat setelah poll terakhir (lewati; event/timeout
+    berikut mencakupnya karena last_hash tak berubah). Dipakai loop agar sync
+    seketika saat WE berubah, tetap sync berkala bila sepi."""
+    global _WE_LAST_POLL
+    try:
+        hit = _WE_TRIGGER.wait(timeout=SYNC_INTERVAL_S)
+        _WE_TRIGGER.clear()
+        if hit and (time.time() - _WE_LAST_POLL) < WE_DEBOUNCE_S:
+            return False
+        _WE_LAST_POLL = time.time()
+        return True
+    except Exception:
+        return True
+
+
 def main():
+    global _HUB_URL_CLI
     args = sys.argv[1:]
+
+    # --compare (read-only, exit; tangani DULUAN agar tanpa konek WS / tanpa tulis)
+    if "--compare" in args:
+        date_c = None
+        if "--date" in args:
+            idx = args.index("--date")
+            date_c = args[idx + 1] if idx + 1 < len(args) else None
+        hub_base = None
+        if "--hub-base" in args:
+            idx = args.index("--hub-base")
+            hub_base = args[idx + 1] if idx + 1 < len(args) else "auto"
+        if "--hub-url" in args:
+            idx = args.index("--hub-url")
+            if idx + 1 < len(args):
+                _HUB_URL_CLI = args[idx + 1]
+        sys.exit(compare_sources(date_c, hub_base=hub_base))
 
     # --show
     if "--show" in args:
@@ -623,7 +906,9 @@ def main():
             idx = args.index("--hub-url")
             if idx + 1 < len(args):
                 hub_url = args[idx + 1]
+        _HUB_URL_CLI = hub_url
         ws_client = WSClient("wma", hub_url=hub_url)
+        ws_client.on_we_update = _we_changed  # realtime: WE berubah -> sync seketika
         ws_client.connect()
         print(f"  {ok('WebSocket client started')}")
         _wait_ws(ws_client)
@@ -646,8 +931,9 @@ def main():
         while True:
             try:
                 sync(date_str, ws_client=ws_client)
-                print(f"  {dim(f'next sync in {SYNC_INTERVAL_S}s...')}")
-                time.sleep(SYNC_INTERVAL_S)
+                print(f"  {dim(f'next sync in {SYNC_INTERVAL_S}s (atau saat WE berubah)...')}")
+                _WE_TRIGGER.clear()
+                _wait_trigger_or_timeout()
             except KeyboardInterrupt:
                 print(f"\n  {ok('stopped')}")
                 break
@@ -657,28 +943,35 @@ def main():
                 time.sleep(SYNC_INTERVAL_S)
         return
 
-    # --watch: event-driven, sync hanya saat ada file baru
+    # --watch: event-driven, sync seketika saat WE berubah (WS we_update),
+    # timeout 60 dtk sbg jaring pengaman bila event terlewat/hub sempat putus.
     if "--watch" in args:
         print(f"  {BOLD}WMA v{WMA_VERSION} — Watch Mode{RESET}")
-        print(f"  Sync saat ada file baru (60s poll)")
+        print(f"  Sync realtime saat WE berubah (poll 60s cadangan)")
         print(f"  Tekan Ctrl+C untuk stop")
         last_hash = None
         while True:
             try:
+                if not _wait_trigger_or_timeout():
+                    continue  # debounce: poll berikut mencakupnya
                 date_str_w = date_str or datetime.date.today().isoformat()
-                rows = fetch_completed(date_str_w)
-                # hash mencakup status + verified (perubahan status tanpa file baru WAJIB sync)
-                current_hash = json.dumps([(r.get("filename", ""), r.get("status", ""),
-                                            bool(r.get("verified", False))) for r in rows], sort_keys=True)
+                rows, sumber_w = _fetch_best(date_str_w)
+                if rows is None:
+                    # Fetch GAGAL (bukan kosong): jangan sync, jangan tulis,
+                    # jangan ubah last_hash (agar pulih langsung sync)
+                    ts_now = datetime.datetime.now().strftime("%H:%M:%S")
+                    print(f"  {err(f'[{ts_now}] sumber: GAGAL-skip ({_API_LAST_ERR}) — tunggu pemicu/timeout...')}")
+                    continue
+                # hash mencakup status (perubahan status tanpa file baru WAJIB sync)
+                current_hash = json.dumps([(r.get("filename", ""), r.get("status", "")) for r in rows], sort_keys=True)
 
                 if current_hash != last_hash:
                     last_hash = current_hash
                     sync(date_str, ws_client=ws_client)
                 else:
                     ts_now = datetime.datetime.now().strftime("%H:%M:%S")
-                    print(f"  {dim(f'[{ts_now}] no changes, 60s...')}")
+                    print(f"  {dim(f'[{ts_now}] no changes...')}")
 
-                time.sleep(SYNC_INTERVAL_S)
             except KeyboardInterrupt:
                 print(f"\n  {ok('stopped')}")
                 break

@@ -157,6 +157,27 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+CREATE TABLE IF NOT EXISTS we_seen (
+  filename TEXT NOT NULL, date TEXT NOT NULL DEFAULT '',
+  nota TEXT DEFAULT '', bahan TEXT DEFAULT '', sides TEXT DEFAULT '',
+  laminating TEXT DEFAULT '', test INTEGER DEFAULT 0, process_type TEXT DEFAULT '',
+  customer TEXT DEFAULT '', total_qty INTEGER DEFAULT 0, jenis TEXT DEFAULT '',
+  size INTEGER DEFAULT 0, mtime INTEGER DEFAULT 0, first_seen_ts TEXT DEFAULT '',
+  PRIMARY KEY (filename, date));
+CREATE TABLE IF NOT EXISTS we_printed (
+  filename TEXT NOT NULL, date TEXT NOT NULL DEFAULT '',
+  nota TEXT DEFAULT '', bahan TEXT DEFAULT '', sides TEXT DEFAULT '',
+  laminating TEXT DEFAULT '', test INTEGER DEFAULT 0, process_type TEXT DEFAULT '',
+  output_name TEXT DEFAULT '', printed_ts TEXT DEFAULT '',
+  operator TEXT DEFAULT '', machine TEXT DEFAULT '',
+  PRIMARY KEY (filename, date));
+CREATE TABLE IF NOT EXISTS we_verified (
+  nota TEXT NOT NULL, bahan TEXT NOT NULL DEFAULT '',
+  sides TEXT DEFAULT '', laminating TEXT DEFAULT '', test INTEGER DEFAULT 0,
+  process_type TEXT DEFAULT '', ts TEXT DEFAULT '',
+  PRIMARY KEY (nota,bahan,sides,laminating,test,process_type));
+CREATE INDEX IF NOT EXISTS idx_we_seen_nota ON we_seen(date, nota);
+CREATE INDEX IF NOT EXISTS idx_we_printed_nota ON we_printed(date, nota);
 """
 
 
@@ -1068,3 +1089,198 @@ def db_execute(sql: str, *, timeout: float = 5.0, max_rows: int = 100):
     if not sql:
         raise ValueError("sql kosong")
     return sql
+
+
+# ── WE (Eye of Wisdom): file terlihat + tercetak + verifikasi ──────
+def _we_test_int(v):
+    """Normalisasi flag test -> 0/1 meniru gaya wma_* (`1 if test else 0`).
+
+    Kompatibel bool/int seperti wma; tambahan toleransi string:
+    ''/'0'/'false'/'no'/'off'/'tidak' -> 0, '1'/'true'/'ya' -> 1,
+    string angka lain ikut nilai int-nya, string asing non-kosong -> 1.
+    """
+    if isinstance(v, bool):
+        return 1 if v else 0
+    if isinstance(v, (int, float)):
+        return 1 if v else 0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("", "0", "false", "f", "no", "n", "off", "tidak",
+                 "tdk", "bukan", "none", "null", "-"):
+            return 0
+        if s in ("1", "true", "t", "yes", "y", "on", "ya", "yaa"):
+            return 1
+        try:
+            # string angka: "2"/"-1" -> ikut truthiness int-nya
+            return 1 if int(s) != 0 else 0
+        except Exception:
+            return 1 if s else 0
+    return 1 if v else 0
+
+
+def _we_proc_str(p):
+    """Normalisasi process_type -> string (None -> ''), meniru `p or ''` wma."""
+    if p is None:
+        return ""
+    if isinstance(p, str):
+        return p
+    try:
+        return p or ""
+    except Exception:
+        return ""
+
+
+def we_seen_upsert(date, rows, con=None):
+    """Catat file terlihat hari ini per-FILE (PK filename+date).
+
+    first_seen_ts dipertahankan yang paling awal (monotonik maju): bila baris
+    sudah ada, ts baru hanya menang bila lebih kecil (lebih awal) secara
+    leksikografis (format ISO); bila salah satu kosong, yang non-kosong menang.
+    """
+    close = con is None
+    con = con or get_conn()
+    try:
+        data = []
+        for r in rows or []:
+            fn = (r.get("filename") or "").strip() if isinstance(r.get("filename"), str) else (r.get("filename") or "")
+            if not fn:
+                continue
+            data.append((fn, date or "",
+                         r.get("nota") or "", r.get("bahan") or "",
+                         r.get("sides") or "", r.get("laminating") or "",
+                         _we_test_int(r.get("test")), _we_proc_str(r.get("process_type")),
+                         r.get("customer") or "", int(r.get("total_qty") or 0),
+                         r.get("jenis") or "", int(r.get("size") or 0),
+                         int(r.get("mtime") or 0), r.get("first_seen_ts") or ""))
+        if data:
+            con.executemany(
+                "INSERT INTO we_seen(filename,date,nota,bahan,sides,laminating,test,"
+                "process_type,customer,total_qty,jenis,size,mtime,first_seen_ts)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(filename,date) DO UPDATE SET nota=excluded.nota,"
+                "bahan=excluded.bahan,sides=excluded.sides,laminating=excluded.laminating,"
+                "test=excluded.test,process_type=excluded.process_type,"
+                "customer=excluded.customer,total_qty=excluded.total_qty,jenis=excluded.jenis,"
+                "size=excluded.size,mtime=excluded.mtime,"
+                "first_seen_ts=CASE"
+                " WHEN we_seen.first_seen_ts IS NULL OR we_seen.first_seen_ts='' THEN excluded.first_seen_ts"
+                " WHEN excluded.first_seen_ts IS NULL OR excluded.first_seen_ts='' THEN we_seen.first_seen_ts"
+                " WHEN excluded.first_seen_ts < we_seen.first_seen_ts THEN excluded.first_seen_ts"
+                " ELSE we_seen.first_seen_ts END",
+                data)
+        con.commit()
+    finally:
+        if close:
+            con.close()
+
+
+def we_seen_day(date, con=None):
+    """Daftar file terlihat pada tanggal tsb, urut filename."""
+    close = con is None
+    con = con or get_conn()
+    try:
+        return [{**dict(r), "test": bool(r["test"])}
+                for r in con.execute(
+                    "SELECT filename,date,nota,bahan,sides,laminating,test,process_type,"
+                    "customer,total_qty,jenis,size,mtime,first_seen_ts FROM we_seen"
+                    " WHERE date=? ORDER BY filename", (date,))]
+    finally:
+        if close:
+            con.close()
+
+
+def we_printed_mark(date, rows, con=None):
+    """Tandai file tercetak (idempoten, per-FILE PK filename+date).
+
+    printed_ts monotonik maju: tandai ulang dengan ts lebih lama TIDAK
+    memundurkan ts tersimpan (hanya ts lebih baru/sama yang menang; bila salah
+    satu kosong, yang non-kosong menang). Field deskriptif nota/bahan/.../
+    output_name selalu di-refresh ke nilai terbaru. operator/machine:
+    nilai NON-KOSONG menang ("" tak pernah menghapus yg sudah tercatat —
+    kalau tidak, tick otomatis tiap 5 dtk akan menimpa pilihan manual
+    "Rahmadi" dgn "" sehingga tampilan flip-flop -/nama/-); utk machine,
+    placeholder "Impose"/"Manual" juga tak pernah menimpa (bukan mesin asli).
+    """
+    close = con is None
+    con = con or get_conn()
+    try:
+        data = []
+        for r in rows or []:
+            fn = (r.get("filename") or "").strip() if isinstance(r.get("filename"), str) else (r.get("filename") or "")
+            if not fn:
+                continue
+            data.append((fn, date or "",
+                         r.get("nota") or "", r.get("bahan") or "",
+                         r.get("sides") or "", r.get("laminating") or "",
+                         _we_test_int(r.get("test")), _we_proc_str(r.get("process_type")),
+                         r.get("output_name") or "", r.get("printed_ts") or "",
+                         r.get("operator") or "", r.get("machine") or ""))
+        if data:
+            con.executemany(
+                "INSERT INTO we_printed(filename,date,nota,bahan,sides,laminating,test,"
+                "process_type,output_name,printed_ts,operator,machine)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(filename,date) DO UPDATE SET nota=excluded.nota,"
+                "bahan=excluded.bahan,sides=excluded.sides,laminating=excluded.laminating,"
+                "test=excluded.test,process_type=excluded.process_type,"
+                "output_name=excluded.output_name,"
+                "operator=CASE WHEN excluded.operator IS NULL OR excluded.operator=''"
+                " THEN we_printed.operator ELSE excluded.operator END,"
+                "machine=CASE WHEN excluded.machine IS NULL OR excluded.machine IN ('','Impose','Manual')"
+                " THEN we_printed.machine ELSE excluded.machine END,"
+                "printed_ts=CASE"
+                " WHEN excluded.printed_ts IS NULL OR excluded.printed_ts='' THEN we_printed.printed_ts"
+                " WHEN we_printed.printed_ts IS NULL OR we_printed.printed_ts='' THEN excluded.printed_ts"
+                " WHEN excluded.printed_ts >= we_printed.printed_ts THEN excluded.printed_ts"
+                " ELSE we_printed.printed_ts END",
+                data)
+        con.commit()
+    finally:
+        if close:
+            con.close()
+
+
+def we_printed_day(date, con=None):
+    """Daftar file tercetak pada tanggal tsb, urut filename."""
+    close = con is None
+    con = con or get_conn()
+    try:
+        return [{**dict(r), "test": bool(r["test"])}
+                for r in con.execute(
+                    "SELECT filename,date,nota,bahan,sides,laminating,test,process_type,"
+                    "output_name,printed_ts,operator,machine FROM we_printed"
+                    " WHERE date=? ORDER BY filename", (date,))]
+    finally:
+        if close:
+            con.close()
+
+
+def we_verify_row(nota, bahan="", sides="", laminating="", test=False, process_type="", ts="", con=None):
+    """Verifikasi per-baris 6-tuple (cermin `wma_verify_row`)."""
+    close = con is None
+    con = con or get_conn()
+    try:
+        con.execute(
+            "INSERT INTO we_verified(nota,bahan,sides,laminating,test,process_type,ts)"
+            " VALUES(?,?,?,?,?,?,?) ON CONFLICT(nota,bahan,sides,laminating,test,process_type)"
+            " DO UPDATE SET ts=excluded.ts",
+            (nota or "", bahan or "", sides or "", laminating or "",
+             _we_test_int(test), _we_proc_str(process_type), ts or ""))
+        con.commit()
+    finally:
+        if close:
+            con.close()
+
+
+def we_verified_all(con=None):
+    """Return set skey per-baris: 'nota||bahan||sides||lam||1/0||proc' (cermin `wma_verified_all`)."""
+    close = con is None
+    con = con or get_conn()
+    try:
+        out = set()
+        for r in con.execute("SELECT nota,bahan,sides,laminating,test,process_type FROM we_verified"):
+            out.add(skey((r[0], r[1] or "", r[2] or "", r[3] or "", r[4] or 0, r[5] or "")))
+        return out
+    finally:
+        if close:
+            con.close()

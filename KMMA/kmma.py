@@ -379,6 +379,50 @@ def match_bahan(filename_bahan, km_material_name):
     return False
 
 
+def _machine_token(name_low):
+    """Ekstrak token kanonik '1'/'2' dari nama mesin (sudah lowercase), atau None.
+
+    Digit 1/2 hanya dihitung sebagai token mandiri (word-boundary-ish) agar
+    'C2060' tidak salah terbaca; pola develop1/develop-1/develop 1 didukung.
+    Kata Indonesia satu→'1', dua→'2' juga dipetakan (untuk sisi KM).
+    """
+    m = re.search(r'develop\s*[-_ ]*([12])\b', name_low)
+    if m:
+        return m.group(1)
+    m = re.search(r'(?<![a-z0-9])([12])(?![a-z0-9])', name_low)
+    if m:
+        return m.group(1)
+    if re.search(r'(?<![a-z0-9])satu(?![a-z0-9])', name_low):
+        return "1"
+    if re.search(r'(?<![a-z0-9])dua(?![a-z0-9])', name_low):
+        return "2"
+    return None
+
+
+def match_machine(machine_wma, km_machine_name):
+    """Cek apakah mesin WMA match mesin KM — sadar token 1↔SATU / 2↔DUA.
+
+    Label WMA 'Develop 1'/'Develop 2' (digit) vs nama KM
+    'Mesin Develop C2060 SATU/DUA(Langsung)' (kata): bila KEDUA sisi
+    menghasilkan token, match HANYA bila token sama. Bila hanya satu sisi
+    bertoken → False (cegah Develop 2 tersimpan sebagai SATU). Bila tak ada
+    sisi bertoken → fallback substring lama (jalur ricoh/generik).
+    """
+    if not machine_wma or not km_machine_name:
+        return False
+    wma = str(machine_wma).strip().lower()
+    km = str(km_machine_name).strip().lower()
+    if not wma or not km:
+        return False
+    tok_wma = _machine_token(wma)
+    tok_km = _machine_token(km)
+    if tok_wma is not None and tok_km is not None:
+        return tok_wma == tok_km
+    if tok_wma is not None or tok_km is not None:
+        return False
+    return wma in km
+
+
 def detect_process_type(filename):
     """Deteksi tipe proses dari filename: 'kisscut', 'diecut', atau None (Digital A3+)."""
     if R_DIECUT.search(filename):
@@ -729,10 +773,32 @@ def should_skip(key):
     return False
 
 
+def _nota_pernah_di_km(nota, days=7):
+    """Cek apakah nota pernah terlihat di snapshot km_orders 7 hari terakhir.
+    Pakai accessor generik km_orders_all (tanpa ubah db.py). Gagal/error -> False
+    (fail-safe: pemanggil jatuh ke jalur retry lama)."""
+    try:
+        if not HAVE_DB or nshdb is None or not nota:
+            return False
+        today = datetime.date.today()
+        for i in range(int(days)):
+            d = (today - datetime.timedelta(days=i)).isoformat()
+            try:
+                for o in nshdb.km_orders_all(d):
+                    if (o.get("nota") or "") == nota:
+                        return True
+            except Exception:
+                continue
+        return False
+    except Exception:
+        return False
+
+
 def mark_nota_retry(key, ws_client=None):
     """Catat retry bila baris tak ada di KM. Retry tiap 3 mnt TANPA batas
     (sampai berhasil / di-skip manual). Kirim status 'retry' agar dashboard
-    tak menampilkan baris hantu di Antrian. Return jumlah percobaan."""
+    tak menampilkan baris hantu di Antrian. Return jumlah percobaan.
+    PHASE 2: >=40x (~2 jam) -> eskalasi manual, tanpa tulis 'skipped'."""
     now = datetime.datetime.now().isoformat()
     nota = key[0] if isinstance(key, tuple) else key
     count = 1
@@ -750,6 +816,10 @@ def mark_nota_retry(key, ws_client=None):
             count = int((old or {}).get("count") or 0) + 1
         except Exception:
             count = 1
+    # PHASE 2 eskalasi: 40x percobaan (~2 jam) -> manual, jangan tulis 'skipped'
+    if count >= 40:
+        send_manual(key, "tak ada di KM setelah 40x percobaan (~2 jam) — cek manual", ws_client)
+        return count
     if HAVE_DB:
         try:
             if isinstance(key, tuple):
@@ -876,6 +946,14 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
             break
 
     if not matched:
+        # PHASE 2: nota hilang dari list KM tapi pernah terlihat (snapshot 7 hari)
+        # -> kemungkinan dikerjakan manual di KM, eskalasi manual. Gagal cek -> retry lama.
+        try:
+            if _nota_pernah_di_km(nota):
+                send_manual(key, "sudah tidak di list KM — kemungkinan dikerjakan manual di KM, cek & verifikasi", ws_client)
+                return
+        except Exception:
+            pass
         n = mark_nota_retry(key, ws_client)
         print(f"    {warn(f'{nota} tidak ada di KM, retry 3 mnt (percobaan {n})')}")
         return
@@ -957,13 +1035,18 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
 
         id_td = id_td_order
 
-        # cari mesin Digital A3+ (Develop/Ricoh)
+        # cari mesin Digital A3+ (Develop/Ricoh) — utama: token-equal 1↔SATU / 2↔DUA
         digital_mac = None
         for mc in digital_flow.get("machine", []):
-            mn = mc["machine_name"].lower()
-            if "develop" in mn or "ricoh" in mn:
+            if match_machine(machine_wma, mc["machine_name"]):
                 digital_mac = mc
                 break
+        if not digital_mac:
+            for mc in digital_flow.get("machine", []):
+                mn = mc["machine_name"].lower()
+                if "develop" in mn or "ricoh" in mn:
+                    digital_mac = mc
+                    break
         if not digital_mac and digital_flow.get("machine"):
             digital_mac = digital_flow["machine"][0]
 
@@ -1037,7 +1120,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                     "status": finish_state[0],
                     "msg": finish_state[1],
                 },
-            ])
+            ], key=key)
 
         _push_steps(("pending", ""), ("pending", ""))
 
@@ -1156,11 +1239,20 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
         mac_idmachine = None
         mac_name = ""
         for mc in flow.get("machine", []):
-            if machine_wma.lower() in mc["machine_name"].lower():
+            if match_machine(machine_wma, mc["machine_name"]):
                 mac_id = mc["idproduct_machine"]
                 mac_idmachine = mc["idmachine"]
                 mac_name = mc["machine_name"]
                 break
+        if not mac_id:
+            # preferensi token-equal develop (1↔SATU / 2↔DUA) sebelum generik
+            for mc in flow.get("machine", []):
+                if "develop" in machine_wma.lower() and "develop" in mc["machine_name"].lower():
+                    if match_machine(machine_wma, mc["machine_name"]):
+                        mac_id = mc["idproduct_machine"]
+                        mac_idmachine = mc["idmachine"]
+                        mac_name = mc["machine_name"]
+                        break
         if not mac_id:
             for mc in flow.get("machine", []):
                 if "develop" in machine_wma.lower() and "develop" in mc["machine_name"].lower():
@@ -1208,7 +1300,7 @@ def process_entry(client, entry, orders_cache, ws_client=None, qty_override=None
                     "qty": qty_str,
                     "status": state,
                     "msg": m,
-                }])
+                }], key=key)
 
         _push_single("pending")
 

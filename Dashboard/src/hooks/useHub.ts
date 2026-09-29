@@ -2,11 +2,15 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 // ─── Protocol (mirror hub_server.py) ─────────────────────────────────────────
 // Server -> client:
-//   {type:'init', logs, entries, entries_all, verified, kmma_timer, output_files, status, modules, steps, kma}
+//   {type:'init', logs, entries, entries_all, verified, kmma_timer, output_files, we, status, modules, steps, kma}
+//   (we = snapshot WE: {date, monitoring, mode, override, seen_count, printed_count, verified_count, seen, printed, verified})
 //   {type:'log', module, msg, ts}
 //   {type:'entries', entries}
 //   {type:'entries_all', entries}
 //   {type:'verified_update', verified}
+//   {type:'we_update', date, monitoring, mode, override, seen_count, printed_count, verified_count, seen, printed, verified}
+//   {type:'we_state', ...sama spt we_update (ganti-penuh)}
+//   {type:'we_verified_update', verified} (defensif: hub saat ini kirim verified_update; digabung union)
 //   {type:'kmma_timer_update', next_in, interval}
 //   {type:'output_update', files}
 //   {type:'status_update', nota, status, msg, ts}
@@ -104,6 +108,31 @@ export interface OutputFile {
   ts?: number
 }
 
+// ─── WE (WisdomEye): baris file toleran — hanya filename wajib ───────────────
+export interface WeFile {
+  filename: string
+  nota?: string
+  bahan?: string
+  sides?: string
+  laminating?: string
+  test?: boolean
+  process_type?: string
+  customer?: string
+  total_qty?: number
+  jenis?: string
+  printed_ts?: string
+  output_name?: string
+  operator?: string
+  machine?: string
+  first_seen_ts?: string
+}
+
+export interface WeAuto {
+  mode: string
+  monitoring: string
+  override: boolean
+}
+
 export interface CommandResult {
   id: string
   action: string
@@ -154,6 +183,13 @@ export interface HubState {
   details: Record<string, HubStep[]>
   results: CommandResult[]
   kma: KmaState
+  /** WE: file terlihat (INPUT) + tercetak (Impose/DEVELOP/RICOH/output_moves) */
+  weSeen: WeFile[]
+  wePrinted: WeFile[]
+  /** WE: skey per-baris 6-tuple "nota||bahan||sides||lam||1/0||process_type" */
+  weVerified: string[]
+  /** WE: mode auto/manual + path MONITORING (null bila hub lama tanpa `we`) */
+  weAuto: WeAuto | null
 }
 
 export function getAuthToken(): string {
@@ -190,6 +226,73 @@ export function defaultHubUrl(): string {
 const MAX_LOGS = 200
 const RECONNECT_DELAYS = [1000, 2000, 5000, 10000]
 
+/** Baris WE toleran: hanya filename wajib, sisanya opsional (hub lama/baru). */
+function normalizeWeFiles(arr: unknown): WeFile[] {
+  if (!Array.isArray(arr)) return []
+  const out: WeFile[] = []
+  for (const r of arr) {
+    if (typeof r !== 'object' || r === null) continue
+    const o = r as Record<string, unknown>
+    const filename = String(o.filename ?? '')
+    if (!filename) continue
+    const str = (v: unknown): string | undefined =>
+      v === null || v === undefined || v === '' ? undefined : String(v)
+    const num = (v: unknown): number | undefined => {
+      if (v === null || v === undefined || v === '') return undefined
+      const n = Number(v)
+      return Number.isFinite(n) ? n : undefined
+    }
+    out.push({
+      filename,
+      nota: str(o.nota),
+      bahan: str(o.bahan),
+      sides: str(o.sides),
+      laminating: str(o.laminating),
+      test: typeof o.test === 'boolean' ? o.test
+        : o.test === 1 || o.test === '1' || o.test === 'true' ? true
+        : o.test === 0 || o.test === '0' || o.test === 'false' ? false : undefined,
+      process_type: str(o.process_type),
+      customer: str(o.customer),
+      total_qty: num(o.total_qty),
+      jenis: str(o.jenis),
+      printed_ts: str(o.printed_ts),
+      output_name: str(o.output_name),
+      operator: str(o.operator),
+      machine: str(o.machine),
+      first_seen_ts: str(o.first_seen_ts),
+    })
+  }
+  return out
+}
+
+/** Mode WE dari WS (mode/override top-level) atau HTTP (auto:{mode,override} nested). */
+function normalizeWeAuto(src: unknown): WeAuto | null {
+  if (typeof src !== 'object' || src === null) return null
+  const o = src as Record<string, unknown>
+  const nested = (typeof o.auto === 'object' && o.auto !== null)
+    ? (o.auto as Record<string, unknown>) : undefined
+  const modeRaw = o.mode ?? nested?.mode
+  // tanpa info mode sama sekali → hub lama: null (bukan default menipu)
+  if (modeRaw === null || modeRaw === undefined) return null
+  return {
+    mode: String(modeRaw || 'wait'),
+    monitoring: String(o.monitoring ?? ''),
+    override: Boolean(o.override ?? nested?.override ?? false),
+  }
+}
+
+/** Terapkan payload WE (we_update / we_state / GET /api/we/state) ganti-penuh per daftar. */
+function applyWePayload(prev: HubState, src: unknown): HubState {
+  if (typeof src !== 'object' || src === null) return prev
+  const o = src as Record<string, unknown>
+  return {
+    ...prev,
+    weSeen: o.seen !== undefined ? normalizeWeFiles(o.seen) : prev.weSeen,
+    wePrinted: o.printed !== undefined ? normalizeWeFiles(o.printed) : prev.wePrinted,
+    weVerified: o.verified !== undefined ? normalizeVerified(o.verified) : prev.weVerified,
+    weAuto: normalizeWeAuto(src) ?? prev.weAuto,
+  }
+}
 /** Migrasi rkey legacy 5-tuple (tanpa process_type) -> 6-tuple; nota-only dibiarkan (fallback). */
 function normalizeVerified(arr: unknown): string[] {
   if (!Array.isArray(arr)) return []
@@ -227,6 +330,19 @@ function handleIncoming(prev: HubState, d: unknown, cap: number): HubState {
     case 'verified_update': {
       return { ...prev, verified: normalizeVerified(msg.verified) }
     }
+    case 'we_state':
+    case 'we_update': {
+      // ganti-penuh tiga daftar + auto (kunci tak ada → pertahankan lama, anti hapus)
+      return applyWePayload(prev, msg)
+    }
+    case 'we_verified_update': {
+      // defensif: hub saat ini siarkan verified_update utk WE (via _mark_verified);
+      // tipe ini digabung union agar tak ada verified yg hilang bila hub baru mengirimnya
+      const inc = normalizeVerified(msg.verified)
+      if (inc.length === 0) return prev
+      const merged = new Set([...prev.weVerified, ...inc])
+      return { ...prev, weVerified: [...merged] }
+    }
     case 'kmma_timer_update': {
       return { ...prev, kmmaTimer: { next_in: Number(msg.next_in ?? 0), interval: Number(msg.interval ?? 180) } }
     }
@@ -263,9 +379,10 @@ function handleIncoming(prev: HubState, d: unknown, cap: number): HubState {
     case 'step_detail_update': {
       const nota = String(msg.nota ?? '')
       if (!nota) return prev
+      const key = msg.key ? String(msg.key) : nota
       return {
         ...prev,
-        details: { ...prev.details, [nota]: (msg.steps as HubStep[]) ?? [] },
+        details: { ...prev.details, [key]: (msg.steps as HubStep[]) ?? [] },
       }
     }
     case 'kma_state': {
@@ -296,6 +413,9 @@ function handleIncoming(prev: HubState, d: unknown, cap: number): HubState {
     }
     case 'init': {
       const logs = ((msg.logs as HubLogEntry[]) ?? []).slice(-cap)
+      // WE aditif: hub lama tanpa `we` → irisan kosong, tanpa crash
+      const w = (typeof msg.we === 'object' && msg.we !== null)
+        ? (msg.we as Record<string, unknown>) : null
       return {
         ...prev,
         logs,
@@ -304,6 +424,10 @@ function handleIncoming(prev: HubState, d: unknown, cap: number): HubState {
         verified: normalizeVerified(msg.verified),
         kmmaTimer: (msg.kmma_timer as KmmaTimer | null) ?? null,
         outputFiles: (msg.output_files as OutputFile[]) ?? [],
+        weSeen: w ? normalizeWeFiles(w.seen) : [],
+        wePrinted: w ? normalizeWeFiles(w.printed) : [],
+        weVerified: w ? normalizeVerified(w.verified) : [],
+        weAuto: w ? normalizeWeAuto(w) : null,
         statuses: (msg.status as Record<string, NotaStatus>) ?? {},
         modules: (msg.modules as Record<string, ModuleState>) ?? {},
         details: (msg.steps as Record<string, HubStep[]>) ?? {},
@@ -329,6 +453,10 @@ export function useHub(url: string = defaultHubUrl(), maxLogs: number = MAX_LOGS
     details: {},
     results: [],
     kma: { routes: [], printers: [], rules: [], stats: {} },
+    weSeen: [],
+    wePrinted: [],
+    weVerified: [],
+    weAuto: null,
   })
   const capRef = useRef(maxLogs)
   capRef.current = maxLogs
@@ -361,6 +489,27 @@ export function useHub(url: string = defaultHubUrl(), maxLogs: number = MAX_LOGS
     if (wsRef.current?.readyState !== WebSocket.OPEN) return null
     return id
   }, [])
+
+  /** Refresh manual WE via HTTP (pola fetch tab Database: Bearer + base :8766). */
+  const weRefresh = useCallback(async (): Promise<boolean> => {
+    try {
+      let base = 'http://localhost:8766'
+      try {
+        const u = new URL(url)
+        base = `http://${u.hostname || 'localhost'}:8766`
+      } catch { /* pakai default localhost */ }
+      const tok = getAuthToken()
+      const r = await fetch(`${base}/api/we/state`, {
+        headers: tok ? { Authorization: `Bearer ${tok}` } : undefined,
+      })
+      const j = await r.json().catch(() => null)
+      if (!r.ok || !j || j.ok !== true) return false
+      setState(p => applyWePayload(p, j))
+      return true
+    } catch {
+      return false
+    }
+  }, [url])
 
   useEffect(() => {
     let ws: WebSocket | null = null
@@ -434,5 +583,5 @@ export function useHub(url: string = defaultHubUrl(), maxLogs: number = MAX_LOGS
     }
   }, [url])
 
-  return { ...state, sendCommand }
+  return { ...state, sendCommand, weRefresh }
 }

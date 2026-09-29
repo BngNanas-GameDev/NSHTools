@@ -537,6 +537,11 @@ def handle_folders_command(action, module, folders=None):
     except Exception:
         pass
     add_log("HUB", f"folders {module} disimpan — restart modul agar berlaku")
+    # WE Phase 2: set_folders manual (lite/kma) = override ON (auto-path hanya log)
+    try:
+        _we_set_override(True, reason=f"set_folders {module} manual")
+    except Exception:
+        pass
     return True, "tersimpan — modul restart otomatis (±30 dtk)", cleaned
 
 
@@ -661,6 +666,1573 @@ def _output_watcher():
         time.sleep(3)
 
 
+# ══════════════════════════════════════════════════════════════
+# WE (Eye of Wisdom) — PHASE 2: watcher + auto-path + state API
+# ══════════════════════════════════════════════════════════════
+# - MONITORING = folder AaDevelop hari ini (WE/paths.py daily_paths).
+#   Root tahun (mis. L:\2026) diturunkan dari ancestor input_folder lite
+#   (nama dir 4-digit); TANPA fallback hardcoded — bila tak terpecahkan,
+#   log sekali + lewati tick (didokumentasikan, bukan diam-diam).
+# - Thread _we_watcher meniru _output_watcher (daemon, tick ±5 dtk,
+#   try/except per-tick agar satu tick buruk tak membunuh thread).
+#   Auto-path jalan di thread yang sama tiap 60 dtk (pilihan desain:
+#   hemat 1 thread; didokumentasikan di sini).
+# - Parser nama file LOKAL hub (_we_parse_filename): meniru pola regex
+#   WMA/wma.py (R_NOTA/R_TOTAL/sides/lam/kisscut/diecut/test) + pola bahan
+#   SEDERHANA lokal (tanpa bahan_dict agar hub tetap bebas-dependensi di
+#   sini). KETERBATASAN: nama bahan eksotis di luar pola bisa "" / kasar —
+#   cukup untuk bookkeeping WE, bukan agregasi presisi WMA.
+# - Kunci cocok impose: lower() + kupas akhiran '-ipy' sebelum '.pdf';
+#   fallback cocok via kesetaraan R_NOTA bila nama beda total.
+# - output_moves tak punya kolom tanggal (ts = HH:MM:SS saja) → saring
+#   "hari ini" mustahil; gantinya cocokkan N move terbaru per nama file
+#   persis (best-effort, didokumentasikan).
+# - Subfolder relatif hanya dipakai sbg info (petunjuk mesin) di
+#   memori/broadcast — skema Phase-1 beku, tanpa kolom baru.
+WE_STABLE_S = 5          # file lebih muda dari ini = setengah-copy, lewati (catat tick berikut)
+WE_SCAN_INTERVAL_S = 5   # tick watcher WE (jaring pengaman; deteksi utama = watchdog di bawah)
+WE_AUTO_INTERVAL_S = 60  # tick auto-path
+WE_LIST_CAP = 500        # cap list spt endpoint list lain (kma events/limit 500)
+WE_EVENT_STABLE_WAIT_S = 30  # batas tunggu file event stabil sebelum menyerah
+
+we_cache = {"seen": [], "printed": [], "verified": []}  # cermin DB utk tanggal aktif
+we_auto = {"mode": "wait", "monitoring": "", "override": False}  # mode wait/auto + flag manual
+_we_today = datetime.date.today().isoformat()  # tanggal aktif (pemicu rollover)
+_we_last_sig = None      # tanda siaran terakhir (anti spam WS)
+_we_wait_logged = False  # banner WAIT sekali per episode folder-hilang
+_we_year_warned = False  # peringatan root-tahun sekali per episode
+_we_last_auto = 0.0      # ts auto-path terakhir
+_we_auto_pending_sig = ""  # tanda perubahan tertahan (log sekali per perubahan)
+_WE_PATHS_MOD = None     # modul WE/paths.py (lazy, cache)
+_WE_EVENT_Q = []         # antre path PDF dari watchdog (top-level MONITORING saja)
+_WE_EVENT_LOCK = threading.Lock()  # kunci antre + jadwal observer
+_WE_EVENT = threading.Event()  # bangunkan worker saat ada event FS
+_WE_WATCH_DIR = ""       # folder yg sedang diobserve (ganti saat rollover/path berubah)
+_WE_OBSERVER = None      # watchdog Observer aktif (None = belum/tak bisa start)
+
+# Regex lokal hub (cermin WMA/wma.py; hub DILARANG import WMA).
+_WE_R_NOTA = re.compile(r"(ON\d{12})")
+_WE_R_TOTAL = re.compile(r"TOTAL\s*=\s*(\d+)\s*(BESAR|KECIL)", re.I)
+_WE_R_SIDES = re.compile(r"(?<![a-z0-9])([12])\s*s(?![a-z])", re.I)
+_WE_R_LAM = re.compile(r"(?<![a-z])(doff?|glossy?)(?![a-z])", re.I)
+_WE_R_KISS = re.compile(r"kiss\s*cut", re.I)
+_WE_R_DIE = re.compile(r"die\s*cut", re.I)
+_WE_R_TEST = re.compile(r"(?<![a-z])tes(t)?(?![a-z])", re.I)
+_WE_R_BAHAN = re.compile(
+    r"(Ap\d+gr|Ac\d+gr|(?:Stiker|Sticker)\s+\w+|HVS|Concord|BC\s+\w+|Master|BNTU"
+    r"|NewToop\s*\d*\s*mic|Toop\s*\d*\s*mic|Art\s*Paper|Art\s*Carton|ArtPaper|ArtCarton"
+    r"|(?:Kertas\s+)?[KC]rom[oe]|Vinyl|Vyinil|Vynil|Rajawali|Pindo|Jasmine|Ivory"
+    r"|Transparant|Hologram|Gold|Silver)", re.I)
+
+
+def _we_norm_date(v=None):
+    """Normalisasi tanggal -> (obj_date|None, iso_str). Terima date/datetime/string ISO/None(=hari ini)."""
+    try:
+        if v is None:
+            d = datetime.date.today()
+            return d, d.isoformat()
+        if isinstance(v, datetime.datetime):
+            d = v.date()
+            return d, d.isoformat()
+        if isinstance(v, datetime.date):
+            return v, v.isoformat()
+        if isinstance(v, str):
+            d = datetime.date.fromisoformat(v.strip()[:10])
+            return d, d.isoformat()
+    except Exception:
+        pass
+    d = datetime.date.today()
+    return d, d.isoformat()
+
+
+_WE_GUESS = None      # bahan_dict.guess_bahan (kanonik, spt WMA)
+_WE_RESOLVE = None    # konica_printer.resolve_bahan (spt WMA)
+_WE_BAHAN_TRIED = False  # import dicoba sekali saja
+
+
+def _we_canon_bahan(filename, raw):
+    """Kanonisasi bahan persis spt WMA (wma.py): raw regex -> guess_bahan ->
+    resolve_bahan. Tanpa ini skey WE (mis. 'Sticker kromo') tak pernah cocok
+    skey WMA ('Stiker Kromo') sehingga pill VERIFIED tak pernah menyala.
+    Gagal import/unit -> kembalikan raw. Tak pernah raise."""
+    global _WE_GUESS, _WE_RESOLVE, _WE_BAHAN_TRIED
+    try:
+        if not _WE_BAHAN_TRIED:
+            _WE_BAHAN_TRIED = True
+            try:
+                sys.path.insert(0, str(BASE_DIR / "NSH Lite"))
+                from bahan_dict import guess_bahan as _g
+                _WE_GUESS = _g
+            except Exception:
+                _WE_GUESS = None
+            try:
+                from konica_printer import resolve_bahan as _r
+                _WE_RESOLVE = _r
+            except Exception:
+                _WE_RESOLVE = None
+        if _WE_GUESS is not None:
+            try:
+                canon = _WE_GUESS(filename)
+            except Exception:
+                canon = ""
+            if canon:
+                try:
+                    if _WE_RESOLVE is not None:
+                        return _WE_RESOLVE(filename, canon) or canon
+                except Exception:
+                    pass
+                return canon
+    except Exception:
+        pass
+    return raw
+
+
+def _we_parse_filename(filename):
+    """Parser nama file LOKAL hub (jangan import WMA): nota via ON\\d{12},
+    TOTAL qty/jenis, sides 1s/2s, laminating doff/glossy, kisscut/diecut,
+    test, + bahan pola sederhana lokal (keterbatasan: bahan eksotis bisa
+    '' — cukup utk bookkeeping WE). Tak pernah raise."""
+    out = {"nota": "", "bahan": "", "sides": "", "laminating": "",
+           "test": False, "process_type": "", "customer": "",
+           "total_qty": 0, "jenis": ""}
+    try:
+        fn = filename or ""
+        m = _WE_R_NOTA.search(fn)
+        if m:
+            out["nota"] = m.group(1)
+        m = _WE_R_BAHAN.search(fn)
+        if m:
+            out["bahan"] = m.group(1).strip()
+        # Kanonisasi spt WMA (cromo->Kromo, BC Pindo->Pindo, ...): WAJIB agar
+        # skey WE cocok dgn skey wma_verified (pill VERIFIED bisa menyala).
+        try:
+            canon = _we_canon_bahan(fn, out["bahan"])
+            if canon:
+                out["bahan"] = canon
+        except Exception:
+            pass
+        m = _WE_R_TOTAL.search(fn)
+        if m:
+            try:
+                out["total_qty"] = int(m.group(1))
+            except Exception:
+                out["total_qty"] = 0
+            out["jenis"] = m.group(2).upper()
+        if _WE_R_KISS.search(fn):
+            out["process_type"] = "kisscut"
+        elif _WE_R_DIE.search(fn):
+            out["process_type"] = "diecut"
+        m = _WE_R_SIDES.search(fn)
+        if m:
+            out["sides"] = m.group(1) + "s"
+        m = _WE_R_LAM.search(fn)
+        if m:
+            low = (m.group(1) or "").lower()
+            out["laminating"] = "doff" if low.startswith("do") else "glossy"
+        out["test"] = bool(_WE_R_TEST.search(fn))
+    except Exception:
+        pass
+    return out
+
+
+def _we_norm_impose_key(name):
+    """Kunci cocok impose: lower() + kupas akhiran '-ipy' sebelum '.pdf'."""
+    try:
+        s = (name or "").lower()
+        if s.endswith("-ipy.pdf"):
+            s = s[:-8] + ".pdf"
+        return s
+    except Exception:
+        return (name or "").lower()
+
+
+def _we_norm_path(p):
+    """Normalisasi path utk banding config (slash + casefold, toleran win)."""
+    try:
+        return os.path.normpath((p or "").strip()).casefold().replace("/", "\\")
+    except Exception:
+        return (p or "").strip().casefold()
+
+
+def _we_year_root(lite_input=None):
+    """Root tahun = ancestor input_folder lite yg bernama 4-digit (mis. L:\\2026).
+
+    TANPA fallback hardcoded: tak terpecahkan -> None (pemanggil log sekali
+    + lewati tick). Tak pernah raise."""
+    try:
+        raw = lite_input
+        if not raw:
+            try:
+                raw = (_read_folders_file("lite").get("input_folder") or "").strip()
+            except Exception:
+                raw = ""
+        if not raw:
+            return None
+        p = Path(os.path.normpath(raw))
+        for anc in [p] + list(p.parents):
+            if re.fullmatch(r"\d{4}", anc.name or ""):
+                return str(anc)
+        return None
+    except Exception:
+        return None
+
+
+def _we_daily_paths(year_root, tdate):
+    """Bungkus WE/paths.py daily_paths (load lazy via lokasi file, cache modul).
+
+    Dipakai agar hub tak butuh WE sbg package. Gagal -> None (sinyal WAIT)."""
+    global _WE_PATHS_MOD
+    try:
+        if _WE_PATHS_MOD is None:
+            import importlib.util
+            fp = BASE_DIR / "WE" / "paths.py"
+            spec = importlib.util.spec_from_file_location("we_paths_hub", str(fp))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _WE_PATHS_MOD = mod
+        return _WE_PATHS_MOD.daily_paths(year_root, tdate)
+    except Exception:
+        return None
+
+
+def _we_output_moves_map(limit=2000):
+    """{filename: {dest, machine, operator, ts}} dari move terbaru.
+
+    KETERBATASAN (skema output_moves beku): tanpa kolom tanggal (ts cuma
+    HH:MM:SS) sehingga saring harian mustahil — cocokkan move terbaru per
+    nama file persis (best-effort). Tak pernah raise."""
+    try:
+        db = _hub_db()
+        if db is None:
+            return {}
+        con = db.get_conn()
+        try:
+            rows = con.execute(
+                "SELECT file,dest,machine,operator,ts FROM output_moves"
+                " ORDER BY id DESC LIMIT ?", (int(limit or 2000),)).fetchall()
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        m = {}
+        for r in rows:
+            try:
+                d = dict(r)
+            except Exception:
+                continue
+            fn = (d.get("file") or "").strip()
+            if fn and fn not in m:
+                m[fn] = {"dest": d.get("dest") or "", "machine": d.get("machine") or "",
+                         "operator": d.get("operator") or "", "ts": d.get("ts") or ""}
+        return m
+    except Exception:
+        return {}
+
+
+def _we_kma_printable_map(iso, limit=2000):
+    """{filename: {dest, machine, status, ts}} dari kma_events yg menandakan cetak.
+
+    KMA (route.py) menulis langsung ke DB via kma_event_add — TIDAK pernah
+    membuat baris output_moves (hanya dashboard move_output yg mencatat ke
+    output_moves via db.output_move_add). Tanpa aturan ini, file yg dirutekan
+    KMA otomatis akan macet di seen setelah aturan output_cache dihapus.
+
+    dest aktual KMA (dibaca dari KMA/route.py):
+    - status 'ok'   -> dest = nama hot folder (ST_GLOSS_1S, ART_230_1S, ...)
+      + machine DEVELOP 1/2 (COPY ke printer + arsip Uda)
+    - status 'done' -> dest = nama hot folder + machine DEVELOP 1/2 (Done->Uda)
+    - status 'ricoh'-> dest = 'RICOH' + machine 'RICOH' (watcher, tanpa dipindah)
+    - status 'return'/'wait'/'error' -> GAGAL/belum cetak -> DIABAIKAN
+      (dest RETURN/folder tapi bukan bukti cetak).
+    Hanya status ok/done/ricoh yg dianggap printed. Operator kosong
+    (KMA otomatis, tanpa operator manusia). Tak pernah raise."""
+    try:
+        db = _hub_db()
+        if db is None:
+            return {}
+        try:
+            evs = db.kma_events_day(iso, int(limit or 2000))
+        except Exception:
+            return {}
+        m = {}
+        for e in evs or []:
+            try:
+                if not isinstance(e, dict):
+                    continue
+                st = str(e.get("status") or "").strip().lower()
+                # Hanya bukti cetak: ok/done/ricoh. return/wait/error diabaikan.
+                if st not in ("ok", "done", "ricoh"):
+                    continue
+                fn = str(e.get("file") or "").strip()
+                if not fn:
+                    continue
+                # evs tertua->terbaru: timpa agar yg terbaru menang.
+                m[fn] = {"dest": str(e.get("dest") or ""),
+                         "machine": str(e.get("machine") or ""),
+                         "status": st,
+                         "ts": str(e.get("ts") or "")}
+            except Exception:
+                continue
+        return m
+    except Exception:
+        return {}
+
+
+def _we_refresh_cache(iso=None, db=None):
+    """Segarkan we_cache dari DB (seen+printed tanggal tsb, verified global)."""
+    try:
+        iso = iso or _we_today
+        if db is None:
+            db = _hub_db()
+        if db is None:
+            return
+        try:
+            seen = db.we_seen_day(iso) or []
+        except Exception:
+            seen = []
+        try:
+            printed = db.we_printed_day(iso) or []
+        except Exception:
+            printed = []
+        try:
+            ver = sorted(db.we_verified_all() or set())
+        except Exception:
+            ver = []
+        we_cache["seen"] = seen
+        we_cache["printed"] = printed
+        we_cache["verified"] = ver
+    except Exception:
+        pass
+
+
+def _we_sig():
+    """Tanda perubahan cache: hitungan + ts termuda (cukup utk anti spam WS)."""
+    try:
+        seen = we_cache.get("seen") or []
+        printed = we_cache.get("printed") or []
+        ver = we_cache.get("verified") or []
+        mx_s = ""
+        for r in seen:
+            v = str((r or {}).get("first_seen_ts") or "")
+            if v > mx_s:
+                mx_s = v
+        mx_p = ""
+        for r in printed:
+            v = str((r or {}).get("printed_ts") or "")
+            if v > mx_p:
+                mx_p = v
+        return (len(seen), len(printed), len(ver), mx_s, mx_p)
+    except Exception:
+        return None
+
+
+def _we_pending_names(seen, printed):
+    """Nama file seen yg BELUM printed (semantik hitungan tampilan).
+    Dipakai snapshot WS + HTTP agar konsisten. Tak pernah raise."""
+    try:
+        done = set()
+        for p in printed or []:
+            try:
+                fn = ((p or {}).get("filename") or "").strip() if isinstance(p, dict) else ""
+                if fn:
+                    done.add(fn)
+            except Exception:
+                continue
+        out = []
+        for r in seen or []:
+            try:
+                fn = ((r or {}).get("filename") or "").strip() if isinstance(r, dict) else ""
+                if fn and fn not in done:
+                    out.append(fn)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def _we_pending_count():
+    """Jumlah seen yg BELUM printed (seen minus printed, per filename).
+
+    Tampilan memakai semantik gerak: file yg sudah printed keluar dari hitungan
+    seen (0 seen 3 printed bila semua tercetak). DB tetap menyimpan riwayat
+    penuh (seen_rows tak pernah dihapus) utk pencocokan + audit."""
+    try:
+        seen = we_cache.get("seen") or []
+        printed = we_cache.get("printed") or []
+        return len(_we_pending_names(seen, printed))
+    except Exception:
+        return 0
+
+
+def _we_snapshot():
+    """Snapshot WE utk WS init + we_update + GET /api/we/state (cap 500).
+
+    seen_count = pending (belum printed); seen_total_count = riwayat.
+    List seen/printed dikirim penuh (UI butuh semua baris utk pill + tombol)."""
+    try:
+        seen = we_cache.get("seen") or []
+        printed = we_cache.get("printed") or []
+        ver = we_cache.get("verified") or []
+        return {"date": _we_today, "monitoring": we_auto.get("monitoring") or "",
+                "mode": we_auto.get("mode") or "wait",
+                "override": bool(we_auto.get("override")),
+                "seen_count": _we_pending_count(), "printed_count": len(printed),
+                "seen_total_count": len(seen),
+                "verified_count": len(ver),
+                "seen": list(seen)[:WE_LIST_CAP],
+                "printed": list(printed)[:WE_LIST_CAP],
+                "verified": list(ver)[:WE_LIST_CAP]}
+    except Exception:
+        return {"date": "", "monitoring": "", "mode": "wait", "override": False,
+                "seen_count": 0, "printed_count": 0, "verified_count": 0,
+                "seen": [], "printed": [], "verified": []}
+
+
+def _we_backfill_seen_fields(iso, db):
+    """Tulis-ulang field parse-an we_seen hari ini dgn parser TERBARU.
+
+    Baris lama (sebelum kanonisasi bahan) punya bahan mentah ('Sticker kromo')
+    yg skey-nya tak cocok wma_verified ('Stiker Kromo') — pill VERIFIED mati
+    selamanya utk file-file itu. Backfill bandingkan per-baris & UPDATE hanya
+    yg berubah (filename/date/size/mtime/first_seen_ts tak tersentuh).
+    Return jumlah baris diperbarui. Tak pernah raise."""
+    n = 0
+    try:
+        if db is None:
+            return 0
+        try:
+            rows = db.we_seen_day(iso) or []
+        except Exception:
+            return 0
+        for r in rows:
+            try:
+                fn = (r or {}).get("filename") or ""
+                if not fn:
+                    continue
+                pr = _we_parse_filename(fn)
+                new = {"bahan": pr.get("bahan") or "",
+                       "sides": pr.get("sides") or "",
+                       "laminating": pr.get("laminating") or "",
+                       "test": 1 if pr.get("test") else 0,
+                       "process_type": pr.get("process_type") or "",
+                       "customer": pr.get("customer") or "",
+                       "total_qty": int(pr.get("total_qty") or 0),
+                       "jenis": pr.get("jenis") or ""}
+                old = {"bahan": (r.get("bahan") or ""),
+                       "sides": (r.get("sides") or ""),
+                       "laminating": (r.get("laminating") or ""),
+                       "test": 1 if r.get("test") else 0,
+                       "process_type": (r.get("process_type") or ""),
+                       "customer": (r.get("customer") or ""),
+                       "total_qty": int(r.get("total_qty") or 0),
+                       "jenis": (r.get("jenis") or "")}
+                if new == old:
+                    continue
+                try:
+                    con = db.get_conn()
+                except Exception:
+                    continue
+                try:
+                    con.execute(
+                        "UPDATE we_seen SET bahan=?, sides=?, laminating=?, test=?,"
+                        " process_type=?, customer=?, total_qty=?, jenis=?"
+                        " WHERE filename=? AND date=?",
+                        (new["bahan"], new["sides"], new["laminating"], new["test"],
+                         new["process_type"], new["customer"], new["total_qty"],
+                         new["jenis"], fn, iso))
+                    con.commit()
+                    n += 1
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return n
+
+
+def _preload_we_from_db(today=None):
+    """Muat WE hari ini dari DB ke we_cache (sblm bind port, sblm _preload WMA).
+    Pulihkan juga flag override manual persisten (config tabel 'we')."""
+    global _we_today
+    try:
+        _tdate, iso = _we_norm_date(today)
+    except Exception:
+        iso = datetime.date.today().isoformat()
+    _we_today = iso
+    db = None
+    try:
+        db = _hub_db()
+        if db is not None:
+            try:
+                cur = db.config_get("we") or {}
+            except Exception:
+                cur = {}
+            if isinstance(cur, dict) and cur.get("manual_override"):
+                we_auto["override"] = True
+    except Exception:
+        pass
+    try:
+        n_fix = _we_backfill_seen_fields(iso, db)
+        if n_fix:
+            try:
+                add_log("WE", f"backfill parse {n_fix} baris seen hari ini (kanonisasi bahan)")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _we_refresh_cache(iso, db)
+    try:
+        add_log("HUB", f"WE hari ini dimuat dari DB: {len(we_cache.get('seen') or [])} seen, "
+                       f"{len(we_cache.get('printed') or [])} printed, "
+                       f"{len(we_cache.get('verified') or [])} verified")
+    except Exception:
+        pass
+
+
+def _we_set_override(val, reason=""):
+    """Set flag override manual (memori + persisten config tabel 'we')."""
+    we_auto["override"] = bool(val)
+    try:
+        db = _hub_db()
+        if db is not None:
+            try:
+                cur = db.config_get("we") or {}
+            except Exception:
+                cur = {}
+            if not isinstance(cur, dict):
+                cur = {}
+            cur["manual_override"] = bool(val)
+            db.config_set("we", cur)
+    except Exception:
+        pass
+    try:
+        add_log("WE", f"override manual {'ON' if val else 'OFF'}"
+                       + (f" ({reason})" if reason else ""))
+    except Exception:
+        pass
+
+
+def _we_check_rollover(iso):
+    """Rollover tengah malam: reset cache tanggal, muat ulang tanggal baru,
+    log ganti hari, bersihkan override. Return True bila rollover terjadi."""
+    global _we_today, _we_last_sig, _we_wait_logged
+    try:
+        if not iso or iso == _we_today:
+            return False
+        old = _we_today
+        _we_today = iso
+        we_cache["seen"] = []
+        we_cache["printed"] = []
+        _we_last_sig = None
+        _we_wait_logged = False
+        try:
+            _we_set_override(False, reason="ganti hari")
+        except Exception:
+            pass
+        try:
+            _preload_we_from_db(iso)
+        except Exception:
+            pass
+        try:
+            add_log("WE", f"ganti hari {old}→{iso} (cache tanggal dimuat ulang, override dibersihkan)")
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _we_scan_once(today=None, year_root=None):
+    """Satu siklus scan WE: MONITORING -> we_seen -> transisi printed.
+
+    - year_root eksplisit utk injeksi uji; None = turunkan dari lite input.
+    - WAIT (daily None): set we_auto mode wait, banner log sekali per episode.
+    - Hanya *.pdf (case-insensitive) LEVEL ATAS MONITORING yg masuk we_seen;
+      SUBFOLDER (Impose/Uda/DEVELOP/RICOH/...) TIDAK diintip — sesuai arahan
+      operator, WE cukup melihat folder AaDevelop itu sendiri.
+    - File labil (mtime < WE_STABLE_S) dilewati, tercatat tick berikut.
+    - we_seen_upsert SATU batch; printed HANYA bila (a) ada di output_moves
+      (aksi move_output dashboard: operator+mesin asli) ATAU (b) ada di
+      kma_events dgn status ok/done/ricoh (rute KMA otomatis: operator kosong,
+      mesin dari event) — cocok nama ternormalisasi kupas '-ipy', fallback
+      kesetaraan NOTA dari nama file. Muncul di OUTPUT/Impose SAJA (tanpa
+      move/event/manual) TIDAK lagi menandai printed — harus ada input
+      pengguna (pindah dashboard / tandai manual) atau rute KMA.
+      Manual POST /api/we/mark-printed di luar scan (operator/mesin dropdown).
+      Lalu we_printed_mark + refresh cache + siaran we_update HANYA bila
+      berubah. Return dict ringkasan."""
+    global _we_wait_logged, _we_year_warned, _we_last_sig
+    try:
+        tdate, iso = _we_norm_date(today)
+    except Exception:
+        return {"ok": False, "mode": "wait", "reason": "tanggal buruk"}
+    try:
+        _we_check_rollover(iso)
+    except Exception:
+        pass
+    try:
+        yroot = year_root if year_root is not None else _we_year_root()
+    except Exception:
+        yroot = None
+    if not yroot:
+        # TANPA fallback hardcoded (mis. L:\\2026 dilarang): log sekali + lewati
+        if not _we_year_warned:
+            _we_year_warned = True
+            try:
+                add_log("WE", "tunggu: root tahun tak terpecahkan dari lite input_folder "
+                               "(tanpa fallback) — lewati tick")
+            except Exception:
+                pass
+        we_auto["mode"] = "wait"
+        return {"ok": False, "mode": "wait", "reason": "year-root tak terpecahkan"}
+    _we_year_warned = False
+    try:
+        paths = _we_daily_paths(yroot, tdate)
+    except Exception:
+        paths = None
+    if not paths:
+        we_auto["mode"] = "wait"
+        we_auto["monitoring"] = ""
+        if not _we_wait_logged:
+            _we_wait_logged = True
+            try:
+                lite = _read_folders_file("lite")
+                add_log("WE", f"tunggu: folder hari/AaDevelop belum ada "
+                               f"(lite input={lite.get('input_folder', '?')}) — mode WAIT")
+            except Exception:
+                pass
+        return {"ok": True, "mode": "wait", "monitoring": "",
+                "seen": 0, "printed": 0, "verified": len(we_cache.get("verified") or [])}
+    _we_wait_logged = False
+    mon_s = str(paths.get("monitoring") or "")
+    we_auto["mode"] = "auto"
+    we_auto["monitoring"] = mon_s
+    now = time.time()
+    now_s = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    seen_rows = []
+    try:
+        # Level atas saja: tidak masuk subfolder (Impose/Uda/DEVELOP/RICOH/...).
+        with os.scandir(mon_s) as it:
+            entries = [e for e in it if e.is_file(follow_symlinks=False)]
+    except OSError:
+        entries = []
+    for e in entries:
+        fn = e.name
+        try:
+            if not fn.lower().endswith(".pdf"):
+                continue  # .cdr/.txt/.bak/.tmp/non-PDF diabaikan
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if now - st.st_mtime < WE_STABLE_S:
+                continue  # setengah-copy: catat tick berikut bila stabil
+            pr = _we_parse_filename(fn)
+            seen_rows.append({"filename": fn, "nota": pr.get("nota") or "",
+                              "bahan": pr.get("bahan") or "",
+                              "sides": pr.get("sides") or "",
+                              "laminating": pr.get("laminating") or "",
+                              "test": pr.get("test") or False,
+                              "process_type": pr.get("process_type") or "",
+                              "customer": pr.get("customer") or "",
+                              "total_qty": pr.get("total_qty") or 0,
+                              "jenis": pr.get("jenis") or "",
+                              "size": int(st.st_size or 0),
+                              "mtime": int(st.st_mtime or 0),
+                              "first_seen_ts": now_s})
+        except Exception:
+            continue
+    db = None
+    try:
+        db = _hub_db()
+        if db is not None and seen_rows:
+            db.we_seen_upsert(iso, seen_rows)  # SATU batch, bukan per-file
+    except Exception:
+        pass
+    # Transisi seen->printed, tick yg sama: (a) output_moves (aksi move_output
+    # dashboard: operator+mesin asli) ATAU (b) kma_events ok/done/ricoh (rute
+    # KMA otomatis: operator kosong, mesin dari event). Cocok nama
+    # ternormalisasi kupas '-ipy', fallback kesetaraan NOTA dari nama file.
+    # Muncul di OUTPUT/Impose SAJA tanpa move/event/manual TIDAK printed.
+    try:
+        moves = _we_output_moves_map()
+    except Exception:
+        moves = {}
+    try:
+        moves_norm = {}
+        moves_nota = {}
+        for mfn, mv in (moves or {}).items():
+            try:
+                moves_norm.setdefault(_we_norm_impose_key(mfn), (mfn, mv))
+                mn = _we_parse_filename(mfn).get("nota") or ""
+                if mn:
+                    moves_nota.setdefault(mn, (mfn, mv))
+            except Exception:
+                continue
+    except Exception:
+        moves_norm = {}
+        moves_nota = {}
+    try:
+        kma_map = _we_kma_printable_map(iso)
+    except Exception:
+        kma_map = {}
+    try:
+        kma_norm = {}
+        kma_nota = {}
+        for kfn, kev in (kma_map or {}).items():
+            try:
+                if not kfn or not str(kfn).lower().endswith(".pdf"):
+                    continue
+                kma_norm.setdefault(_we_norm_impose_key(kfn), (kfn, kev))
+                kn = _we_parse_filename(kfn).get("nota") or ""
+                if kn:
+                    kma_nota.setdefault(kn, (kfn, kev))
+            except Exception:
+                continue
+    except Exception:
+        kma_norm = {}
+        kma_nota = {}
+    # Kandidat seen = scan saat ini + riwayat DB hari ini. Riwayat WAJIB ikut:
+    # Lite memindah input ke uda() begitu impose selesai, jadi file yg outputnya
+    # baru muncul sering sudah hilang dari scan — tanpa riwayat ia tak pernah
+    # jadi printed. Scan saat ini menang bila bentrok.
+    try:
+        hist = (db.we_seen_day(iso) or []) if db is not None else []
+    except Exception:
+        hist = []
+    try:
+        seen_by_norm = {}
+        seen_by_nota = {}
+        for h in hist:
+            try:
+                hf = (h.get("filename") or "").strip()
+                if not hf:
+                    continue
+                seen_by_norm.setdefault(_we_norm_impose_key(hf), h)
+                hn = (h.get("nota") or "").strip()
+                if hn:
+                    seen_by_nota.setdefault(hn, h)
+            except Exception:
+                continue
+        for s in seen_rows:
+            try:
+                fn = (s.get("filename") or "").strip()
+                if not fn:
+                    continue
+                seen_by_norm[_we_norm_impose_key(fn)] = s
+                sn = (s.get("nota") or "").strip()
+                if sn:
+                    seen_by_nota[sn] = s
+            except Exception:
+                continue
+    except Exception:
+        seen_by_norm = {}
+        seen_by_nota = {}
+    # Rekonstruksi DIBATASI (pelajaran insiden: 319 baris basi 1 tick karena
+    # kandidat tanpa filter tanggal; lalu 276 baris basi dari moves): hanya
+    # bila ada bukti output HARI INI yg terbukti tanggalnya. Aturan:
+    # - cache OUTPUT: file harus ada dgn mtime (ts = st_mtime via
+    #   _snapshot_output) >= 00:00 hari ini (day-start = mktime(tdate);
+    #   sisa kemarin yg nangkring di folder = basi, abaikan).
+    # - event KMA: sudah tersaring harian via kma_events_day -> boleh.
+    # - moves: TANPA tanggal di skema (ts cuma HH:MM:SS) -> DILARANG jadi
+    #   kandidat rekonstruksi (membangkitkan file basi); moves HANYA menandai
+    #   printed pada seen yg SUDAH ada (blok `if s is None: continue` di bawah
+    #   tetap). File pindahan dashboard tetap tercakup karena saat dipindah
+    #   outputnya ada di OUTPUT (aturan mtime-segar) kecuali balapan <5 dtk.
+    # Kandidat output = cache OUTPUT hub + event KMA SAJA (tanpa moves).
+    try:
+        try:
+            _day_start = time.mktime(tdate.timetuple())
+        except Exception:
+            _day_start = 0
+        cands = []
+        try:
+            for _f in (output_cache or []):
+                try:
+                    _nm = (_f or {}).get("name") or ""
+                    if not _nm or not _nm.lower().endswith(".pdf"):
+                        continue
+                    try:
+                        _ts = int((_f or {}).get("ts") or 0)
+                    except Exception:
+                        _ts = 0
+                    if _day_start and _ts < _day_start:
+                        continue  # sisa kemarin, bukan output hari ini
+                    cands.append(_nm)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        for _kfn, _kev in list((kma_norm or {}).values()) + list((kma_nota or {}).values()):
+            cands.append(_kfn)
+        for _co in cands:
+            try:
+                if not _co:
+                    continue
+                _nk = _we_norm_impose_key(_co)
+                if _nk in seen_by_norm:
+                    continue
+                # TANPA penjaga NOTA: satu nota boleh dipakai banyak file
+                # (mis. Eci01/02/03 satu nota) — tiap kunci-norm unik wajib
+                # dapat baris seen sendiri via _we_ensure_seen_for_output.
+                _row = _we_ensure_seen_for_output(_co, iso, now_s, db)
+                if _row and (_row.get("filename") or "").strip():
+                    seen_by_norm.setdefault(_we_norm_impose_key(_row["filename"]), _row)
+                    _rn = (_row.get("nota") or "").strip()
+                    if _rn:
+                        seen_by_nota.setdefault(_rn, _row)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    printed_rows = []
+    try:
+        matched_norm_keys = set()
+        matched_notas = set()
+        # (a) tiap move -> baris seen-nya (operator/mesin asli dari move)
+        for nk, (mfn, mv) in (moves_norm or {}).items():
+            try:
+                s = seen_by_norm.get(nk)
+                if s is None:
+                    continue
+                fn = (s.get("filename") or "").strip()
+                if not fn:
+                    continue
+                matched_norm_keys.add(nk)
+                printed_rows.append({"filename": fn, "nota": s.get("nota") or "",
+                                     "bahan": s.get("bahan") or "",
+                                     "sides": s.get("sides") or "",
+                                     "laminating": s.get("laminating") or "",
+                                     "test": s.get("test") or False,
+                                     "process_type": s.get("process_type") or "",
+                                     "output_name": mfn,
+                                     "printed_ts": now_s,
+                                     "operator": mv.get("operator") or "",
+                                     "machine": mv.get("machine") or ""})
+            except Exception:
+                continue
+        for nota_key, (mfn, mv) in (moves_nota or {}).items():
+            try:
+                if nota_key in matched_notas:
+                    continue
+                s = seen_by_nota.get(nota_key)
+                if s is None:
+                    continue
+                fn = (s.get("filename") or "").strip()
+                if not fn:
+                    continue
+                if _we_norm_impose_key(fn) in matched_norm_keys:
+                    continue  # sudah kena via nama persis
+                matched_notas.add(nota_key)
+                printed_rows.append({"filename": fn, "nota": s.get("nota") or "",
+                                     "bahan": s.get("bahan") or "",
+                                     "sides": s.get("sides") or "",
+                                     "laminating": s.get("laminating") or "",
+                                     "test": s.get("test") or False,
+                                     "process_type": s.get("process_type") or "",
+                                     "output_name": mfn,
+                                     "printed_ts": now_s,
+                                     "operator": mv.get("operator") or "",
+                                     "machine": mv.get("machine") or ""})
+            except Exception:
+                continue
+        # (b) tiap event KMA ok/done/ricoh -> baris seen-nya (otomatis: operator
+        # kosong, mesin dari event). Lewati yg sudah kena via move agar
+        # operator asli move tidak tertimpa operator kosong KMA.
+        for nk, (kfn, kev) in (kma_norm or {}).items():
+            try:
+                if nk in matched_norm_keys:
+                    continue  # sudah printed via move (operator asli menang)
+                s = seen_by_norm.get(nk)
+                if s is None:
+                    continue
+                fn = (s.get("filename") or "").strip()
+                if not fn:
+                    continue
+                matched_norm_keys.add(nk)
+                printed_rows.append({"filename": fn, "nota": s.get("nota") or "",
+                                     "bahan": s.get("bahan") or "",
+                                     "sides": s.get("sides") or "",
+                                     "laminating": s.get("laminating") or "",
+                                     "test": s.get("test") or False,
+                                     "process_type": s.get("process_type") or "",
+                                     "output_name": kfn,
+                                     "printed_ts": now_s,
+                                     "operator": "",
+                                     "machine": (kev or {}).get("machine") or ""})
+            except Exception:
+                continue
+        for nota_key, (kfn, kev) in (kma_nota or {}).items():
+            try:
+                if nota_key in matched_notas:
+                    continue
+                s = seen_by_nota.get(nota_key)
+                if s is None:
+                    continue
+                fn = (s.get("filename") or "").strip()
+                if not fn:
+                    continue
+                if _we_norm_impose_key(fn) in matched_norm_keys:
+                    continue  # sudah kena via nama persis
+                matched_notas.add(nota_key)
+                printed_rows.append({"filename": fn, "nota": s.get("nota") or "",
+                                     "bahan": s.get("bahan") or "",
+                                     "sides": s.get("sides") or "",
+                                     "laminating": s.get("laminating") or "",
+                                     "test": s.get("test") or False,
+                                     "process_type": s.get("process_type") or "",
+                                     "output_name": kfn,
+                                     "printed_ts": now_s,
+                                     "operator": "",
+                                     "machine": (kev or {}).get("machine") or ""})
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        if db is not None and printed_rows:
+            db.we_printed_mark(iso, printed_rows)
+    except Exception:
+        pass
+    _we_refresh_cache(iso, db)
+    try:
+        sig = _we_sig()
+        if sig != _we_last_sig:
+            _we_last_sig = sig
+            try:
+                broadcast_threadsafe(json.dumps({"type": "we_update", **_we_snapshot()},
+                                                ensure_ascii=False))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return {"ok": True, "mode": "auto", "monitoring": mon_s,
+            "seen": _we_pending_count(),
+            "seen_total": len(we_cache.get("seen") or []),
+            "printed": len(we_cache.get("printed") or []),
+            "verified": len(we_cache.get("verified") or [])}
+
+
+def _we_refresh_announce(iso=None, db=None):
+    """Segarkan we_cache + siarkan we_update bila berubah.
+
+    Jalur pasca-tulis yg SAMA dipakai ekor _we_scan_once (refresh cache,
+    banding tanda, broadcast threadsafe) — bukan mekanisme siaran baru.
+    Dipakai endpoint tulis-manual WE agar dashboard ikut segar."""
+    global _we_last_sig
+    try:
+        try:
+            _d, _iso = _we_norm_date(iso or _we_today)
+        except Exception:
+            _iso = _we_today
+        try:
+            _we_refresh_cache(_iso, db)
+        except Exception:
+            pass
+        try:
+            sig = _we_sig()
+            if sig != _we_last_sig:
+                _we_last_sig = sig
+                try:
+                    broadcast_threadsafe(json.dumps({"type": "we_update", **_we_snapshot()},
+                                                    ensure_ascii=False))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _we_apply_paths(want_lite, want_kma):
+    """Terapkan path harian (cermin semantik handle_folders_command).
+
+    - INPUT harus ada; buat HANYA subfolder Impose/DEVELOP/Uda/RICOH —
+      JANGAN pernah buat folder tanggal itu sendiri.
+    - Tulis lite.json + config.set('lite') DAN route.json + config.set('kma')
+      (pertahankan kunci lain spt flag lite). Return (ok, msg)."""
+    try:
+        aa_in = ((want_lite or {}).get("input_folder") or "").strip()
+        if not aa_in or not os.path.isdir(aa_in):
+            return False, f"INPUT tidak ada: {aa_in or '?'}"
+        for sub in (((want_lite or {}).get("output_folder") or ""),
+                    ((want_lite or {}).get("uda_folder") or ""),
+                    ((want_kma or {}).get("input_folder") or ""),
+                    ((want_kma or {}).get("uda_folder") or ""),
+                    ((want_kma or {}).get("ricoh_folder") or "")):
+            s = (sub or "").strip()
+            if not s:
+                continue
+            try:
+                os.makedirs(s, exist_ok=True)
+            except Exception as e:
+                return False, f"gagal siapkan {s}: {e}"
+        try:
+            lp = _folders_path("lite")
+            data_l = {}
+            try:
+                data_l = json.loads(lp.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            data_l.update({k: str((want_lite or {}).get(k) or "") for k in FOLDER_KEYS["lite"]})
+            lp.write_text(json.dumps(data_l, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            return False, f"gagal tulis lite.json: {e}"
+        try:
+            kp = _folders_path("kma")
+            data_k = {}
+            try:
+                data_k = json.loads(kp.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            data_k.update({k: str((want_kma or {}).get(k) or "") for k in FOLDER_KEYS["kma"]})
+            kp.write_text(json.dumps(data_k, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            return False, f"gagal tulis route.json: {e}"
+        try:
+            db = _hub_db()
+            if db is not None:
+                try:
+                    db.config_set("lite", _read_folders_file("lite"))
+                except Exception:
+                    pass
+                try:
+                    db.config_set("kma", _read_folders_file("kma"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            add_log("WE", f"auto path diterapkan: {aa_in}")
+        except Exception:
+            pass
+        return True, f"auto path diterapkan: {aa_in}"
+    except Exception as e:
+        return False, f"error: {e}"
+
+
+def _we_auto_tick(today=None, year_root=None):
+    """Satu siklus auto-path (dipanggil tiap 60 dtk dari thread WE).
+
+    Beda dari config tersimpan (banding casefold/slash-normal) -> terapkan
+    via _we_apply_paths; saat override manual ON hanya LOG sekali per
+    perubahan (tanpa spam). WAIT (daily None) -> lewati. Return dict."""
+    global _we_auto_pending_sig
+    try:
+        tdate, iso = _we_norm_date(today)
+    except Exception:
+        return {"applied": False, "reason": "tanggal buruk"}
+    try:
+        yroot = year_root if year_root is not None else _we_year_root()
+    except Exception:
+        yroot = None
+    if not yroot:
+        return {"applied": False, "reason": "year-root tak terpecahkan"}
+    try:
+        paths = _we_daily_paths(yroot, tdate)
+    except Exception:
+        paths = None
+    if not paths:
+        we_auto["mode"] = "wait"
+        return {"applied": False, "reason": "WAIT (folder hari/AaDevelop belum ada)"}
+    we_auto["mode"] = "auto"
+    we_auto["monitoring"] = str(paths.get("monitoring") or "")
+    try:
+        lp = paths.get("lite") or {}
+        kp = paths.get("kma") or {}
+        want_lite = {"input_folder": str(lp.get("input") or ""),
+                     "output_folder": str(lp.get("output") or ""),
+                     "uda_folder": str(lp.get("uda") or "")}
+        want_kma = {"input_folder": str(kp.get("input") or ""),
+                    "return_folder": str(kp.get("return") or ""),
+                    "uda_folder": str(kp.get("uda") or ""),
+                    "ricoh_folder": str(kp.get("ricoh") or "")}
+    except Exception:
+        return {"applied": False, "reason": "paths buruk"}
+    if not all(want_lite.values()) or not all(want_kma.values()):
+        return {"applied": False, "reason": "paths tak lengkap"}
+    try:
+        cur_lite = _read_folders_file("lite")
+        cur_kma = _read_folders_file("kma")
+    except Exception:
+        return {"applied": False, "reason": "config tak terbaca"}
+    same_lite = all(_we_norm_path(cur_lite.get(k)) == _we_norm_path(v)
+                    for k, v in want_lite.items())
+    same_kma = all(_we_norm_path(cur_kma.get(k)) == _we_norm_path(v)
+                   for k, v in want_kma.items())
+    if same_lite and same_kma:
+        _we_auto_pending_sig = ""
+        return {"applied": False, "reason": "sudah cocok"}
+    sig = json.dumps({"lite": want_lite, "kma": want_kma}, ensure_ascii=False)
+    if we_auto.get("override"):
+        if sig != _we_auto_pending_sig:
+            _we_auto_pending_sig = sig
+            try:
+                add_log("WE", f"auto ditahan (override manual ON): akan pindah ke "
+                               f"{want_lite['input_folder']}")
+            except Exception:
+                pass
+        return {"applied": False, "reason": "override manual ON (hanya log)"}
+    _we_auto_pending_sig = ""
+    ok, msg = _we_apply_paths(want_lite, want_kma)
+    return {"applied": bool(ok), "reason": msg}
+
+
+def _we_note_event(path):
+    """Tampung path PDF dari watchdog utk diproses worker (cepat, tak pernah raise)."""
+    try:
+        if not path:
+            return
+        with _WE_EVENT_LOCK:
+            if path not in _WE_EVENT_Q:
+                _WE_EVENT_Q.append(path)
+            _WE_EVENT.set()
+    except Exception:
+        pass
+
+
+def _we_record_file(fp, iso, now_s, timeout_s=0, fast=True):
+    """Catat SATU file ke we_seen (dipakai jalur watchdog event-driven).
+
+    fast=True (default): catat SECEPATNYA tanpa tunggu stabil — begitu event
+    masuk + file ada, langsung upsert. Meta (size/mtime) yg mungkin masih
+    bertumbuh (copy berjalan) di-refresh tick/event berikut via upsert, dan
+    first_seen_ts terawal selalu dijaga. Ini yg membuat deteksi <3 dtk:
+    event watchdog -> antre -> catat (biasanya <1 dtk).
+    fast=False: perilaku lama, tunggu stabil (umur >= WE_STABLE_S + ukuran
+    sama 2x cek) max timeout_s, utk diagnostik/pemakaian khusus.
+    File hilang sebelum tercatat -> False. Tak pernah raise.
+    Return True bila tercatat."""
+    try:
+        timeout_s = timeout_s or WE_EVENT_STABLE_WAIT_S
+    except Exception:
+        timeout_s = 30
+    try:
+        t0 = time.time()
+        last_size = -1
+        stable_hits = 0
+        size = 0
+        st = None
+        while True:
+            try:
+                st = os.stat(fp)
+            except OSError:
+                return False  # hilang/dipindah sebelum tercatat
+            try:
+                size = int(st.st_size or 0)
+                age = time.time() - float(st.st_mtime or 0)
+            except Exception:
+                return False
+            if fast:
+                break  # catat sekarang; meta menyusul via upsert berikut
+            if size == last_size and age >= WE_STABLE_S:
+                stable_hits += 1
+            else:
+                stable_hits = 0
+            last_size = size
+            if stable_hits >= 1:
+                break
+            if time.time() - t0 >= timeout_s:
+                return False
+            time.sleep(1)
+        fn = os.path.basename(fp)
+        if not fn.lower().endswith(".pdf"):
+            return False
+        try:
+            pr = _we_parse_filename(fn)
+        except Exception:
+            return False
+        try:
+            db = _hub_db()
+            if db is None:
+                return False
+            db.we_seen_upsert(iso, [{"filename": fn, "nota": pr.get("nota") or "",
+                                     "bahan": pr.get("bahan") or "",
+                                     "sides": pr.get("sides") or "",
+                                     "laminating": pr.get("laminating") or "",
+                                     "test": pr.get("test") or False,
+                                     "process_type": pr.get("process_type") or "",
+                                     "customer": pr.get("customer") or "",
+                                     "total_qty": pr.get("total_qty") or 0,
+                                     "jenis": pr.get("jenis") or "",
+                                     "size": size, "mtime": int(st.st_mtime or 0),
+                                     "first_seen_ts": now_s}])
+        except Exception:
+            return False
+        try:
+            _we_refresh_announce(iso, db)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _we_ensure_seen_for_output(out_name, iso, now_s, db=None):
+    """Pastikan output punya baris seen (rekonstruksi bila file input lenyap
+    sebelum terpantau — mis. Lite memindah ke uda dalam hitungan detik).
+
+    Cocok riwayat we_seen hari ini HANYA via kunci-norm (lower + kupas
+    '-ipy'); ketemu -> kembalikan barisnya (anti-duplikat). Cocok NOTA saja
+    SENGAJA tak mengembalikan baris saudara — satu nota boleh dipakai banyak
+    file (mis. Eci01/02/03 satu nota); mengembalikan saudara membuat file lain
+    terkunci selamanya. Tanpa cocok kunci-norm -> SELALU turunkan baris baru
+    dari nama output ASLI (kupas '-ipy', jaga casing; parse spt biasa) lalu
+    upsert + kembalikan. Return dict baris atau None. Tak pernah raise."""
+    try:
+        if db is None:
+            try:
+                db = _hub_db()
+            except Exception:
+                db = None
+        if db is None:
+            return None
+        try:
+            hist = db.we_seen_day(iso) or []
+        except Exception:
+            hist = []
+        nk = ""
+        try:
+            nk = _we_norm_impose_key(out_name)
+        except Exception:
+            nk = (out_name or "").lower()
+        for h in hist:
+            try:
+                hf = ((h or {}).get("filename") or "").strip()
+                if not hf:
+                    continue
+                if _we_norm_impose_key(hf) == nk:
+                    return h
+                # SENGAJA tanpa fallback NOTA: nota sama tak boleh
+                # mengembalikan baris saudara yg salah.
+            except Exception:
+                continue
+        # Tak ada riwayat: turunkan nama input dari nama output ASLI (jaga
+        # casing; JANGAN pakai kunci-norm lowercase — regex NOTA case-sensitive
+        # dan nama file asli memudahkan cocok ulang).
+        try:
+            s = (out_name or "").strip()
+            low = s.lower()
+            if low.endswith("-ipy.pdf"):
+                cand = s[:-8] + ".pdf"
+            elif low.endswith(".pdf"):
+                cand = s
+            else:
+                return None
+            if not cand:
+                return None
+            pr = _we_parse_filename(cand)
+            row = {"filename": cand, "nota": pr.get("nota") or "",
+                   "bahan": pr.get("bahan") or "",
+                   "sides": pr.get("sides") or "",
+                   "laminating": pr.get("laminating") or "",
+                   "test": pr.get("test") or False,
+                   "process_type": pr.get("process_type") or "",
+                   "customer": pr.get("customer") or "",
+                   "total_qty": pr.get("total_qty") or 0,
+                   "jenis": pr.get("jenis") or "",
+                   "size": 0, "mtime": 0, "first_seen_ts": now_s}
+            try:
+                db.we_seen_upsert(iso, [row])
+            except Exception:
+                return None
+            return row
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _we_event_worker():
+    """Thread worker antre watchdog: catat file event satu per satu.
+
+    Daemon, try/except per-file; jeda 1 dtk antar file agar DB tak dibanjiri
+    saat operator drop belasan file sekaligus. Tak pernah mati."""
+    while True:
+        try:
+            _WE_EVENT.wait(5)
+            _WE_EVENT.clear()
+            while True:
+                try:
+                    with _WE_EVENT_LOCK:
+                        if not _WE_EVENT_Q:
+                            break
+                        fp = _WE_EVENT_Q.pop(0)
+                except Exception:
+                    break
+                try:
+                    tdate = datetime.date.today()
+                    iso = tdate.isoformat()
+                except Exception:
+                    continue
+                try:
+                    now_s = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    now_s = ""
+                try:
+                    # Hanya file yg masih di MONITORING aktif (abaikan basi
+                    # dari folder kemarin / path yg sudah tak relevan).
+                    mon = (we_auto.get("monitoring") or "").strip()
+                    if not mon or os.path.dirname(os.path.abspath(fp)) != os.path.abspath(mon):
+                        continue
+                except Exception:
+                    continue
+                try:
+                    _we_record_file(fp, iso, now_s)
+                except Exception:
+                    pass
+                try:
+                    time.sleep(0.2)  # jeda antar file kecil (deteksi <3 dtk)
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                time.sleep(5)
+            except Exception:
+                pass
+
+
+def _we_ensure_observer(mon_s):
+    """Pastikan watchdog observe folder MONITORING aktif (top-level saja).
+
+    Dipanggil tiap tick: bila folder berubah -> jadwal ulang; bila folder
+    hilang -> hentikan observe (tunggu folder kembali). Gagal import/start
+    watchdog -> diam (polling tick tetap jalan sbg jaring pengaman).
+    Tak pernah raise. Return True bila observer aktif utk mon_s."""
+    global _WE_WATCH_DIR, _WE_OBSERVER
+    try:
+        want = (mon_s or "").strip()
+        with _WE_EVENT_LOCK:
+            cur_obs = _WE_OBSERVER
+            cur_dir = _WE_WATCH_DIR
+        if not want or not os.path.isdir(want):
+            if cur_obs is not None:
+                try:
+                    cur_obs.unschedule_all()
+                    cur_obs.stop()
+                except Exception:
+                    pass
+                with _WE_EVENT_LOCK:
+                    _WE_OBSERVER = None
+                    _WE_WATCH_DIR = ""
+            return False
+        if cur_obs is not None and cur_dir == os.path.abspath(want):
+            try:
+                if cur_obs.is_alive():
+                    return True
+            except Exception:
+                pass
+        # (re)schedule: hentikan yg lama dulu
+        if cur_obs is not None:
+            try:
+                cur_obs.unschedule_all()
+                cur_obs.stop()
+            except Exception:
+                pass
+        try:
+            from watchdog.observers import Observer
+            from watchdog.events import FileSystemEventHandler
+        except Exception:
+            with _WE_EVENT_LOCK:
+                _WE_OBSERVER = None
+                _WE_WATCH_DIR = ""
+            return False
+
+        root = os.path.abspath(want)
+
+        class _WeHandler(FileSystemEventHandler):
+            def _push(self, p):
+                try:
+                    if not p:
+                        return
+                    ap = os.path.abspath(p)
+                    if os.path.dirname(ap) != root:
+                        return  # subfolder diabaikan (WE hanya level atas)
+                    if not os.path.basename(ap).lower().endswith(".pdf"):
+                        return
+                    _we_note_event(ap)
+                except Exception:
+                    pass
+
+            def on_created(self, event):
+                try:
+                    if not event.is_directory:
+                        self._push(event.src_path)
+                except Exception:
+                    pass
+
+            def on_modified(self, event):
+                try:
+                    if not event.is_directory:
+                        self._push(event.src_path)
+                except Exception:
+                    pass
+
+            def on_moved(self, event):
+                try:
+                    if not event.is_directory:
+                        self._push(event.dest_path)
+                except Exception:
+                    pass
+
+        obs = Observer()
+        try:
+            obs.schedule(_WeHandler(), root, recursive=False)
+            obs.daemon = True
+            obs.start()
+        except Exception:
+            try:
+                obs.stop()
+            except Exception:
+                pass
+            with _WE_EVENT_LOCK:
+                _WE_OBSERVER = None
+                _WE_WATCH_DIR = ""
+            return False
+        with _WE_EVENT_LOCK:
+            _WE_WATCH_DIR = root
+            _WE_OBSERVER = obs
+        return True
+    except Exception:
+        return False
+
+
+def _we_watcher():
+    """Thread WE: scan MONITORING tiap tick + auto-path tiap 60 dtk.
+    Cermin _output_watcher (daemon, try/except per-tick). Deteksi utama
+    = watchdog event (instant, anti-terskip); scan tick = jaring pengaman
+    (termasuk transisi printed via moves yg tak hasilkan event FS)."""
+    global _we_last_auto
+    while True:
+        try:
+            try:
+                today = datetime.date.today()
+            except Exception:
+                today = None
+            if today is not None:
+                try:
+                    _we_scan_once(today)
+                except Exception:
+                    pass
+                # Pastikan watchdog observe folder MONITORING aktif
+                # (top-level saja; atur ulang saat rollover/ganti path).
+                try:
+                    mon = (we_auto.get("monitoring") or "").strip()
+                    if mon:
+                        _we_ensure_observer(mon)
+                except Exception:
+                    pass
+                try:
+                    if time.time() - _we_last_auto >= WE_AUTO_INTERVAL_S:
+                        _we_auto_tick(today)
+                        _we_last_auto = time.time()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(WE_SCAN_INTERVAL_S)
+
+
+def _we_http_state(date_str):
+    """Payload GET /api/we/state (selalu dari DB utk tanggal tsb; cap 500)."""
+    try:
+        _d, iso = _we_norm_date(date_str or datetime.date.today())
+    except Exception:
+        iso = datetime.date.today().isoformat()
+    seen = []
+    printed = []
+    ver = []
+    try:
+        db = _hub_db()
+        if db is not None:
+            try:
+                seen = db.we_seen_day(iso) or []
+            except Exception:
+                seen = []
+            try:
+                printed = db.we_printed_day(iso) or []
+            except Exception:
+                printed = []
+            try:
+                ver = sorted(db.we_verified_all() or set())
+            except Exception:
+                ver = []
+    except Exception:
+        pass
+    return {"ok": True, "date": iso, "monitoring": we_auto.get("monitoring") or "",
+            "auto": {"mode": we_auto.get("mode") or "wait",
+                     "override": bool(we_auto.get("override"))},
+            "seen_count": len(_we_pending_names(seen, printed)),
+            "seen_total_count": len(seen), "printed_count": len(printed),
+            "verified_count": len(ver),
+            "seen": seen[:WE_LIST_CAP], "printed": printed[:WE_LIST_CAP],
+            "verified": ver[:WE_LIST_CAP]}
+
+
+def _we_query_files(state, date="", limit=20, offset=0, search=""):
+    """Query paginasi we_seen/we_printed (cermin _db_query_table; limit 1..100)."""
+    st = (state or "").strip().lower()
+    if st not in ("seen", "printed"):
+        return False, "state harus seen|printed"
+    try:
+        limit = max(1, min(100, int(limit or 20)))
+    except Exception:
+        limit = 20
+    try:
+        offset = max(0, int(offset or 0))
+    except Exception:
+        offset = 0
+    search = (search or "").strip()
+    try:
+        _d, iso = _we_norm_date(date or datetime.date.today())
+    except Exception:
+        iso = datetime.date.today().isoformat()
+    tbl = "we_seen" if st == "seen" else "we_printed"
+    try:
+        db = _hub_db()
+        if db is None:
+            return False, "DB tidak tersedia"
+        con = db.get_conn()
+        try:
+            cols = [r[1] for r in con.execute(f'PRAGMA table_info("{tbl}")').fetchall()]
+            if not cols:
+                return False, f"tabel {tbl} tidak ada"
+            params: list = [iso]
+            where = " WHERE date=?"
+            if search:
+                conds = " OR ".join(f'CAST("{c}" AS TEXT) LIKE ?' for c in cols)
+                where += " AND (" + conds + ")"
+                params += [f"%{search}%"] * len(cols)
+            total = con.execute(f'SELECT COUNT(*) FROM "{tbl}"' + where, params).fetchone()[0]
+            rows = []
+            for r in con.execute(f'SELECT * FROM "{tbl}"' + where +
+                                 " ORDER BY filename LIMIT ? OFFSET ?",
+                                 params + [limit, offset]):
+                d = dict(r)
+                if isinstance(d.get("test"), int):
+                    d["test"] = bool(d["test"])
+                rows.append(d)
+            return True, {"state": st, "date": iso, "columns": cols, "rows": rows,
+                          "total": int(total or 0), "limit": limit,
+                          "offset": offset, "search": search}
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+    except Exception as e:
+        return False, f"error: {e}"
+
+
 def handle_output_command(action, msg):
     """KONSUMSI di hub. list_output: daftar PDF di OUTPUT lite.
     move_output: pindahkan ke DEVELOP (input KMA) / RICOH (ricoh KMA) +
@@ -752,6 +2324,7 @@ def handle_output_command(action, msg):
 DB_ALLOWED = {
     "kmma_state", "wma_entries", "wma_seen", "kma_stats", "kma_events",
     "km_orders", "wma_verified", "config", "output_moves", "validasi", "events",
+    "we_seen", "we_printed", "we_verified",
 }
 
 def _db_list_tables():
@@ -1179,6 +2752,273 @@ connect();
 </html>"""
 
 
+def _resolve_output_file(name):
+    """Resolve nama file OUTPUT (basename .pdf tervalidasi) ke path nyata.
+
+    Cari di output_folder lite, fallback jalan di sekitar parent
+    (aaDevelop — file hari sebelumnya yg masih di list).
+    Raise FileNotFoundError bila tak ketemu.
+    Dipakai /api/output-file dan /api/output-info agar resolusi tunggal."""
+    lite_cfg = _read_folders_file("lite")
+    outdir = os.path.realpath((lite_cfg.get("output_folder") or "").strip())
+    if not outdir or not os.path.isdir(outdir):
+        raise FileNotFoundError
+    fpath = os.path.realpath(os.path.join(outdir, name))
+    if not fpath.startswith(outdir + os.sep) or not os.path.isfile(fpath):
+        # fallback: cari di sekitar aaDevelop (mis. file dari hari sebelumnya masih di list)
+        parent = os.path.dirname(outdir)
+        found = None
+        try:
+            for r, dirs, files in os.walk(parent):
+                if name in files:
+                    cand = os.path.realpath(os.path.join(r, name))
+                    if cand.startswith(os.path.realpath(parent) + os.sep) and os.path.isfile(cand):
+                        found = cand
+                        break
+                # batasi kedalaman agar tidak scan terlalu jauh
+                if r.count(os.sep) - parent.count(os.sep) > 3:
+                    dirs[:] = []
+        except Exception:
+            found = None
+        if found:
+            fpath = found
+        else:
+            raise FileNotFoundError
+    return fpath
+
+
+def _read_output_pdf_info(fpath):
+    """Jumlah halaman + dimensi halaman pertama (pt). Gagal parse → (0, 0, 0).
+    Import PyPDF2 lazy (di dalam fungsi) agar lib PDF yg rusak/hilang
+    tak pernah mencegah hub startup."""
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(fpath)
+        n = len(reader.pages)
+        if n <= 0:
+            return 0, 0, 0
+        box = reader.pages[0].mediabox
+        w = int(round(float(box.width)))
+        h = int(round(float(box.height)))
+        return n, w, h
+    except Exception:
+        return 0, 0, 0
+
+
+def _validate_output_pages_arg(pages_raw, total):
+    """Validasi argumen pages 1-based dari JSON. Return (ok, sorted_list | msg_id)."""
+    if not isinstance(pages_raw, list) or not pages_raw:
+        return False, "halaman kosong (isi nomor halaman dulu)"
+    nums = []
+    for p in pages_raw:
+        # bool adalah subclass int di Python — tolak tegas
+        if isinstance(p, bool) or not isinstance(p, int):
+            return False, "nomor halaman harus bilangan bulat"
+        nums.append(p)
+    if any(p < 1 or p > total for p in nums):
+        return False, f"halaman harus 1..{total}"
+    return True, sorted(set(nums))
+
+
+def _ensure_output_backup(fpath):
+    """Backup sekali: salin fpath -> fpath+'.bak' HANYA bila .bak belum ada.
+
+    Tanpa ekstensi .pdf agar file backup tak pernah muncul di listing OUTPUT.
+    Return (ok, msg). Bila backup gagal, pemanggil WAJIB batal (jangan ubah file)."""
+    try:
+        bak = fpath + ".bak"
+        if os.path.exists(bak):
+            return True, "bak sudah ada"
+        shutil.copy2(fpath, bak)
+        return True, "ok"
+    except Exception as e:
+        return False, f"gagal backup: {e}"
+
+
+def _output_apply_bw(fpath, pages_raw):
+    """Ubah halaman target jadi grayscale (raster 300 DPI + kurva gamma gray 2.2).
+
+    Pola andal: bangun PDF BARU di memori — halaman target diganti raster gray
+    seukuran mediabox asli, halaman lain disalin lossless via insert_pdf —
+    lalu simpan menimpa fpath (garbage=4, deflate=True).
+    Return (status, msg): status 'ok'|'bad'|'err' -> HTTP 200|400|500."""
+    try:
+        import fitz  # PyMuPDF, lazy agar hub tetap jalan tanpanya
+        from PIL import Image
+        import io
+    except Exception as e:
+        return "err", f"lib PDF tak tersedia: {e}"
+    # Kurva gamma gray 2.2 (LUT 256 entri): out = round(255*(in/255)**2.2).
+    # Hitam murni (0) tetap 0 = perilaku preserve-black: teks/garis hitam pekat
+    # tidak jadi abu-abu; midtone digelapkan agar hasil cetak BW bersih.
+    try:
+        lut = [min(255, max(0, int(round(255 * ((i / 255.0) ** 2.2))))) for i in range(256)]
+    except Exception as e:
+        return "err", f"gagal hitung kurva: {e}"
+    src = None
+    newdoc = None
+    try:
+        try:
+            src = fitz.open(fpath)
+        except Exception as e:
+            return "err", f"gagal baca PDF: {e}"
+        try:
+            total = len(src)
+        except Exception:
+            total = 0
+        if total <= 0:
+            return "bad", "PDF kosong (0 halaman)"
+        ok, res = _validate_output_pages_arg(pages_raw, total)
+        if not ok:
+            return "bad", res
+        targets = set(res)
+        try:
+            newdoc = fitz.open()
+            for i in range(total):
+                if (i + 1) in targets:
+                    pg = src[i]
+                    w, h = pg.rect.width, pg.rect.height
+                    pix = pg.get_pixmap(matrix=fitz.Matrix(300 / 72, 300 / 72),
+                                        colorspace=fitz.csGRAY)
+                    _done = False
+                    try:
+                        import numpy as _np
+                    except Exception:
+                        _np = None
+                    if _np is not None:
+                        try:
+                            _lut_np = _np.array(lut, dtype=_np.uint8)
+                            _raw = _np.frombuffer(pix.samples, dtype=_np.uint8).copy()
+                            if pix.alpha:
+                                _px = _raw.reshape(-1, pix.n)
+                                _px[:, 0] = _lut_np[_px[:, 0]]
+                                _gray = _px.tobytes()
+                            else:
+                                _gray = _lut_np[_raw].tobytes()
+                            _gray_pix = fitz.Pixmap(fitz.csGRAY, pix.w, pix.h, _gray, pix.alpha)
+                            np = newdoc.new_page(width=w, height=h)
+                            np.insert_image(np.rect, pixmap=_gray_pix)
+                            _done = True
+                        except Exception:
+                            _done = False
+                    if not _done:
+                        img = Image.open(io.BytesIO(pix.tobytes("png")))
+                        if img.mode != "L":
+                            img = img.convert("L")
+                        img = img.point(lut)
+                        # Buang profil ICC bawaan agar PNG tanpa chunk iCCP: Konica membaca objek ICCBased sebagai halaman berwarna, jadi harus DeviceGray murni.
+                        img.info.pop("icc_profile", None)
+                        buf = io.BytesIO()
+                        img.save(buf, format="PNG")
+                        np = newdoc.new_page(width=w, height=h)
+                        np.insert_image(np.rect, stream=buf.getvalue())
+                    # Paksa DeviceGray murni: insert_image PyMuPDF menyisipkan ICCBased (Alternate DeviceGray) yang dibaca Konica sebagai Full Color, jadi ganti ColorSpace xref jadi /DeviceGray langsung.
+                    try:
+                        for _im in np.get_images(full=True):
+                            try:
+                                if _im[5] != "DeviceGray":
+                                    newdoc.xref_set_key(_im[0], "ColorSpace", "/DeviceGray")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                else:
+                    newdoc.insert_pdf(src, from_page=i, to_page=i)
+        except Exception as e:
+            return "err", f"gagal konversi BW: {e}"
+        ok, bmsg = _ensure_output_backup(fpath)
+        if not ok:
+            return "err", bmsg
+        try:
+            src.close()
+            src = None
+        except Exception:
+            src = None
+        try:
+            newdoc.save(fpath, garbage=4, deflate=True)
+        except Exception as e:
+            return "err", f"gagal simpan PDF: {e}"
+        return "ok", f"BW halaman {', '.join(map(str, sorted(targets)))} ({len(targets)} hlm) dit timpa: {os.path.basename(fpath)} (tetap PDF, nama sama)"
+    except Exception as e:
+        return "err", f"gagal BW: {e}"
+    finally:
+        for d in (newdoc, src):
+            try:
+                if d is not None:
+                    d.close()
+            except Exception:
+                pass
+
+
+def _output_delete_pages(fpath, pages_raw):
+    """Hapus halaman target (1-based). Menolak bila sisa 0 halaman.
+
+    Simpan via file sementara + os.replace (aman di Windows: file sumber yang
+    sedang terbuka tak bisa ditimpa langsung).
+    Return (status, msg): status 'ok'|'bad'|'err' -> HTTP 200|400|500."""
+    try:
+        import fitz  # PyMuPDF, lazy agar hub tetap jalan tanpanya
+    except Exception as e:
+        return "err", f"lib PDF tak tersedia: {e}"
+    doc = None
+    tmp = fpath + ".tmp"
+    try:
+        try:
+            doc = fitz.open(fpath)
+        except Exception as e:
+            return "err", f"gagal baca PDF: {e}"
+        try:
+            total = len(doc)
+        except Exception:
+            total = 0
+        if total <= 0:
+            return "bad", "PDF kosong (0 halaman)"
+        ok, res = _validate_output_pages_arg(pages_raw, total)
+        if not ok:
+            return "bad", res
+        targets = res  # sorted unik 1-based
+        if len(targets) >= total:
+            return "bad", "tidak bisa hapus semua halaman"
+        zero = [p - 1 for p in targets]
+        ok, bmsg = _ensure_output_backup(fpath)
+        if not ok:
+            return "err", bmsg
+        try:
+            doc.delete_pages(zero)
+        except Exception:
+            # fallback versi lama: hapus satu-satu dari belakang
+            for pno in sorted(zero, reverse=True):
+                doc.delete_page(pno)
+        try:
+            doc.save(tmp, garbage=4, deflate=True)
+        except Exception as e:
+            return "err", f"gagal simpan PDF: {e}"
+        try:
+            doc.close()
+            doc = None
+        except Exception:
+            doc = None
+        try:
+            os.replace(tmp, fpath)
+        except Exception as e:
+            return "err", f"gagal simpan PDF: {e}"
+        sisa = total - len(targets)
+        return "ok", f"hapus {len(targets)} halaman, sisa {sisa} — dit timpa: {os.path.basename(fpath)} (tetap PDF, nama sama)"
+    except Exception as e:
+        return "err", f"gagal hapus halaman: {e}"
+    finally:
+        try:
+            if doc is not None:
+                doc.close()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
 # ══════════════════════════════════════════════════════════════
 # HTTP SERVER (dashboard only, separate thread)
 # ══════════════════════════════════════════════════════════════
@@ -1314,6 +3154,40 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if parsed.path == "/api/we/state":
+            # WE state (user boleh): snapshot tanggal tsb dari DB + mode/override memori
+            tok = self._get_token()
+            if not _auth_lookup(tok):
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+            qs = urllib.parse.parse_qs(parsed.query)
+            date_q = (qs.get("date", [""])[0] or "").strip()
+            self._send_json(200, _we_http_state(date_q or datetime.date.today().isoformat()))
+            return
+        if parsed.path == "/api/we/files":
+            # WE files paginasi (user boleh): ?state=seen|printed&date=&limit=&offset=&search=
+            tok = self._get_token()
+            if not _auth_lookup(tok):
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+            qs = urllib.parse.parse_qs(parsed.query)
+            try:
+                lim = int((qs.get("limit", ["20"])[0] or 20))
+            except Exception:
+                lim = 20
+            try:
+                off = int((qs.get("offset", ["0"])[0] or 0))
+            except Exception:
+                off = 0
+            ok, payload = _we_query_files((qs.get("state", ["seen"])[0] or "seen"),
+                                          (qs.get("date", [""])[0] or ""),
+                                          lim, off,
+                                          (qs.get("search", [""])[0] or ""))
+            if ok:
+                self._send_json(200, {"ok": True, **payload})
+            else:
+                self._send_json(400, {"ok": False, "msg": str(payload)})
+            return
         if parsed.path == "/api/output-file":
             tok = self._get_token()
             if not _auth_lookup(tok):
@@ -1329,31 +3203,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"nama file tidak valid")
                 return
             try:
-                lite_cfg = _read_folders_file("lite")
-                outdir = os.path.realpath((lite_cfg.get("output_folder") or "").strip())
-                if not outdir or not os.path.isdir(outdir):
-                    raise FileNotFoundError
-                fpath = os.path.realpath(os.path.join(outdir, name))
-                if not fpath.startswith(outdir + os.sep) or not os.path.isfile(fpath):
-                    # fallback: cari di sekitar aaDevelop (mis. file dari hari sebelumnya masih di list)
-                    parent = os.path.dirname(outdir)
-                    found = None
-                    try:
-                        for r, _, files in os.walk(parent):
-                            if name in files:
-                                cand = os.path.realpath(os.path.join(r, name))
-                                if cand.startswith(os.path.realpath(parent) + os.sep) and os.path.isfile(cand):
-                                    found = cand
-                                    break
-                            # batasi kedalaman agar tidak scan terlalu jauh
-                            if r.count(os.sep) - parent.count(os.sep) > 3:
-                                dirs[:] = []
-                    except Exception:
-                        found = None
-                    if found:
-                        fpath = found
-                    else:
-                        raise FileNotFoundError
+                fpath = _resolve_output_file(name)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/pdf")
                 self.send_header("Content-Length", str(os.path.getsize(fpath)))
@@ -1374,6 +3224,85 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 self._cors_headers()
                 self.end_headers()
                 self.wfile.write(f"error: {e}".encode()[:200])
+                return
+        if parsed.path == "/api/output-info":
+            try:
+                tok = self._get_token()
+                if not _auth_lookup(tok):
+                    self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                    return
+                qs = urllib.parse.parse_qs(parsed.query)
+                name = (qs.get("name", [""])[0] or "").strip()
+                # validasi ketat: basename saja, .pdf (sama spt /api/output-file)
+                if not name or name != os.path.basename(name) or not name.lower().endswith(".pdf"):
+                    self._send_json(400, {"ok": False, "msg": "nama file tidak valid"})
+                    return
+                try:
+                    fpath = _resolve_output_file(name)
+                except FileNotFoundError:
+                    self._send_json(404, {"ok": False, "msg": "file tidak ditemukan di OUTPUT (mungkin sudah dipindah ke DEVELOP/RICOH atau ganti hari)"})
+                    return
+                try:
+                    size = os.path.getsize(fpath)
+                except Exception:
+                    size = 0
+                pages, w, h = _read_output_pdf_info(fpath)
+                self._send_json(200, {"ok": True, "pages": pages, "width_pt": w, "height_pt": h, "size": size})
+                return
+            except Exception as e:
+                try:
+                    self._send_json(500, {"ok": False, "msg": f"error: {e}"[:200]})
+                except Exception:
+                    pass
+                return
+        if parsed.path == "/api/output-page":
+            # Render 1 halaman PDF jadi PNG (preview tanpa scroll: tanpa PDF viewer
+            # browser, <img> tidak bisa di-scroll). page = 1-based.
+            try:
+                tok = self._get_token()
+                if not _auth_lookup(tok):
+                    self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                    return
+                qs = urllib.parse.parse_qs(parsed.query)
+                name = (qs.get("name", [""])[0] or "").strip()
+                if not name or name != os.path.basename(name) or not name.lower().endswith(".pdf"):
+                    self._send_json(400, {"ok": False, "msg": "nama file tidak valid"})
+                    return
+                try:
+                    page = max(1, int((qs.get("page", ["1"])[0] or "1").strip() or "1"))
+                except Exception:
+                    page = 1
+                try:
+                    fpath = _resolve_output_file(name)
+                except FileNotFoundError:
+                    self._send_json(404, {"ok": False, "msg": "file tidak ditemukan di OUTPUT (mungkin sudah dipindah ke DEVELOP/RICOH atau ganti hari)"})
+                    return
+                try:
+                    import fitz  # PyMuPDF, lazy agar hub tetap jalan tanpanya
+                    doc = fitz.open(fpath)
+                    try:
+                        if page > len(doc):
+                            page = len(doc)
+                        pix = doc[page - 1].get_pixmap(matrix=fitz.Matrix(1.6, 1.6))
+                        png = pix.tobytes("png")
+                    finally:
+                        doc.close()
+                except Exception as e:
+                    self._send_json(500, {"ok": False, "msg": f"gagal render: {e}"[:200]})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(png)))
+                self.send_header("Cache-Control", "private, max-age=300")
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(png)
+                return
+            except Exception as e:
+                try:
+                    self._send_json(500, {"ok": False, "msg": f"error: {e}"[:200]})
+                except Exception:
+                    pass
                 return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1573,6 +3502,161 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             else:
                 self._send_json(400, {"ok": False, "msg": str(payload)})
             return
+        if path == "/api/we/rescan":
+            # WE rescan paksa (ADMIN ONLY, gaya gate spt /api/db/exec)
+            sess, ok = self._require_auth(admin_only=True)
+            if sess is None:
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+            if not ok:
+                self._send_json(403, {"ok": False, "msg": "admin only"})
+                return
+            try:
+                res = _we_scan_once()
+            except Exception as e:
+                self._send_json(500, {"ok": False, "msg": f"error: {e}"[:200]})
+                return
+            self._send_json(200, {"ok": True, **res})
+            return
+        if path == "/api/we/auto":
+            # WE auto/manual (ADMIN ONLY): {"mode":"auto"|"manual"} — hapus/set override
+            sess, ok = self._require_auth(admin_only=True)
+            if sess is None:
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+            if not ok:
+                self._send_json(403, {"ok": False, "msg": "admin only"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+                data = json.loads(raw) if raw.strip() else {}
+            except Exception:
+                self._send_json(400, {"ok": False, "msg": "json tidak valid"})
+                return
+            mode = str((data.get("mode") or "")).strip().lower()
+            if mode not in ("auto", "manual"):
+                self._send_json(400, {"ok": False, "msg": 'mode harus "auto"|"manual"'})
+                return
+            _we_set_override(mode == "manual", reason="we_auto admin")
+            self._send_json(200, {"ok": True, "mode": we_auto.get("mode") or "wait",
+                                  "override": bool(we_auto.get("override"))})
+            return
+        if path == "/api/we/mark-printed":
+            # WE tandai manual Printed (USER boleh — gate spt /api/output-bw).
+            # JSON {filename}: basename .pdf yg SUDAH terlihat hari ini (we_seen,
+            # cegah ghost). Tulis via db.we_printed_mark + segar/siar ulang.
+            try:
+                tok = self._get_token()
+                if not _auth_lookup(tok):
+                    self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                    raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+                    data = json.loads(raw) if raw.strip() else {}
+                except Exception:
+                    self._send_json(400, {"ok": False, "msg": "json tidak valid"})
+                    return
+                fn = (data.get("filename") or "") if isinstance(data, dict) else ""
+                fn = str(fn).strip()
+                if not fn or fn != os.path.basename(fn) or not fn.lower().endswith(".pdf"):
+                    self._send_json(400, {"ok": False, "msg": "filename harus basename .pdf"})
+                    return
+                # Opsional (batch WE): operator/mesin perekam; absen -> default lama
+                # ("" / "Manual") agar kompatibel mundur; potong 40 karakter.
+                try:
+                    op = str(data.get("operator") or "").strip()[:40]
+                except Exception:
+                    op = ""
+                try:
+                    mc = str(data.get("machine") or "").strip()[:40] or "Manual"
+                except Exception:
+                    mc = "Manual"
+                try:
+                    _d, iso = _we_norm_date(datetime.date.today())
+                except Exception:
+                    iso = datetime.date.today().isoformat()
+                db = None
+                try:
+                    db = _hub_db()
+                    if db is None:
+                        self._send_json(500, {"ok": False, "msg": "DB tidak tersedia"})
+                        return
+                    try:
+                        seen = db.we_seen_day(iso) or []
+                    except Exception:
+                        seen = []
+                    if not any(isinstance(r, dict) and r.get("filename") == fn for r in seen):
+                        self._send_json(404, {"ok": False, "msg": "file belum terlihat hari ini (we_seen)"})
+                        return
+                    pr = _we_parse_filename(fn)
+                    now_s = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    db.we_printed_mark(iso, [{
+                        "filename": fn, "nota": pr.get("nota") or "",
+                        "bahan": pr.get("bahan") or "", "sides": pr.get("sides") or "",
+                        "laminating": pr.get("laminating") or "",
+                        "test": pr.get("test") or False,
+                        "process_type": pr.get("process_type") or "",
+                        "output_name": fn, "printed_ts": now_s,
+                        "operator": op, "machine": mc}])
+                except Exception as e:
+                    self._send_json(500, {"ok": False, "msg": f"error: {e}"[:200]})
+                    return
+                try:
+                    _we_refresh_announce(iso, db)
+                except Exception:
+                    pass
+                try:
+                    add_log("WE", f"manual printed: {fn}")
+                except Exception:
+                    pass
+                self._send_json(200, {"ok": True, "msg": f"{fn} ditandai printed"})
+                return
+            except Exception as e:
+                try:
+                    self._send_json(500, {"ok": False, "msg": f"error: {e}"[:200]})
+                except Exception:
+                    pass
+                return
+        if path == "/api/output-bw" or path == "/api/output-delpages":
+            # Edit ringan halaman PDF OUTPUT (dipakai modal VIEW NSH Lite).
+            try:
+                tok = self._get_token()
+                if not _auth_lookup(tok):
+                    self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                    raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+                    data = json.loads(raw) if raw.strip() else {}
+                except Exception:
+                    self._send_json(400, {"ok": False, "msg": "json tidak valid"})
+                    return
+                name = (data.get("name") or "").strip() if isinstance(data, dict) else ""
+                pages_arg = data.get("pages") if isinstance(data, dict) else None
+                # validasi nama persis seperti /api/output-page
+                if not name or name != os.path.basename(name) or not name.lower().endswith(".pdf"):
+                    self._send_json(400, {"ok": False, "msg": "nama file tidak valid"})
+                    return
+                try:
+                    fpath = _resolve_output_file(name)
+                except FileNotFoundError:
+                    self._send_json(404, {"ok": False, "msg": "file tidak ditemukan di OUTPUT (mungkin sudah dipindah ke DEVELOP/RICOH atau ganti hari)"})
+                    return
+                if path == "/api/output-bw":
+                    st, msg = _output_apply_bw(fpath, pages_arg)
+                else:
+                    st, msg = _output_delete_pages(fpath, pages_arg)
+                code = 200 if st == "ok" else (400 if st == "bad" else 500)
+                self._send_json(code, {"ok": st == "ok", "msg": msg})
+                return
+            except Exception as e:
+                try:
+                    self._send_json(500, {"ok": False, "msg": f"error: {e}"[:200]})
+                except Exception:
+                    pass
+                return
         if path == "/ingest" or path.startswith("/ingest"):
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -1635,6 +3719,149 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(500, {"ok": False, "msg": str(e)})
                 return
+        if path == "/api/we/file":
+            # WE hapus file MONITORING + baris DB hari ini (ADMIN ONLY — gate spt
+            # /api/we/rescan). Permanen (tanpa trash); tolak subpath & non-PDF;
+            # tak pernah sentuh luar MONITORING; tak pernah raise (500 JSON).
+            try:
+                sess, ok = self._require_auth(admin_only=True)
+                if sess is None:
+                    self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                    return
+                if not ok:
+                    self._send_json(403, {"ok": False, "msg": "admin only"})
+                    return
+                qs = urllib.parse.parse_qs(parsed.query)
+                name = ((qs.get("name") or [""])[0] or "").strip()
+                if not name or name != os.path.basename(name) or not name.lower().endswith(".pdf"):
+                    self._send_json(400, {"ok": False, "msg": "name harus basename .pdf"})
+                    return
+                mon = (we_auto.get("monitoring") or "").strip()
+                if not mon:
+                    self._send_json(400, {"ok": False, "msg": "folder MONITORING belum tersedia"})
+                    return
+                try:
+                    mon_real = os.path.realpath(mon)
+                    rp = os.path.realpath(os.path.join(mon, name))
+                except Exception:
+                    self._send_json(400, {"ok": False, "msg": "path tidak valid"})
+                    return
+                # level-atas saja: dirname hasil resolve harus persis monitoring
+                # (menolak ../x.pdf, sub/y.pdf, symlink yg keluar).
+                if os.path.dirname(rp) != mon_real:
+                    self._send_json(400, {"ok": False, "msg": "hanya file level atas MONITORING"})
+                    return
+                if not os.path.isfile(rp):
+                    self._send_json(404, {"ok": False, "msg": "file tidak ada di MONITORING"})
+                    return
+                try:
+                    os.remove(rp)
+                except Exception as e:
+                    self._send_json(500, {"ok": False, "msg": f"gagal hapus file: {e}"[:200]})
+                    return
+                try:
+                    _d, iso = _we_norm_date(datetime.date.today())
+                except Exception:
+                    iso = datetime.date.today().isoformat()
+                db = None
+                try:
+                    db = _hub_db()
+                    if db is not None:
+                        con = db.get_conn()
+                        try:
+                            con.execute("DELETE FROM we_seen WHERE date=? AND filename=?", (iso, name))
+                            con.execute("DELETE FROM we_printed WHERE date=? AND filename=?", (iso, name))
+                            con.commit()
+                        finally:
+                            try:
+                                con.close()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                try:
+                    _we_refresh_announce(iso, db)
+                except Exception:
+                    pass
+                try:
+                    add_log("WE", f"hapus file: {name}")
+                except Exception:
+                    pass
+                self._send_json(200, {"ok": True, "msg": f"{name} dihapus"})
+                return
+            except Exception as e:
+                try:
+                    self._send_json(500, {"ok": False, "msg": f"error: {e}"[:200]})
+                except Exception:
+                    pass
+                return
+        if path == "/api/we/seen":
+            # WE cabut tanda SEEN hari ini (batch Hapus frontend; USER boleh —
+            # gate spt mark-printed, BUKAN admin spt /api/we/file). HANYA hapus
+            # baris DB we_seen (+we_printed bila ada) utk tanggal hari ini;
+            # file di DISK tetap ada — rescan memunculkan lagi bila berkas
+            # masih di MONITORING. Tak pernah raise (500 JSON).
+            try:
+                tok = self._get_token()
+                if not _auth_lookup(tok):
+                    self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                    return
+                qs = urllib.parse.parse_qs(parsed.query)
+                name = ((qs.get("name") or [""])[0] or "").strip()
+                if not name or name != os.path.basename(name) or not name.lower().endswith(".pdf"):
+                    self._send_json(400, {"ok": False, "msg": "name harus basename .pdf"})
+                    return
+                try:
+                    _d, iso = _we_norm_date(datetime.date.today())
+                except Exception:
+                    iso = datetime.date.today().isoformat()
+                db = None
+                try:
+                    db = _hub_db()
+                    if db is None:
+                        self._send_json(500, {"ok": False, "msg": "DB tidak tersedia"})
+                        return
+                    con = db.get_conn()
+                    try:
+                        hits = list(con.execute(
+                            "SELECT filename FROM we_seen WHERE date=? AND filename=?", (iso, name)))
+                    finally:
+                        try:
+                            con.close()
+                        except Exception:
+                            pass
+                    if not hits:
+                        self._send_json(404, {"ok": False, "msg": "file belum terlihat hari ini (we_seen)"})
+                        return
+                    con = db.get_conn()
+                    try:
+                        con.execute("DELETE FROM we_seen WHERE date=? AND filename=?", (iso, name))
+                        con.execute("DELETE FROM we_printed WHERE date=? AND filename=?", (iso, name))
+                        con.commit()
+                    finally:
+                        try:
+                            con.close()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self._send_json(500, {"ok": False, "msg": f"error: {e}"[:200]})
+                    return
+                try:
+                    _we_refresh_announce(iso, db)
+                except Exception:
+                    pass
+                try:
+                    add_log("WE", f"cabut seen: {name}")
+                except Exception:
+                    pass
+                self._send_json(200, {"ok": True, "msg": f"{name} dihapus dari daftar (file disk tetap ada)"})
+                return
+            except Exception as e:
+                try:
+                    self._send_json(500, {"ok": False, "msg": f"error: {e}"[:200]})
+                except Exception:
+                    pass
+                return
         self.send_response(404)
         self.end_headers()
 
@@ -1695,6 +3922,7 @@ async def handler(connection):
                         "verified": sorted(verified_cache),
                         "kmma_timer": kmma_timer_cache,
                         "output_files": list(output_cache),
+                        "we": _we_snapshot(),
                         "status": status_cache,
                         "modules": module_status,
                         "steps": step_cache,
@@ -1950,10 +4178,19 @@ async def handler(connection):
                 nota = msg.get("nota", "")
                 steps = msg.get("steps", [])
                 if nota:
-                    step_cache[nota] = steps
+                    if any(msg.get(k) is not None for k in ("bahan", "sides", "laminating", "test", "process_type")):
+                        _rk = _rkey(nota, msg.get("bahan"), msg.get("sides"),
+                                     msg.get("laminating"), msg.get("test"),
+                                     msg.get("process_type"))
+                    else:
+                        _rk = nota  # pengirim lama: kunci legacy per-nota
+                    step_cache[_rk] = steps
+                    if _rk != nota:
+                        step_cache[nota] = steps  # legacy: dashboard lama tetap render
                     broadcast(json.dumps({
                         "type": "step_detail_update",
                         "nota": nota,
+                        "key": _rk,
                         "steps": steps,
                     }))
 
@@ -2153,15 +4390,28 @@ def _mark_verified(nota, bahan=None, sides=None, laminating=None, test=None, pro
         n, b, s, l, t, p = tk
         try:
             if db is not None:
+                _vts = ts()  # satu ts utk double-write WMA+WE (ts sama)
                 if hasattr(db, "wma_verify_row"):
-                    db.wma_verify_row(n, b, s, l, bool(t), p, ts())
+                    db.wma_verify_row(n, b, s, l, bool(t), p, _vts)
                 else:
-                    db.wma_verify(n, ts(), bahan=b, sides=s, laminating=l, test=bool(t), process_type=p)
+                    db.wma_verify(n, _vts, bahan=b, sides=s, laminating=l, test=bool(t), process_type=p)
+                # WE hook: cermin verifikasi per-baris 6-tuple (guard gaya repo: hasattr)
+                if hasattr(db, "we_verify_row"):
+                    try:
+                        db.we_verify_row(n, b, s, l, bool(t), p, _vts)
+                    except Exception:
+                        pass
         except Exception:
             pass
         verified_cache.add(_rkey(n, b, s, l, bool(t), p))
     broadcast(json.dumps({"type": "verified_update",
                           "verified": sorted(verified_cache)}, ensure_ascii=False))
+    # WE ikut segar SEKEJAP (tanpa tunggu tick 5 dtk): pill VERIFIED di tab WE
+    # bergantung weVerified dari we_update — tanpa ini ada jeda/stale.
+    try:
+        _we_refresh_announce()
+    except Exception:
+        pass
     upd_total = 0
     matched_total = 0
     err_last = ""
@@ -2291,6 +4541,7 @@ async def main():
 
     _preload_kma_from_db()
     _preload_wma_from_db()
+    _preload_we_from_db()
     supervise_init(ws_port)
 
     # Bind port DULU (retry bila hub lama belum bebas), modul BARU dinyalakan
@@ -2328,6 +4579,8 @@ async def main():
     asyncio.create_task(_kma_sweeper())
     asyncio.create_task(_supervisor_poller())
     threading.Thread(target=_output_watcher, daemon=True).start()
+    threading.Thread(target=_we_watcher, daemon=True).start()
+    threading.Thread(target=_we_event_worker, daemon=True).start()
     print(f"  NSH Hub running:")
     print(f"    Dashboard: http://localhost:{http_port}")
     print(f"    WebSocket: ws://0.0.0.0:{ws_port}")

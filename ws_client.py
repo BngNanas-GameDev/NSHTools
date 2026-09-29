@@ -51,6 +51,7 @@ class WSClient:
         self.on_log = None      # lambda module, msg: ...
         self.on_command = None  # lambda cmd_dict: ... (KMMA side)
         self.on_command_result = None  # lambda result_dict: ... (dashboard side)
+        self.on_we_update = None  # lambda msg_dict: ... (WE berubah -> WMA sync realtime)
 
     def connect(self):
         """Start WebSocket client in background thread."""
@@ -131,6 +132,11 @@ class WSClient:
                 self.on_command_result(msg)
             except Exception:
                 pass
+        elif msg_type == "we_update" and self.on_we_update:
+            try:
+                self.on_we_update(msg)
+            except Exception:
+                pass
 
     def send(self, msg_dict):
         """Thread-safe send."""
@@ -163,13 +169,26 @@ class WSClient:
                 pass
         self.send(body)
 
-    def send_step_detail(self, nota, steps):
+    def send_step_detail(self, nota, steps, key=None):
         """Send per-step detail from KMMA.
 
         steps: list of {name, machine, material, sdm, qty, status, msg}
         status: 'pending' | 'ok' | 'error'
+        key = (nota,bahan,sides,laminating,test[,process_type]) untuk
+        step_detail per-baris (None = kompatibel lama per-nota).
         """
-        self.send({"type": "step_detail", "nota": nota, "steps": steps})
+        body = {"type": "step_detail", "nota": nota, "steps": steps}
+        if key is not None:
+            try:
+                n, b, s, l, t = key[0], key[1], key[2], key[3], key[4]
+                body["bahan"] = b or ""
+                body["sides"] = s or ""
+                body["laminating"] = l or ""
+                body["test"] = bool(t)
+                body["process_type"] = key[5] if len(key) > 5 else ""
+            except Exception:
+                pass
+        self.send(body)
 
     def send_timer(self, next_in, interval):
         """Lapor hitung mundur siklus KMMA (detik)."""

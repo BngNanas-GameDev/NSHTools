@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useHub, defaultHubUrl, getAuthToken, getAuthRole, getAuthUser, clearAuth, type HubLogEntry, type WmaEntry, type NotaStatus, type ModuleState, type HubStep, type CommandResult, type SendCommandOpts, type KmaRoute, type KmaPrinter, type KmaRule, type KmaStats, type KmmaTimer, type OutputFile } from './hooks/useHub'
+import { createPortal } from 'react-dom'
+import { useHub, defaultHubUrl, getAuthToken, getAuthRole, getAuthUser, clearAuth, type HubLogEntry, type WmaEntry, type NotaStatus, type ModuleState, type HubStep, type CommandResult, type SendCommandOpts, type KmaRoute, type KmaPrinter, type KmaRule, type KmaStats, type KmmaTimer, type OutputFile, type WeFile, type WeAuto } from './hooks/useHub'
 import { pushToast, onToast, type ToastItem } from './toast'
 import LoginPage from './pages/Login'
 
@@ -11,9 +12,9 @@ function guessLevel(msg: string): StatusLevel {
   return 'success'
 }
 
-// ─── Module folder bar (Lite: INPUT/OUTPUT/UDA, KMA: INPUT/RETURN/UDA) ──────
-// Ambil via get_folders, simpan via set_folders (hub tulis lite.json/route.json).
-// Hub membalas "restart modul agar berlaku" — restart via tombol power.
+// ─── Module folder view (Lite: INPUT/OUTPUT/UDA, KMA: INPUT/RETURN/UDA) ─────
+// Read-only: path diambil via get_folders, ditulis otomatis oleh engine WE.
+// Gaya sama dengan blok Monitoring WE: hanya menampilkan kemana path melihat.
 
 interface FolderField {
   key: string
@@ -72,54 +73,34 @@ function useModuleFolders(
   return { values, setValues, loaded, saving, save }
 }
 
-function PathBar({ fields, values, onChange, onSave, saving }: {
+function PathView({ fields, values }: {
   fields: FolderField[]
   values: Record<string, string>
-  onChange: (next: Record<string, string>) => void
-  onSave: () => void
-  saving: boolean
 }) {
-  const [open, setOpen] = useState(true)
   return (
     <div className="card px-5 py-4">
-      <SectionHeader
-        label="Path Folder"
-        action={
-          <div className="flex items-center gap-1.5">
-            <button className="btn btn-primary btn-sm" onClick={onSave} disabled={saving}>
-              <Icon name="save" size={13} /> {saving ? 'Menyimpan…' : 'Simpan Path'}
-            </button>
-            <button className="btn btn-ghost btn-sm" title={open ? 'Sembunyikan path' : 'Tampilkan path'}
-              onClick={() => setOpen(o => !o)}>
-              <Icon name="chevronDown" size={14}
-                style={{ transform: open ? undefined : 'rotate(-90deg)', transition: 'transform 0.2s' } as any} />
-            </button>
-          </div>
-        }
-      />
-      {open && (
-      <div className="grid gap-2.5 three-col" style={{ gridTemplateColumns: `repeat(${fields.length > 3 ? 2 : fields.length}, 1fr)` }}>
+      <SectionHeader label="Path Folder" />
+      <div className="flex flex-col gap-1.5">
         {fields.map(f => (
-          <div key={f.key}>
-            <div className="section-label mb-1">{f.label}</div>
-            <input
-              className="input font-mono"
-              value={values[f.key] ?? ''}
-              onChange={e => onChange({ ...values, [f.key]: e.target.value })}
-              placeholder={`C:\\…`}
-              spellCheck={false}
-            />
+          <div key={f.key} className="flex items-center gap-2.5">
+            <span className="section-label shrink-0" style={{ minWidth: 64 }}>{f.label}</span>
+            <span className="font-mono truncate flex-1" title={values[f.key] ?? ''}
+              style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
+              {values[f.key] || '—'}
+            </span>
           </div>
         ))}
       </div>
-      )}
+      <div style={{ fontSize: 10, color: 'var(--color-text-dim)', marginTop: 6 }}>
+        Path otomatis dari engine WE — berubah sendiri mengikuti folder tanggal
+      </div>
     </div>
   )
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Page = 'ringkasan' | 'nshlite' | 'kma' | 'wma' | 'kmma' | 'log' | 'pengaturan' | 'database'
+type Page = 'ringkasan' | 'nshlite' | 'kma' | 'we' | 'wma' | 'kmma' | 'log' | 'pengaturan' | 'database'
 type ConnStatus = 'connected' | 'connecting' | 'disconnected'
 type StatusLevel = 'success' | 'warning' | 'danger' | 'violet' | 'accent' | 'muted'
 
@@ -127,6 +108,7 @@ const NAV: { id: Page; icon: string; label: string }[] = [
   { id: 'ringkasan',  icon: 'dashboard', label: 'HOME'        },
   { id: 'nshlite',   icon: 'layers',    label: 'NSH Lite'    },
   { id: 'kma',       icon: 'router',    label: 'KMA'         },
+  { id: 'we',        icon: 'eye',       label: 'WisdomEye'},
   { id: 'wma',       icon: 'workflow',  label: 'WMA'         },
   { id: 'kmma',      icon: 'package',   label: 'KMMA'        },
   { id: 'log',       icon: 'terminal',  label: 'Log'         },
@@ -135,6 +117,7 @@ const NAV: { id: Page; icon: string; label: string }[] = [
 ]
 const PAGE_TITLE: Record<Page, string> = {
   ringkasan: 'HOME', nshlite: 'NSH Lite', kma: 'KMA Router',
+  we: 'WisdomEye',
   wma: 'WMA', kmma: 'KMMA', log: 'Log Monitor', pengaturan: 'Pengaturan', database: 'Database',
 }
 const CONN_CFG: Record<ConnStatus, { status: StatusLevel; label: string; live: boolean }> = {
@@ -408,15 +391,6 @@ const MODULE_HEALTH = [
   { name: 'KMMA Tracker', modKey: 'kmma', ctl: true,  desc: 'Otomasi step KonsepMedia' },
 ]
 
-interface ModulTab { label: string; value: number | string; level: StatusLevel }
-
-const DASH_TABS: ModulTab[] = [
-  { label: 'Antrian Aktif', value: '—', level: 'accent' },
-  { label: 'Selesai', value: '—', level: 'success' },
-  { label: 'Menunggu Aksi', value: '—', level: 'warning' },
-  { label: 'Gagal', value: '—', level: 'danger' },
-]
-
 const ModulePowerButtons = ({ isOn, name, modKey, onCmd }: {
   isOn: boolean
   name: string
@@ -442,16 +416,24 @@ const ModulePowerButtons = ({ isOn, name, modKey, onCmd }: {
   </div>
 )
 
-const PageRingkasan = ({ connected, logs, entriesAll, statuses, modules, live, sendCommand, results, kmaRoutes }: {
+const PageRingkasan = ({ connected, logs, entriesAll, entries = [], statuses, verified = [], modules, live, sendCommand, results, kmaRoutes, weSeen = [], wePrinted = [], weVerified = [], weAuto = null, outputFiles = [], onGo }: {
   connected: boolean
   logs: HubLogEntry[]
   entriesAll: WmaEntry[]
+  entries?: WmaEntry[]
   statuses: Record<string, NotaStatus>
+  verified?: string[]
   modules: Record<string, ModuleState>
   live: boolean
   sendCommand: (action: string, opts?: SendCommandOpts) => string | null
   results: CommandResult[]
   kmaRoutes: KmaRoute[]
+  weSeen?: WeFile[]
+  wePrinted?: WeFile[]
+  weVerified?: string[]
+  weAuto?: WeAuto | null
+  outputFiles?: OutputFile[]
+  onGo?: (p: Page) => void
 }) => {
   const pendingRef = useRef<Set<string>>(new Set())
 
@@ -476,41 +458,51 @@ const PageRingkasan = ({ connected, logs, entriesAll, statuses, modules, live, s
     pendingRef.current.add(id)
     pushToast(`Perintah dikirim: ${action} ${label}`, 'accent')
   }
-  const feed = logs.slice(-20).reverse().map((l, i) => ({
-    ts: l.ts, module: l.module, msg: l.msg, level: guessLevel(l.msg), key: `live-${i}-${l.ts}`,
-  }))
-
-  // 4 tab pipeline WMA/KMMA dari tampilan SEHARIAN (.entries_all + status),
-  // bukan antrean live — agar tracker tetap hidup walau antrean kosong
-  const okAll = entriesAll.filter(e => stOf(statuses, e)?.status === 'ok').length
-  const errAll = entriesAll.filter(e => stOf(statuses, e)?.status === 'error').length
-  const manAll = entriesAll.filter(e => stOf(statuses, e)?.status === 'manual').length
-  const pipeTabs: ModulTab[] = [
-    { label: 'Antrian Aktif', value: entriesAll.length - okAll - errAll - manAll, level: 'accent' },
-    { label: 'Selesai', value: okAll, level: 'success' },
-    { label: 'Menunggu Aksi', value: manAll, level: 'warning' },
-    { label: 'Gagal', value: errAll, level: 'danger' },
-  ]
-  // 4 tab KMA dari daftar file router (PENDING/SELESAI/SKIP/GAGAL)
-  const kmaLv = (kmaRoutes ?? []).map(r => kmaStatus(r.status).label)
-  const kmaTabs: ModulTab[] = [
-    { label: 'Antrian Aktif', value: kmaLv.filter(l => l === 'PENDING').length, level: 'accent' },
-    { label: 'Selesai', value: kmaLv.filter(l => l === 'SELESAI' || l === 'RICOH').length, level: 'success' },
-    { label: 'Menunggu Aksi', value: kmaLv.filter(l => l === 'SKIP').length, level: 'warning' },
-    { label: 'Gagal', value: kmaLv.filter(l => l === 'GAGAL').length, level: 'danger' },
-  ]
-  const tabsFor = (modKey: string | null): ModulTab[] => {
-    if (modKey === 'kma') return kmaTabs
-    if (modKey === 'wma' || modKey === 'kmma') return pipeTabs
-    return DASH_TABS // lite: belum ada backend
-  }
-
   const health = MODULE_HEALTH.map(m => {
     const mod = m.modKey ? modules[m.modKey] : undefined
     if (!mod) return { ...m, status: 'muted' as StatusLevel, lastRun: '—', desc: 'Menunggu koneksi hub' }
     return { ...m, status: (mod.connected ? 'success' : 'danger') as StatusLevel, lastRun: mod.ts || '—' }
   })
-  const feedRef = useRef<HTMLDivElement>(null)
+
+  // ── Akses Cepat: hitungan baca-saja, navigasi saja (tanpa aksi tulis) ──
+  // WE pending — disalin verbatim dari PageWe (~1362-1369): printedSet + pendingCount
+  const qaPrintedSet = new Set((wePrinted ?? []).map(f => f.filename))
+  const qaWePending = (weSeen ?? []).filter(f => !qaPrintedSet.has(f.filename)).length
+  // WMA menunggu aksi — disalin verbatim dari PageWma mid (~1692-1695) + isVerified (~1685)
+  const qaIsVerified = (e: WmaEntry) => (verified ?? []).includes(rkey(e))
+  const qaWmaMid = (entriesAll ?? []).filter(e => {
+    const s = stOf(statuses ?? {}, e)?.status
+    return (s === 'ok' || s === 'error' || s === 'manual') && !qaIsVerified(e)
+  }).length
+  // KMMA aktif — disalin verbatim dari PageKmma visibleEntries (~1886-1887)
+  const qaKmmaAktif = (entries ?? []).filter(e => !qaIsVerified(e)).length
+  // Lite output — jumlah file OUTPUT (sumber: PageNshLite outputFiles)
+  const qaLiteCount = (outputFiles ?? []).length
+  // KMA pending — disalin via kmaStatus (~1086-1092): bukan ok/done/return/error/ricoh
+  const qaKmaPending = (kmaRoutes ?? []).filter(r => kmaStatus(r.status).label === 'PENDING').length
+  // Log — tanpa badge, hanya hitungan baris
+  const qaLogCount = (logs ?? []).length
+  // weVerified disediakan utk kompatibilitas prop (HOME hanya tampilkan pending)
+  void weVerified
+  // Mode pill — disalin verbatim dari PageWe (~1531-1536) + isManual (~1332) + tgl (~1529-1530)
+  const qaIsManual = !!weAuto?.override
+  const qaNow = new Date()
+  const qaTgl = `${qaNow.getDate()} ${WE_MON[qaNow.getMonth()]} ${qaNow.getFullYear()} (${WE_DAY[qaNow.getDay()]})`
+  const qaIsWait = !weAuto || weAuto.mode === 'wait'
+  const qaPill = qaIsWait
+    ? { label: 'MENUNGGU folder', status: 'muted' as StatusLevel }
+    : qaIsManual
+      ? { label: 'MANUAL override', status: 'warning' as StatusLevel }
+      : { label: `AUTO ${qaTgl}`, status: 'success' as StatusLevel }
+  // 6 ubin — tanpa Database (ikuti filter sidebar ~3047: non-admin buang database)
+  const qaTiles: { id: Page; icon: string; label: string; count: number; sub: string; color: string }[] = [
+    { id: 'nshlite', icon: 'layers', label: 'NSH Lite', count: qaLiteCount, sub: 'File OUTPUT', color: qaLiteCount > 0 ? 'var(--color-accent)' : 'var(--color-text-dim)' },
+    { id: 'kma', icon: 'router', label: 'KMA', count: qaKmaPending, sub: 'Menunggu routing', color: qaKmaPending > 0 ? 'var(--color-warning)' : 'var(--color-text-dim)' },
+    { id: 'we', icon: 'eye', label: 'WisdomEye', count: qaWePending, sub: 'Menunggu cetak', color: qaWePending > 0 ? 'var(--color-accent)' : 'var(--color-text-dim)' },
+    { id: 'wma', icon: 'workflow', label: 'WMA', count: qaWmaMid, sub: 'Menunggu aksi', color: qaWmaMid > 0 ? 'var(--color-warning)' : 'var(--color-text-dim)' },
+    { id: 'kmma', icon: 'package', label: 'KMMA', count: qaKmmaAktif, sub: 'Antrean aktif', color: qaKmmaAktif > 0 ? 'var(--color-accent)' : 'var(--color-text-dim)' },
+    { id: 'log', icon: 'terminal', label: 'Log', count: qaLogCount, sub: 'Baris log', color: 'var(--color-text-dim)' },
+  ]
 
   return (
     <div className="flex flex-col gap-6">
@@ -525,7 +517,36 @@ const PageRingkasan = ({ connected, logs, entriesAll, statuses, modules, live, s
         </div>
       )}
 
-      {/* Blok Modul: 4 kartu, tiap kartu 4 tab + tombol power */}
+      {/* Blok Akses Cepat: navigasi saja, tanpa aksi tulis */}
+      <div className="card p-5">
+        <SectionHeader label="Akses Cepat" action={
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="font-mono truncate" title={weAuto?.monitoring || ''}
+              style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', maxWidth: 220 }}>
+              {weAuto?.monitoring || 'Belum ada folder MONITORING'}
+            </span>
+            <Badge label={qaPill.label} status={qaPill.status} />
+          </div>
+        } />
+        <div className="grid gap-3 modul-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+          {qaTiles.map((t, i) => (
+            <button key={t.id} onClick={() => onGo?.(t.id)} className="w-full text-left rounded-lg p-3.5 animate-fade-rise"
+              style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', animationDelay: `${Math.min(i * 30, 300)}ms`, cursor: 'pointer' }}>
+              <div className="flex items-center gap-2 mb-2">
+                <Icon name={t.icon} size={16} style={{ color: 'var(--color-text-secondary)' } as any} />
+                <span className="font-semibold truncate flex-1" style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text)' }}>{t.label}</span>
+                <Icon name="chevronRight" size={14} style={{ color: 'var(--color-text-dim)' } as any} />
+              </div>
+              <div className="flex items-baseline gap-2">
+                <span className="font-mono font-bold" style={{ fontSize: 'var(--text-num-sm)', color: t.color }}>{t.count.toLocaleString()}</span>
+                <span style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>{t.sub}</span>
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Blok Modul: kartu status + tombol power per modul */}
       <div className="card p-5">
         <SectionHeader label="Modul" action={
           <span style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>
@@ -545,43 +566,6 @@ const PageRingkasan = ({ connected, logs, entriesAll, statuses, modules, live, s
                   <ModulePowerButtons isOn={m.status === 'success'} name={m.name} modKey={m.modKey} onCmd={doModuleCommand} />
                 )}
               </div>
-              <div className="grid grid-cols-2 gap-1.5">
-                {tabsFor(m.modKey).map((t, j) => (
-                  <div key={j} className="rounded-md px-2 py-1.5" style={{ background: 'var(--color-panel)' }}>
-                    <div style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>{t.label}</div>
-                    <div className="font-bold" style={{ fontSize: 'var(--text-md)', color: STATUS_COLOR[t.level] }}>{t.value}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Aktivitas Live (full width, di bawah blok Modul) */}
-      <div className="card overflow-hidden flex flex-col">
-        <div className="flex items-center justify-between shrink-0 px-5 py-4"
-          style={{ borderBottom: '1px solid var(--color-border)' }}>
-          <span className="section-label">Aktivitas Live</span>
-          <div className="flex items-center gap-1.5">
-            <StatusDot status={connected ? 'success' : 'danger'} live={connected} shake={!connected} />
-            <span style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>
-              {connected ? 'Live' : 'Offline'}
-            </span>
-          </div>
-        </div>
-        <div ref={feedRef} className="overflow-y-auto" style={{ maxHeight: 420 }}>
-          {feed.map((item, i) => (
-            <div key={i} className={`flex items-start gap-3 px-5 py-2.5 ${i === 0 ? 'animate-slide-in-top' : ''}`}
-              style={{ borderBottom: '1px solid var(--color-border-subtle)' }}>
-              <span className="font-mono shrink-0 pt-0.5"
-                style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>{item.ts}</span>
-              <div className="rounded-full shrink-0 mt-[7px]"
-                style={{ width: 4, height: 4, background: STATUS_COLOR[item.level] }} />
-              <span className="shrink-0 pt-0.5" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', minWidth: 72 }}>
-                {item.module}
-              </span>
-              <span style={{ fontSize: 'var(--text-sm)', color: '#cbd5e1' }}>{item.msg}</span>
             </div>
           ))}
         </div>
@@ -665,6 +649,25 @@ function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil 
     pushToast(`Memindah ${sel.size} file ke ${dest.toUpperCase()} (${operator})…`, 'accent')
   }
 
+  // VIEW modal: snapshot file terpilih + halaman per-file + cache-buster preview.
+  // Guard sama seperti doMove minus syarat operator. Sub-panel tools (BW/hapus)
+  // hidup di dalam ViewModal sehingga unmount = reset otomatis.
+  const [viewOpen, setViewOpen] = useState(false)
+  const [viewNames, setViewNames] = useState<string[]>([])
+  const [viewIdx, setViewIdx] = useState(0)
+  const [viewPages, setViewPages] = useState<Record<string, number>>({})
+  const [imgTs, setImgTs] = useState(0)
+  const openView = () => {
+    if (sel.size === 0) { pushToast('Pilih file dulu', 'warning'); return }
+    if (!connected) { pushToast('Hub offline — perintah tidak dikirim', 'warning'); return }
+    const ordered = files.filter(f => sel.has(f.name)).map(f => f.name)
+    setViewNames(ordered.length ? ordered : [...sel])
+    setViewIdx(0)
+    setViewPages({})
+    setViewOpen(true)
+  }
+  const closeView = () => setViewOpen(false)
+
   return (
     <div className="card overflow-hidden">
       <div className="flex items-center gap-3 px-5 py-3.5" style={{ borderBottom: '1px solid var(--color-border)' }}>
@@ -737,6 +740,9 @@ function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil 
             <button className="btn btn-secondary btn-sm" onClick={() => doMove('ricoh')}>
               <Icon name="send" size={13} /> RICOH
             </button>
+            <button className="btn btn-secondary btn-sm" onClick={openView}>
+              <Icon name="eye" size={13} /> VIEW
+            </button>
             <button className="btn btn-ghost btn-sm" title="Batalkan pilihan" onClick={() => setSel(new Set())}>
               <Icon name="x" size={13} />
             </button>
@@ -747,6 +753,247 @@ function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil 
         <div style={{ fontSize: 10, color: 'var(--color-text-dim)', padding: '2px 0' }}>Pilih file untuk memindah batch…</div>
       )}
       <div style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>ke folder DEVELOP / RICOH (setelan KMA) • tercatat + Selesai di .54</div>
+      </div>
+      {viewOpen && viewNames.length > 0 && (
+        <ViewModal names={viewNames} idx={Math.min(viewIdx, viewNames.length - 1)}
+          onIdx={setViewIdx} pageMap={viewPages}
+          onPage={(nm, p) => setViewPages(prev => ({ ...prev, [nm]: p }))}
+          imgTs={imgTs} onEdited={() => setImgTs(t => t + 1)} onClose={closeView} />
+      )}
+    </div>
+  )
+}
+
+// Parser spesifikasi halaman "3" / "2-5" / "1,3,5" (+ kombinasi "1,3-5").
+// Hasil dedupe + sort; semua pesan error Bahasa Indonesia.
+function parsePageSpec(raw: string, total: number): { ok: true; pages: number[] } | { ok: false; err: string } {
+  const t = (raw || '').trim()
+  if (!t) return { ok: false, err: 'Isi nomor halaman dulu (mis. 3 atau 2-5).' }
+  const out = new Set<number>()
+  for (const tok of t.split(',')) {
+    const s = tok.trim()
+    if (!s) continue
+    if (s.includes('-')) {
+      const parts = s.split('-').map(p => p.trim())
+      if (parts.length !== 2 || !parts[0] || !parts[1]) return { ok: false, err: `Rentang tak valid: "${s}". Contoh: 2-5.` }
+      const a = Number(parts[0]); const b = Number(parts[1])
+      if (!Number.isInteger(a) || !Number.isInteger(b)) return { ok: false, err: `Rentang tak valid: "${s}". Pakai angka bulat.` }
+      if (a > b) return { ok: false, err: `Rentang terbalik: "${s}". Tulis kecil-besar (mis. 2-5).` }
+      if (a < 1 || b > total) return { ok: false, err: `Halaman harus 1..${total}.` }
+      for (let p = a; p <= b; p++) out.add(p)
+    } else {
+      const n = Number(s)
+      if (!Number.isInteger(n)) return { ok: false, err: `"${s}" bukan nomor halaman. Contoh: 3 atau 2-5.` }
+      if (n < 1 || n > total) return { ok: false, err: `Halaman harus 1..${total}.` }
+      out.add(n)
+    }
+  }
+  if (out.size === 0) return { ok: false, err: 'Isi nomor halaman dulu (mis. 3 atau 2-5).' }
+  return { ok: true, pages: [...out].sort((a, b) => a - b) }
+}
+
+// VIEW modal NSH Lite: 1 blok card (~90vw/maks 1200px, ~85vh) berisi 3 panel —
+// kiri viewer besar (raster /api/output-page + &t= cache-buster), kanan-atas
+// daftar file terpilih (klik = ganti file; kunjungan pertama = hal. 1, kunjungan
+// ulang = ingat halaman terakhir via pageMap), kanan-bawah tools BW/Hapus Halaman.
+// Klik backdrop / X / ESC = tutup. Tanpa CSS baru (card/btn/input/chip/section-label
+// + animate-fade-rise saja); z-index 9000 di bawah toast (9999) agar toast tetap di atas.
+function ViewModal({ names, idx, onIdx, pageMap, onPage, imgTs, onEdited, onClose }: {
+  names: string[]
+  idx: number
+  onIdx: (i: number) => void
+  pageMap: Record<string, number>
+  onPage: (name: string, page: number) => void
+  imgTs: number
+  onEdited: () => void
+  onClose: () => void
+}) {
+  const [tool, setTool] = useState<null | 'bw' | 'del'>(null)
+  const [spec, setSpec] = useState('')
+  const [specErr, setSpecErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [infos, setInfos] = useState<Record<string, OutputInfo>>({})
+  const [fails, setFails] = useState<Set<string>>(new Set())
+  const [imgFail, setImgFail] = useState(false)
+  const hubHttp = (() => {
+    try { return `http://${location.hostname}:8766` } catch { return 'http://localhost:8766' }
+  })()
+  const cur = names[idx] ?? ''
+  const info = cur ? infos[cur] : undefined
+  const total = info && info.pages > 0 ? info.pages : 0
+  const page = Math.max(0, pageMap[cur] ?? 0)
+  // Aturan tombol sama seperti PreviewPanel: 1 halaman → sembunyi dua-duanya;
+  // halaman pertama → sembunyi Back; halaman terakhir → sembunyi Next.
+  const showBack = total <= 0 ? true : total > 1 && page > 0
+  const showNext = total <= 0 ? true : total > 1 && page < total - 1
+  const imgSrc = cur && !imgFail ? `${hubHttp}/api/output-page?name=${encodeURIComponent(cur)}&page=${page + 1}&t=${imgTs}` : null
+
+  // Jumlah halaman per file: paralel saat modal dibuka, aman-batal bila ditutup cepat.
+  useEffect(() => {
+    let cancelled = false
+    const tok = getAuthToken()
+    setInfos({})
+    setFails(new Set())
+    names.forEach(nm => {
+      fetch(`${hubHttp}/api/output-info?name=${encodeURIComponent(nm)}`, {
+        headers: tok ? { Authorization: `Bearer ${tok}` } : undefined,
+      }).then(r => r.json()).then(j => {
+        if (cancelled) return
+        if (j && j.ok && typeof j.pages === 'number' && j.pages > 0) {
+          setInfos(p => ({ ...p, [nm]: { pages: j.pages, width_pt: Number(j.width_pt) || 0, height_pt: Number(j.height_pt) || 0, size: Number(j.size) || 0 } }))
+        } else {
+          setFails(p => new Set(p).add(nm))
+        }
+      }).catch(() => { if (!cancelled) setFails(p => new Set(p).add(nm)) })
+    })
+    return () => { cancelled = true }
+  }, [hubHttp, names])
+
+  // ESC = tutup (listener + cleanup sepele).
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [onClose])
+
+  // Ganti file/halaman/edit baru → coba muat gambar lagi.
+  useEffect(() => { setImgFail(false) }, [cur, page, imgTs])
+
+  const reloadInfo = (nm: string, after?: (n: number) => void) => {
+    const tok = getAuthToken()
+    fetch(`${hubHttp}/api/output-info?name=${encodeURIComponent(nm)}`, {
+      headers: tok ? { Authorization: `Bearer ${tok}` } : undefined,
+    }).then(r => r.json()).then(j => {
+      if (j && j.ok && typeof j.pages === 'number' && j.pages > 0) {
+        setInfos(p => ({ ...p, [nm]: { pages: j.pages, width_pt: Number(j.width_pt) || 0, height_pt: Number(j.height_pt) || 0, size: Number(j.size) || 0 } }))
+        setFails(p => { const s = new Set(p); s.delete(nm); return s })
+        after?.(j.pages)
+      } else {
+        setFails(p => new Set(p).add(nm))
+        after?.(0)
+      }
+    }).catch(() => { setFails(p => new Set(p).add(nm)); after?.(0) })
+  }
+
+  const applyTool = async () => {
+    if (!cur || busy || !tool) return
+    const parsed = parsePageSpec(spec, total)
+    if (!parsed.ok) { setSpecErr(parsed.err); return }
+    if (tool === 'del' && parsed.pages.length >= total) {
+      setSpecErr('Tidak bisa hapus semua halaman.')
+      return
+    }
+    setSpecErr('')
+    setBusy(true)
+    try {
+      const tok = getAuthToken()
+      const ep = tool === 'bw' ? 'output-bw' : 'output-delpages'
+      const r = await fetch(`${hubHttp}/api/${ep}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: `Bearer ${tok}` } : {}) },
+        body: JSON.stringify({ name: cur, pages: parsed.pages }),
+      })
+      const j = await r.json().catch(() => null)
+      if (r.ok && j && j.ok) {
+        pushToast(String(j.msg || 'Berhasil'), 'success')
+        setSpec('')
+        setTool(null)
+        onEdited()
+        if (tool === 'del') {
+          reloadInfo(cur, np => { if (np > 0 && page > np - 1) onPage(cur, np - 1) })
+        } else {
+          reloadInfo(cur)
+        }
+      } else {
+        const m = (j && j.msg) || `HTTP ${r.status}`
+        pushToast(`Gagal: ${m}`, 'danger')
+        setSpecErr(String(m))
+      }
+    } catch (e: unknown) {
+      pushToast(`Gagal: ${e instanceof Error ? e.message : String(e)}`, 'danger')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 9000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+      <div onClick={e => e.stopPropagation()} className="card animate-fade-rise" style={{ width: '90vw', maxWidth: 1200, height: '85vh', maxHeight: '85vh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <div className="flex items-center gap-3 px-5 py-3.5" style={{ borderBottom: '1px solid var(--color-border)' }}>
+          <span className="section-label truncate">VIEW — {cur} ({idx + 1}/{names.length})</span>
+          <button className="btn btn-ghost btn-sm ml-auto" title="Tutup" onClick={onClose}>
+            <Icon name="x" size={14} />
+          </button>
+        </div>
+        <div className="grid gap-3 p-4" style={{ gridTemplateColumns: '1fr 300px', flex: 1, minHeight: 0 }}>
+          <div className="flex flex-col gap-2" style={{ minHeight: 0 }}>
+            <div style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', overflow: 'hidden', flex: 1, minHeight: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              {imgSrc ? (
+                <img key={imgSrc} src={imgSrc} alt={cur} onError={() => setImgFail(true)}
+                  style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }} />
+              ) : (
+                <div style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-dim)', padding: 24, textAlign: 'center' }}>
+                  {cur ? 'Gagal memuat preview' : 'Tidak ada file'}
+                </div>
+              )}
+            </div>
+            <div className="flex items-center justify-between">
+              {showBack ? (
+                <button className="btn btn-ghost btn-sm" disabled={page === 0} onClick={() => onPage(cur, Math.max(0, page - 1))}>
+                  <Icon name="chevronLeft" size={14} /> Back
+                </button>
+              ) : <span />}
+              <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>Page {page + 1}{total > 0 ? ` / ${total}` : ''}</span>
+              {showNext ? (
+                <button className="btn btn-ghost btn-sm" onClick={() => onPage(cur, total > 0 ? Math.min(total - 1, page + 1) : page + 1)}>
+                  Next <Icon name="chevronRight" size={14} />
+                </button>
+              ) : <span />}
+            </div>
+          </div>
+          <div className="grid gap-3" style={{ gridTemplateRows: 'minmax(0,1fr) auto', minHeight: 0 }}>
+            <div className="flex flex-col gap-1.5 overflow-y-auto" style={{ minHeight: 0 }}>
+              <div className="section-label">File dipilih ({names.length})</div>
+              {names.map((nm, i) => {
+                const inf = infos[nm]
+                const fail = fails.has(nm)
+                const active = i === idx
+                return (
+                  <button key={nm} onClick={() => onIdx(i)} className="flex items-center gap-2 rounded-lg px-2.5 py-2 text-left"
+                    style={{ fontSize: 'var(--text-xs)', background: active ? 'var(--color-nav-active)' : 'var(--color-bg)', border: active ? '1px solid var(--color-accent-ghost)' : '1px solid var(--color-border)', color: 'var(--color-text-secondary)', cursor: 'pointer' }}>
+                    <span className="font-mono truncate flex-1" title={nm}>{nm}</span>
+                    <span className="font-mono shrink-0" style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>{inf ? `${inf.pages} hlm` : fail ? '?' : '…'}</span>
+                  </button>
+                )
+              })}
+            </div>
+            <div>
+              <div className="section-label mb-1">Tools</div>
+              {tool === null ? (
+                <div className="flex flex-col gap-2">
+                  <div className="flex gap-2">
+                    <button className="btn btn-secondary btn-sm" onClick={() => { setTool('bw'); setSpec(''); setSpecErr('') }}>BW</button>
+                    <button className="btn btn-secondary btn-sm" onClick={() => { setTool('del'); setSpec(''); setSpecErr('') }}>Hapus Halaman</button>
+                  </div>
+                  <div style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>Edit sementara sebelum kirim</div>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2 rounded-lg px-2.5 py-2" style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)' }}>
+                  <div className="section-label">{tool === 'bw' ? 'BW — halaman jadi hitam-putih' : 'Hapus halaman'}</div>
+                  <input className="input font-mono" value={spec} onChange={e => setSpec(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') applyTool() }}
+                    placeholder="Halaman: 3 atau 2-5" spellCheck={false} disabled={busy}
+                    style={{ fontSize: 'var(--text-xs)' }} />
+                  {specErr && <div style={{ fontSize: 10, color: 'var(--color-danger-fg)' }}>{specErr}</div>}
+                  <div className="flex gap-2">
+                    <button className="btn btn-primary btn-sm" onClick={applyTool} disabled={busy}>{busy ? 'Memproses…' : 'Terapkan'}</button>
+                    <button className="btn btn-ghost btn-sm" onClick={() => { setTool(null); setSpec(''); setSpecErr('') }} disabled={busy}>Batal</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   )
@@ -810,17 +1057,14 @@ const PageNshLite = ({ connected, sendCommand, results, outputFiles }: {
           OFF = file dibiarkan di INPUT (tidak di-impose / tidak di-copy) • Lite restart otomatis ±30 dtk
         </div>
       </div>
-      {/* Path folder */}
-      <PathBar
+      {/* Path folder (read-only, otomatis WE) */}
+      <PathView
         fields={[
           { key: 'input_folder', label: 'INPUT' },
           { key: 'output_folder', label: 'OUTPUT' },
           { key: 'uda_folder', label: 'UDA' },
         ]}
         values={folders.values}
-        onChange={folders.setValues}
-        onSave={() => folders.save(folders.values)}
-        saving={folders.saving}
       />
       <div className="grid gap-4" style={{ gridTemplateColumns: '1fr 360px' }}>
         <OutputWatcher connected={connected} sendCommand={sendCommand} results={results} files={outputFiles}
@@ -832,13 +1076,47 @@ const PageNshLite = ({ connected, sendCommand, results, outputFiles }: {
 }
 
 // Preview Panel untuk NSH Lite — 1 halaman, tanpa scroll, Next/Back Page 1-2, fit, tanpa rounded
+type OutputInfo = { pages: number; width_pt: number; height_pt: number; size: number }
+
 function PreviewPanel({ file }: { file: OutputFile | null }) {
   const [page, setPage] = useState(0)
-  useEffect(() => { setPage(0) }, [file?.name])
+  const [info, setInfo] = useState<OutputInfo | null>(null)
+  const [imgFail, setImgFail] = useState(false)
   const hubHttp = (() => {
     try { return `http://${location.hostname}:8766` } catch { return 'http://localhost:8766' }
   })()
+  useEffect(() => {
+    setPage(0)
+    setInfo(null)
+    setImgFail(false)
+    const fname = file?.name
+    if (!fname) return
+    let cancelled = false
+    const tok = getAuthToken()
+    fetch(`${hubHttp}/api/output-info?name=${encodeURIComponent(fname)}`, {
+      headers: tok ? { Authorization: `Bearer ${tok}` } : undefined,
+    }).then(r => r.json()).then(j => {
+      if (cancelled) return
+      if (j && j.ok && typeof j.pages === 'number' && j.pages > 0) {
+        setInfo({ pages: j.pages, width_pt: Number(j.width_pt) || 0, height_pt: Number(j.height_pt) || 0, size: Number(j.size) || 0 })
+        setPage(p => Math.max(0, Math.min(p, j.pages - 1)))
+      } else {
+        setInfo(null)
+      }
+    }).catch(() => { if (!cancelled) setInfo(null) })
+    return () => { cancelled = true }
+  }, [file?.name, hubHttp])
+  const pages = info && info.pages > 0 ? info.pages : 0
+  const dimsKnown = !!info && info.width_pt > 0 && info.height_pt > 0
+  // Aturan tombol: 1 halaman → sembunyi dua-duanya; halaman pertama → sembunyi Back;
+  // halaman terakhir → sembunyi Next; tak diketahui → perilaku lama (dua-duanya tampil).
+  const showBack = pages <= 0 ? true : pages > 1 && page > 0
+  const showNext = pages <= 0 ? true : pages > 1 && page < pages - 1
   const pdfSrc = file ? `${hubHttp}/api/output-file?name=${encodeURIComponent(file.name)}#page=${page + 1}` : null
+  // Render 1 halaman jadi gambar via /api/output-page: <img> tidak punya scroll
+  // (iframe memakai PDF viewer browser yg selalu bisa di-scroll). Cookie auth
+  // ikut terkirim otomatis seperti iframe. Gagal (hub lama) → fallback iframe.
+  const imgSrc = file && !imgFail ? `${hubHttp}/api/output-page?name=${encodeURIComponent(file.name)}&page=${page + 1}` : null
   return (
     <div className="card p-5 flex flex-col gap-3 h-fit">
       <SectionHeader label="Preview Panel" />
@@ -849,17 +1127,28 @@ function PreviewPanel({ file }: { file: OutputFile | null }) {
       ) : (
         <>
           <div className="font-mono truncate" title={file.name} style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent)' }}>{file.name}</div>
-          <div style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', height: 520, overflow: 'hidden' }}>
-            <iframe key={pdfSrc ?? ''} src={pdfSrc ?? ''} title={file.name} style={{ width: '100%', height: '100%', border: 'none' }} />
+          <div style={dimsKnown && info
+            ? { background: 'var(--color-bg)', border: '1px solid var(--color-border)', overflow: 'hidden', width: '100%', aspectRatio: `${info.width_pt} / ${info.height_pt}`, maxHeight: 560, margin: 'auto' }
+            : { background: 'var(--color-bg)', border: '1px solid var(--color-border)', height: 520, overflow: 'hidden' }}>
+            {imgSrc ? (
+              <img key={imgSrc} src={imgSrc} alt={file.name} onError={() => setImgFail(true)}
+                style={{ width: '100%', height: '100%', border: 'none', objectFit: 'contain', display: 'block' }} />
+            ) : (
+              <iframe key={pdfSrc ?? ''} src={pdfSrc ?? ''} title={file.name} style={{ width: '100%', height: '100%', border: 'none' }} />
+            )}
           </div>
           <div className="flex items-center justify-between">
-            <button className="btn btn-ghost btn-sm" disabled={page === 0} onClick={() => setPage(p => Math.max(0, p - 1))}>
-              <Icon name="chevronLeft" size={14} /> Back
-            </button>
-            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>Page {page + 1}</span>
-            <button className="btn btn-ghost btn-sm" onClick={() => setPage(p => p + 1)}>
-              Next <Icon name="chevronRight" size={14} />
-            </button>
+            {showBack ? (
+              <button className="btn btn-ghost btn-sm" disabled={page === 0} onClick={() => setPage(p => Math.max(0, p - 1))}>
+                <Icon name="chevronLeft" size={14} /> Back
+              </button>
+            ) : <span />}
+            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>Page {page + 1}{pages > 0 ? ` / ${pages}` : ''}</span>
+            {showNext ? (
+              <button className="btn btn-ghost btn-sm" onClick={() => setPage(p => pages > 0 ? Math.min(pages - 1, p + 1) : p + 1)}>
+                Next <Icon name="chevronRight" size={14} />
+              </button>
+            ) : <span />}
           </div>
         </>
       )}
@@ -895,17 +1184,14 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
 
   return (
     <div className="flex flex-col gap-4">
-      <PathBar
+      <PathView
         fields={[
           { key: 'input_folder', label: 'INPUT' },
           { key: 'return_folder', label: 'RETURN' },
           { key: 'uda_folder', label: 'UDA' },
-          { key: 'ricoh_folder', label: 'RICOH (watcher, kosong=mati)' },
+          { key: 'ricoh_folder', label: 'RICOH' },
         ]}
         values={folders.values}
-        onChange={folders.setValues}
-        onSave={() => folders.save(folders.values)}
-        saving={folders.saving}
       />
       {/* Status printer — di atas Daftar File, 3 blok bersebelahan */}
       <div className="card p-5">
@@ -992,6 +1278,448 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
           </table>
         </div>
       </div>
+    </div>
+  )
+}
+
+// ─── Page: WE (WisdomEye) ───────────────────────────────────────────────────
+// Struktur klon PageWma: bar monitoring read-only + 3 rak (Seen/Printed/Verified).
+// Aksi tulis (Rescan, Auto/Manual) admin-only via HTTP Bearer; baca boleh semua user.
+// Perintah WS tidak dipakai di sini (sendCommand hanya diteruskan agar seragam).
+
+// Kunci baris WE = 6-tuple spt rkey agar cocok dgn skey verified hub.
+function weSkey(f: WeFile): string {
+  return `${f.nota ?? ''}||${f.bahan ?? ''}||${f.sides ?? ''}||${f.laminating ?? ''}||${f.test ? '1' : '0'}||${f.process_type ?? ''}`
+}
+
+const WE_DAY = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab']
+const WE_MON = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des']
+
+const PageWe = ({ live, sendCommand, results, weSeen = [], wePrinted = [], weVerified = [], weAuto = null, hubUrl, weRefresh }: {
+  live: boolean
+  sendCommand: (action: string, opts?: SendCommandOpts) => string | null
+  results: CommandResult[]
+  weSeen: WeFile[]
+  wePrinted: WeFile[]
+  weVerified: string[]
+  weAuto: WeAuto | null
+  hubUrl: string
+  weRefresh: () => Promise<boolean>
+}) => {
+  const isAdmin = getAuthRole() === 'admin'
+  const base = hubHttpBase(hubUrl)
+  const [q, setQ] = useState('')
+  const [refreshing, setRefreshing] = useState(false)
+  const [busy, setBusy] = useState(false)
+  // aksi per-baris: filename -> 'printed' | 'delete' | 'verify' (tombol ybs disabled)
+  const [acting, setActing] = useState<Record<string, string>>({})
+  // aksi per-baris: filename -> 'verify' (tombol verify batch; hasil via pendingRef).
+  // Batch: seleksi multi-baris + blok aksi mengambang (fixed, di bawah).
+  // Operator/mesin meniru pola OutputWatcher ('nsh-operator') dgn kunci sendiri
+  // 'we-operator'/'we-machine' agar tidak saling timpa.
+  const [sel, setSel] = useState<Set<string>>(new Set())
+  const [batchBusy, setBatchBusy] = useState<null | 'printed' | 'verify' | 'hapus'>(null)
+  const [confirmBatchHapus, setConfirmBatchHapus] = useState(false)
+  const [weOperator, setWeOperator] = useState(() => {
+    try { return localStorage.getItem('we-operator') || '' } catch { return '' }
+  })
+  const [weMachine, setWeMachine] = useState(() => {
+    try { return localStorage.getItem('we-machine') || 'Develop 1' } catch { return 'Develop 1' }
+  })
+  const pickWeOperator = (v: string) => {
+    setWeOperator(v)
+    try { localStorage.setItem('we-operator', v) } catch { /* abaikan */ }
+  }
+  const pickWeMachine = (v: string) => {
+    setWeMachine(v)
+    try { localStorage.setItem('we-machine', v) } catch { /* abaikan */ }
+  }
+  // Batal/X: hanya bersihkan pilihan (+ status konfirmasi), tanpa server call.
+  const clearSel = () => { setSel(new Set()); setConfirmBatchHapus(false) }
+  const pendingRef = useRef<Set<string>>(new Set())
+  // peta id perintah verify -> filename (agar hasil WS membuka lagi tepat 1 baris)
+  const verifyFileRef = useRef<Map<string, string>>(new Map())
+  // Cap waktu data WE terakhir berubah (utk penanda umur data + deteksi basi).
+  const [weUpdatedAt, setWeUpdatedAt] = useState<number>(0)
+  useEffect(() => {
+    setWeUpdatedAt(Date.now())
+  }, [weSeen, wePrinted, weVerified])
+  // Sembuh-sendiri: refresh HTTP tiap 30 dtk saat live, agar tampilan konvergen
+  // walau ada pesan WS yg hilang. Interval dibersihkan saat unmount/offline.
+  useEffect(() => {
+    if (!live) return
+    const t = setInterval(() => { weRefresh().catch(() => undefined) }, 30000)
+    return () => clearInterval(t)
+  }, [live, weRefresh])
+
+  useEffect(() => {
+    for (const r of results ?? []) {
+      if (!pendingRef.current.has(r.id)) continue
+      pendingRef.current.delete(r.id)
+      if (r.action === 'verify') {
+        const fn = verifyFileRef.current.get(r.id)
+        verifyFileRef.current.delete(r.id)
+        if (fn) {
+          setActing(p => {
+            if (p[fn] !== 'verify') return p
+            const n = { ...p }
+            delete n[fn]
+            return n
+          })
+        }
+      }
+      pushToast(r.ok ? `OK: ${r.action} — ${r.msg}` : `Gagal: ${r.action} — ${r.msg}`, r.ok ? 'success' : 'danger')
+    }
+  }, [results])
+
+  const authHdr = () => {
+    const tok = getAuthToken()
+    return tok ? { Authorization: `Bearer ${tok}` } : undefined
+  }
+
+  const doManualRefresh = async () => {
+    if (!live) { pushToast('Hub offline — menampilkan data WE terakhir', 'warning'); return }
+    setRefreshing(true)
+    const ok = await weRefresh()
+    setRefreshing(false)
+    pushToast(ok ? 'State WE dimuat ulang' : 'Gagal muat ulang state WE', ok ? 'success' : 'danger')
+  }
+
+  const doRescan = async () => {
+    if (!live) { pushToast('Hub offline — perintah tidak dikirim', 'warning'); return }
+    setBusy(true)
+    try {
+      const r = await fetch(`${base}/api/we/rescan`, { method: 'POST', headers: authHdr() })
+      const j = await r.json().catch(() => null)
+      if (r.ok && j && j.ok) {
+        pushToast(`Rescan OK: ${j.seen ?? '?'} seen, ${j.printed ?? '?'} printed, ${j.verified ?? '?'} verified`, 'success')
+        await weRefresh()
+      } else {
+        pushToast(`Rescan gagal: ${(j && j.msg) || `HTTP ${r.status}`}`, 'danger')
+      }
+    } catch (e: unknown) {
+      pushToast(`Rescan gagal: ${e instanceof Error ? e.message : String(e)}`, 'danger')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const isManual = !!weAuto?.override
+  const doToggleAuto = async () => {
+    if (!live) { pushToast('Hub offline — perintah tidak dikirim', 'warning'); return }
+    const next = isManual ? 'auto' : 'manual'
+    setBusy(true)
+    try {
+      const r = await fetch(`${base}/api/we/auto`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(authHdr() || {}) },
+        body: JSON.stringify({ mode: next }),
+      })
+      const j = await r.json().catch(() => null)
+      if (r.ok && j && j.ok) {
+        // tanpa optimistis lokal — konfirmasi final datang dari we_update berikutnya
+        pushToast(`Mode ${next.toUpperCase()} dikirim — menunggu konfirmasi hub…`, 'accent')
+      } else {
+        pushToast(`Gagal ubah mode: ${(j && j.msg) || `HTTP ${r.status}`}`, 'danger')
+      }
+    } catch (e: unknown) {
+      pushToast(`Gagal ubah mode: ${e instanceof Error ? e.message : String(e)}`, 'danger')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Hapus file fisik per-baris DIHILANGKAN dari blok SEEN (keputusan UI);
+  // endpoint DELETE /api/we/file tetap ada di hub utk tab Database (admin).
+
+  // Status per-baris dari props (tanpa fetch baru):
+  // verified = skey 6-tuple ada di weVerified; printed = filename ada di wePrinted.
+  const verSet = new Set(weVerified)
+  const printedSet = new Set((wePrinted ?? []).map(f => f.filename))
+  // Mesin/Operator TERCATAT di tabel printed (moves/tombol manual), sedangkan
+  // baris tampil dari tabel seen (tanpa kolom itu) — gabung di sini agar tulisan
+  // berganti begitu user input dari NSH Lite / floating blok.
+  const printedMap = new Map((wePrinted ?? []).map(p => [p.filename, p] as const))
+  // Hitungan SEEN = menunggu cetak (belum printed); DB tetap riwayat penuh.
+  const pendingCount = weSeen.filter(f => !printedSet.has(f.filename)).length
+  // Urutan: terbaru dulu berdasar waktu file masuk (first_seen_ts desc);
+  // tanpa ts dianggap paling lama. Deterministik, didokumentasikan di sini.
+  const ordered = [...weSeen].sort((a, b) => (b.first_seen_ts || '').localeCompare(a.first_seen_ts || ''))
+
+  const matchQ = (f: WeFile, s: string) => {
+    if (!s) return true
+    const t = s.toLowerCase()
+    return f.filename.toLowerCase().includes(t)
+      || (f.nota || '').toLowerCase().includes(t)
+      || (f.customer || '').toLowerCase().includes(t)
+      || (f.bahan || '').toLowerCase().includes(t)
+  }
+  const rows = ordered.filter(f => matchQ(f, q))
+  // Seleksi bertahan saat cari (q); select-all hanya utk baris TERFILTER.
+  const byName = new Map(weSeen.map(f => [f.filename, f]))
+  const toggle = (fn: string) => setSel(p => { const s = new Set(p); if (s.has(fn)) s.delete(fn); else s.add(fn); return s })
+  const toggleAll = () => setSel(p => {
+    const all = rows.length > 0 && rows.every(f => p.has(f.filename))
+    return all ? new Set() : new Set(rows.map(f => f.filename))
+  })
+  const allChecked = rows.length > 0 && rows.every(f => sel.has(f.filename))
+
+  // Batch Printed: POST /api/we/mark-printed {filename, operator, machine} per file.
+  // Server upsert idempoten — coba semua, rangkum hitungan ok/gagal via toast.
+  const doBatchPrinted = async () => {
+    if (!live) { pushToast('Hub offline — perintah tidak dikirim', 'warning'); return }
+    if (sel.size === 0) { pushToast('Pilih file dulu', 'warning'); return }
+    setBatchBusy('printed')
+    let ok = 0, gagal = 0
+    try {
+      for (const fn of sel) {
+        try {
+          const r = await fetch(`${base}/api/we/mark-printed`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...(authHdr() || {}) },
+            body: JSON.stringify({ filename: fn, operator: weOperator, machine: weMachine }),
+          })
+          const j = await r.json().catch(() => null)
+          if (r.ok && j && j.ok) ok++
+          else gagal++
+        } catch { gagal++ }
+      }
+      pushToast(gagal ? `${ok} printed, ${gagal} gagal` : `${ok} printed`, gagal ? 'danger' : 'success')
+      await weRefresh()
+    } finally {
+      setBatchBusy(null)
+    }
+  }
+
+  // Batch Verify: WS 'verify' 6-tuple per baris terpilih (jalur sama spt WMA);
+  // yg sudah VERIFIED dilewati (dihitung di toast).
+  const doBatchVerify = () => {
+    if (!live) { pushToast('Hub offline — perintah tidak dikirim', 'warning'); return }
+    if (sel.size === 0) { pushToast('Pilih file dulu', 'warning'); return }
+    setBatchBusy('verify')
+    try {
+      let kirim = 0, lewati = 0
+      for (const fn of sel) {
+        const f = byName.get(fn)
+        if (!f) { lewati++; continue }
+        if (verSet.has(weSkey(f))) { lewati++; continue }
+        const id = sendCommand('verify', { nota: f.nota ?? '', bahan: f.bahan ?? '', sides: f.sides ?? '', laminating: f.laminating ?? '', test: f.test ?? false, process_type: f.process_type ?? '' })
+        if (!id) { pushToast('Hub offline — perintah tidak dikirim', 'warning'); break }
+        pendingRef.current.add(id)
+        verifyFileRef.current.set(id, f.filename)
+        setActing(p => ({ ...p, [f.filename]: 'verify' }))
+        kirim++
+      }
+      pushToast(lewati ? `${kirim} verify dikirim, ${lewati} dilewati (sudah verified)` : `${kirim} verify dikirim`, 'accent')
+    } finally {
+      setBatchBusy(null)
+    }
+  }
+
+  // Batch Hapus: HANYA cabut tanda SEEN (DELETE /api/we/seen per file) — file di
+  // disk TETAP ada; rescan memunculkan lagi bila berkas masih di MONITORING.
+  // Dua-langkah inline spt pola baris; BUKAN /api/we/file (itu hapus disk, admin).
+  const doBatchUnsee = async () => {
+    if (!live) { pushToast('Hub offline — perintah tidak dikirim', 'warning'); return }
+    if (sel.size === 0) { pushToast('Pilih file dulu', 'warning'); return }
+    if (!confirmBatchHapus) { setConfirmBatchHapus(true); return }
+    setBatchBusy('hapus')
+    let ok = 0, gagal = 0
+    try {
+      for (const fn of sel) {
+        try {
+          const r = await fetch(`${base}/api/we/seen?name=${encodeURIComponent(fn)}`, {
+            method: 'DELETE',
+            headers: authHdr(),
+          })
+          const j = await r.json().catch(() => null)
+          if (r.ok && j && j.ok) ok++
+          else gagal++
+        } catch { gagal++ }
+      }
+      pushToast(gagal ? `${ok} dihapus tandanya, ${gagal} gagal` : `${ok} dihapus dari daftar — file di disk tetap ada`, gagal ? 'danger' : 'success')
+      setConfirmBatchHapus(false)
+      await weRefresh()
+    } finally {
+      setBatchBusy(null)
+    }
+  }
+
+  // Warna blok per status (tanpa pill/badge): Seen=Biru, Printed=Oren, Verified=Hijau.
+  const statusPal = (f: WeFile): { bg: string; bd: string; ver: boolean } => {
+    if (verSet.has(weSkey(f))) return { bg: 'var(--color-success-ghost)', bd: 'var(--color-success)', ver: true }
+    if (printedSet.has(f.filename)) return { bg: 'var(--color-warning-ghost)', bd: 'var(--color-warning)', ver: false }
+    return { bg: 'var(--color-accent-ghost)', bd: 'var(--color-accent)', ver: false }
+  }
+
+  // Baris file: klik DI MANA SAJA pada blok = pilih batch (checkbox hanya indikator).
+  // Warna blok menunjukkan status; yg dipilih ditandai ring + checkbox.
+  // Tanpa badge kertas/duplex/status, tanpa tombol aksi per-baris (via floating blok).
+  const weRow = (f: WeFile, i: number) => {
+    const pal = statusPal(f)
+    const checked = sel.has(f.filename)
+    const pm = printedMap.get(f.filename)
+    const mach = pm?.machine || f.machine || '—'
+    const opr = pm?.operator || f.operator || '—'
+    return (
+      <div key={f.filename} onClick={() => toggle(f.filename)}
+        className="animate-fade-rise rounded-lg px-3.5 py-2.5"
+        style={{ animationDelay: `${Math.min(i * 30, 300)}ms`, cursor: 'pointer', background: pal.bg, border: `1px solid ${pal.bd}`, boxShadow: checked ? `0 0 0 2px ${pal.bd}` : undefined, opacity: pal.ver ? 0.6 : 1 }}>
+        <div className="flex items-center gap-2 mb-1">
+          <input type="checkbox" checked={checked} onChange={() => toggle(f.filename)} onClick={e => e.stopPropagation()} title="Pilih baris ini" />
+          <span className="font-mono font-semibold truncate flex-1" title={f.filename}
+            style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent)' }}>{f.filename}</span>
+          <span className="font-mono shrink-0" title={f.first_seen_ts ? `Masuk: ${f.first_seen_ts}` : ''}
+            style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>
+            {(f.first_seen_ts || '').slice(11) || ''}
+          </span>
+          <span className="font-mono font-semibold shrink-0" title={f.nota || ''}
+            style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text)' }}>{f.nota || ''}</span>
+        </div>
+        {f.customer ? (
+          <div className="truncate mb-1" title={f.customer}
+            style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>
+            {f.customer}
+          </div>
+        ) : null}
+        <div className="flex items-center gap-2" style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>
+          <span>Mesin: <span className="font-semibold" style={{ color: 'var(--color-text-secondary)' }}>{mach}</span></span>
+          <span>•</span>
+          <span>Operator: <span className="font-semibold" style={{ color: 'var(--color-text-secondary)' }}>{opr}</span></span>
+        </div>
+      </div>
+    )
+  }
+
+  if (!live && weSeen.length === 0 && wePrinted.length === 0) {
+    return (
+      <EmptyState
+        icon="eye"
+        title="Hub Offline"
+        description="Hubungkan ke hub untuk data WE live"
+      />
+    )
+  }
+
+  const now = new Date()
+  const tgl = `${now.getDate()} ${WE_MON[now.getMonth()]} ${now.getFullYear()} (${WE_DAY[now.getDay()]})`
+  const isWait = !weAuto || weAuto.mode === 'wait'
+  const pill = isWait
+    ? { label: 'MENUNGGU folder', status: 'muted' as StatusLevel }
+    : isManual
+      ? { label: 'MANUAL override', status: 'warning' as StatusLevel }
+      : { label: `AUTO ${tgl}`, status: 'success' as StatusLevel }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="card px-5 py-4">
+        <SectionHeader label="Monitoring WE"
+          action={
+            <div className="flex items-center gap-1.5">
+              <button className="btn btn-ghost btn-sm" title="Muat ulang state WE" onClick={doManualRefresh} disabled={refreshing}>
+                <Icon name="refresh" size={13} /> {refreshing ? 'Memuat…' : 'Refresh'}
+              </button>
+              {isAdmin && (
+                <>
+                  <button className="btn btn-secondary btn-sm" title="Pindai ulang folder MONITORING" onClick={doRescan} disabled={busy || !live}>
+                    <Icon name="refresh" size={13} /> Rescan
+                  </button>
+                  <button className="btn btn-secondary btn-sm" title="Ganti mode auto/manual" onClick={doToggleAuto} disabled={busy || !live}>
+                    {isManual ? 'Ke AUTO' : 'Ke MANUAL'}
+                  </button>
+                </>
+              )}
+            </div>
+          }
+        />
+        <div className="flex items-center gap-2.5 flex-wrap">
+          <span className="font-mono truncate flex-1" title={weAuto?.monitoring || ''}
+            style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', minWidth: 160 }}>
+            {weAuto?.monitoring || 'Belum ada folder MONITORING'}
+          </span>
+          <Badge label={pill.label} status={pill.status} />
+        </div>
+      </div>
+      <div className="card p-4 flex flex-col gap-2.5">
+        <div className="flex items-center gap-2">
+          <StatusDot status="accent" live={live} />
+          <span className="section-label">SEEN</span>
+          <span className="rounded-full px-1.5 font-bold" style={{ background: 'var(--color-border)', fontSize: 10 }}>{q ? `${rows.length}/${weSeen.length}` : pendingCount}</span>
+        </div>
+        <div style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>Menunggu cetak — terbaru dulu (waktu masuk) • {wePrinted.length} printed dari {weSeen.length} terlihat{weUpdatedAt ? ` • data ${new Date(weUpdatedAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : ''}</div>
+        <div className="relative">
+          <Icon name="search" size={13} style={{ color: 'var(--color-text-muted)', position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)' } as any} />
+          <input className="input" placeholder="Cari file / nota / pelanggan…" value={q} onChange={e => setQ(e.target.value)} style={{ paddingLeft: 28, fontSize: 'var(--text-xs)' }} />
+        </div>
+        <div className="flex flex-col gap-2 overflow-y-auto" style={{ maxHeight: 460 }}>
+          {rows.length > 0 && (
+            <label className="flex items-center gap-2 rounded-lg px-2.5 py-2 cursor-pointer"
+              style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', background: 'var(--color-bg)', border: '1px solid var(--color-border)' }}>
+              <input type="checkbox" checked={allChecked} onChange={toggleAll} />
+              Pilih semua
+              <span className="rounded-full font-mono font-semibold shrink-0" style={{ background: 'var(--color-border)', color: 'var(--color-text-secondary)', fontSize: 10, padding: '1px 8px' }}>{sel.size}/{rows.length}</span>
+            </label>
+          )}
+          {rows.length === 0 && (
+            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-dim)' }}>{q ? `Tidak ada hasil untuk "${q}"` : (live ? 'Belum ada file terlihat' : 'Menunggu hub…')}</div>
+          )}
+          {rows.map((f, i) => weRow(f, i))}
+        </div>
+      </div>
+      {sel.size > 0 && typeof document !== 'undefined' && createPortal(
+        // Portal ke body: ancestor halaman ber-animasi (transform) membuat
+        // position:fixed relatif ke konten + animation-fill menimpa translateX.
+        // Div luar (tanpa animasi) pegang centering; div dalam yg beranimasi.
+        <div style={{ position: 'fixed', left: '50%', transform: 'translateX(-50%)', bottom: 16, zIndex: 9000, maxWidth: 'calc(100vw - 32px)' }}>
+        <div className="card animate-fade-rise" style={{ boxShadow: '0 12px 32px rgba(0,0,0,0.45)' }}>
+          <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-2" style={{ padding: '12px 16px' }}>
+            <div className="flex items-center gap-2">
+              <span className="rounded-full font-semibold shrink-0" style={{ background: 'var(--color-accent-ghost)', color: 'var(--color-accent)', fontSize: 'var(--text-xs)', padding: '3px 10px' }}>{sel.size} dipilih</span>
+              <button className="btn btn-ghost btn-sm" title="Batalkan pilihan" onClick={clearSel}>
+                <Icon name="x" size={13} />
+              </button>
+            </div>
+            <span style={{ width: 1, alignSelf: 'stretch', background: 'var(--color-border)' }} />
+            <div className="flex items-center gap-2 flex-wrap justify-center">
+              <button className="btn btn-primary btn-sm" disabled={!live || !!batchBusy} onClick={doBatchPrinted}>
+                <Icon name="printer" size={13} /> {batchBusy === 'printed' ? 'Memproses…' : 'Printed'}
+              </button>
+              <button className="btn btn-secondary btn-sm" disabled={!live || !!batchBusy} onClick={doBatchVerify}>
+                <Icon name="check" size={13} /> {batchBusy === 'verify' ? 'Memproses…' : 'Verify'}
+              </button>
+              {confirmBatchHapus ? (
+                <>
+                  <button className="btn btn-danger btn-sm" disabled={!live || !!batchBusy} title="Hapus dari daftar? File di disk tetap ada." onClick={doBatchUnsee}>
+                    {batchBusy === 'hapus' ? 'Memproses…' : 'Hapus tandanya?'}
+                  </button>
+                  <button className="btn btn-ghost btn-sm" disabled={!!batchBusy} onClick={() => setConfirmBatchHapus(false)}>
+                    Batal
+                  </button>
+                </>
+              ) : (
+                <button className="btn btn-ghost btn-sm" disabled={!live || !!batchBusy} title="Hanya hapus tanda SEEN — file di disk tetap ada" onClick={() => setConfirmBatchHapus(true)} style={{ color: 'var(--color-danger)' }}>
+                  Hapus
+                </button>
+              )}
+              <button className="btn btn-ghost btn-sm" title="Kembali ke Seen (batalkan pilihan, baris tetap)" onClick={clearSel}>
+                Batal
+              </button>
+            </div>
+            <span style={{ width: 1, alignSelf: 'stretch', background: 'var(--color-border)' }} />
+            <div className="flex items-center gap-2">
+              <select className="input" value={weMachine} onChange={e => pickWeMachine(e.target.value)} title="Mesin" style={{ fontSize: 'var(--text-xs)', padding: '6px 8px' }}>
+                {['Develop 1', 'Develop 2', 'RICOH'].map(m => <option key={m} value={m}>{m}</option>)}
+              </select>
+              <select className="input" value={weOperator} onChange={e => pickWeOperator(e.target.value)} title="Operator" style={{ fontSize: 'var(--text-xs)', padding: '6px 8px' }}>
+                <option value="">—</option>
+                {['Nanas', 'Eric', 'Rahmadi'].map(o => <option key={o} value={o}>{o}</option>)}
+              </select>
+            </div>
+          </div>
+        </div>
+        </div>,
+        document.body
+      )}
     </div>
   )
 }
@@ -1219,7 +1947,7 @@ function kmmaStepsHeuristic(e: WmaEntry, st?: NotaStatus): Step[] {
   return steps
 }
 
-const PageKmma = ({ entries, statuses, details, live, sendCommand, results, timer }: {
+const PageKmma = ({ entries, statuses, details, live, sendCommand, results, timer, verified = [] }: {
   entries: WmaEntry[]
   statuses: Record<string, NotaStatus>
   details: Record<string, HubStep[]>
@@ -1227,10 +1955,16 @@ const PageKmma = ({ entries, statuses, details, live, sendCommand, results, time
   sendCommand: (action: string, opts?: SendCommandOpts) => string | null
   results: CommandResult[]
   timer: KmmaTimer | null
+  verified?: string[]
 }) => {
-  const notas = [...new Set(entries.map(e => e.nota))]
-  const [openNota, setOpenNota]   = useState<string | null>(null)
+  // Sembunyikan baris terverifikasi spt WMA (tetap hidup di WMA Selesai)
+  const isVerified = (e: WmaEntry) => verified.includes(rkey(e))
+  const visibleEntries = entries.filter(e => !isVerified(e))
+  const rowKeys = visibleEntries.map(rkey)
+  const [openRow, setOpenRow]       = useState<string | null>(null)
   const [overrides, setOverrides] = useState<Record<string, number>>({})
+  // Lipatan seksi Menunggu Aksi saja — independen dari openRow per-baris
+  const [tungguOpen, setTungguOpen] = useState<boolean | null>(null)
   const pendingRef = useRef<Set<string>>(new Set())
 
   // Timer cycle: detik berjalan lokal, sinkron ulang tiap laporan KMMA (5 dtk)
@@ -1252,30 +1986,31 @@ const PageKmma = ({ entries, statuses, details, live, sendCommand, results, time
   const pct = timer && timer.interval > 0 && remain !== null
     ? Math.min(100, Math.max(0, (remain / timer.interval) * 100)) : 0
 
-  const open = openNota && notas.includes(openNota) ? openNota : (notas[0] ?? null)
+  const open = openRow && rowKeys.includes(openRow) ? openRow : (rowKeys[0] ?? null)
 
-  const racks = notas.map(n => {
-    const rows = entries.filter(e => e.nota === n)
-    const first = rows[0]
-    const rowSts = rows.map(r => stOf(statuses, r)).filter(Boolean) as NotaStatus[]
-    const pick = rowSts.find(s => s.status === 'manual')
-      ?? rowSts.find(s => s.status === 'error')
-      ?? (rowSts.length === rows.length && rowSts.length > 0 && rowSts.every(s => s.status === 'ok')
-        ? { status: 'ok', msg: '', ts: '' } as NotaStatus
-        : undefined)
-    const stName = pick?.status
-    const real = details[n]
+  const racks = visibleEntries.map(row => {
+    const st = stOf(statuses, row)
+    const stName = st?.status
+    const rk = rkey(row)
+    const real = details[rk] ?? details[row.nota]
     return {
-      nota: n,
-      customer: rows.map(r => r.customer).find(Boolean) || '—',
-      bahan: [...new Set(rows.map(r => r.bahan ?? '-'))].join(', '),
-      qty: rows.reduce((a, r) => a + (r.total_qty ?? 0), 0),
-      operator: rows.map(r => r.operator).find(Boolean) || '—',
+      key: rk,
+      nota: row.nota,
+      customer: row.customer || '—',
+      bahan: row.bahan ?? '-',
+      qty: row.total_qty ?? 0,
+      operator: row.operator || '—',
       status: (stName === 'ok' ? 'success' : stName === 'manual' ? 'warning' : stName === 'error' ? 'danger' : 'accent') as StatusLevel,
       statusLabel: stName === 'ok' ? 'SELESAI' : stName === 'manual' ? 'MANUAL' : stName === 'error' ? 'ERROR' : 'ANTRI',
-      steps: real?.length ? real.map(kmmaStepFromHub) : kmmaStepsHeuristic(first, pick),
+      steps: real?.length ? real.map(kmmaStepFromHub) : kmmaStepsHeuristic(row, st),
     }
   })
+
+  // Kelompok visual: Aktif (ANTRI) selalu bentang; Menunggu Aksi (MANUAL/ERROR/sisa SELESAI) bisa dilipat
+  const aktif = racks.filter(r => r.statusLabel === 'ANTRI')
+  const menunggu = racks.filter(r => r.statusLabel !== 'ANTRI')
+  // Bawaan lipat bila ramai (>5), bentang bila sepi — pilihan pengguna menang
+  const menungguOpen = tungguOpen ?? (menunggu.length <= 5)
 
   useEffect(() => {
     for (const r of results ?? []) {
@@ -1299,6 +2034,155 @@ const PageKmma = ({ entries, statuses, details, live, sendCommand, results, time
     }
     pendingRef.current.add(id)
     pushToast(`Perintah dikirim: ${action} ${nota}${qty ? ` (qty ${qty})` : ''}`, 'accent')
+  }
+
+  // Kartu rak tunggal — dipakai ulang seksi Aktif + Menunggu Aksi (logika buka/tombol sama)
+  const rackCard = (r: (typeof racks)[number]) => {
+    const isOpen = open === r.key
+    return (
+    <div key={r.key} className="card overflow-hidden">
+      {/* Rak nota: Pelanggan | NOTA | Bahan | qty | Operator */}
+      <button onClick={() => setOpenRow(isOpen ? null : r.key)}
+        className="w-full text-left cursor-pointer transition-colors hover:bg-white/[0.02]">
+        <div className="flex items-center gap-x-5 gap-y-2 flex-wrap px-5 py-3.5">
+          <div className="min-w-0" style={{ flex: '2 1 180px' }}>
+            <div className="section-label mb-0.5">Pelanggan</div>
+            <div className="font-bold truncate" title={r.customer}
+              style={{ fontSize: 'var(--text-base)', color: 'var(--color-text)' }}>{r.customer}</div>
+          </div>
+          <div className="min-w-0" style={{ flex: '1 1 150px' }}>
+            <div className="section-label mb-0.5">Nota</div>
+            <div className="font-mono font-semibold truncate"
+              style={{ fontSize: 'var(--text-sm)', color: 'var(--color-accent)' }}>{r.nota}</div>
+          </div>
+          <div className="min-w-0" style={{ flex: '1 1 150px' }}>
+            <div className="section-label mb-0.5">Bahan</div>
+            <div className="truncate" title={r.bahan}
+              style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>{r.bahan}</div>
+          </div>
+          <div>
+            <div className="section-label mb-0.5">Qty</div>
+            <div className="font-mono font-semibold" style={{ fontSize: 'var(--text-sm)' }}>{r.qty.toLocaleString()}</div>
+          </div>
+          <div>
+            <div className="section-label mb-0.5">Operator</div>
+            <div style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>{r.operator}</div>
+          </div>
+          <div className="ml-auto flex items-center gap-2.5 shrink-0">
+            <Badge label={r.statusLabel} status={r.status} />
+            <Icon name="chevronDown" size={16}
+              style={{ color: 'var(--color-text-muted)', transform: isOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.2s' } as any} />
+          </div>
+        </div>
+      </button>
+
+      {/* Dropdown: Alur Produksi */}
+      {isOpen && (
+      <div className="px-6 py-5" style={{ borderTop: '1px solid var(--color-border)' }}>
+        <SectionHeader label="Alur Produksi" action={
+          r.statusLabel === 'MANUAL' ? (
+            <button className="btn btn-secondary btn-sm" onClick={() => doCommand(r.nota, 'skip')}>
+              <Icon name="skip" size={13} /> Lewati Permanen
+            </button>
+          ) : undefined
+        } />
+        <div className="flex flex-col">
+          {r.steps.map((step, i) => {
+            const isLast = i === r.steps.length - 1
+            const pct = step.status === 'done' ? '100%' : step.status === 'active' ? '50%' : '0%'
+            const key = `${r.key}-${i}`
+            const qty = overrides[key] ?? step.qty
+
+        return (
+          <div key={i} className="flex gap-4">
+            {/* Connector column */}
+            <div className="flex flex-col items-center shrink-0">
+              <StepDot s={step.status} />
+              {!isLast && (
+                <div className="timeline-connector flex-1" style={{ minHeight: 48 }}>
+                  <div className="timeline-connector-fill" style={{ height: pct }} />
+                </div>
+              )}
+            </div>
+
+            {/* Step content */}
+            <div className="flex-1 pb-5 last:pb-0 -mt-0.5">
+              <div className="flex items-center gap-2.5 mb-2">
+                <span className="font-bold" style={{
+                  fontSize: 'var(--text-md)',
+                  color: step.status === 'pending' ? 'var(--color-text-muted)' : 'var(--color-text)',
+                }}>{step.name}</span>
+                {step.status === 'active' && (
+                  <span className="rounded-full font-bold"
+                    style={{ fontSize: 10, background: 'var(--color-accent-ghost)', color: 'var(--color-accent)', padding: '2px 7px' }}>
+                    SEDANG BERJALAN
+                  </span>
+                )}
+              </div>
+
+              {/* Warning / error banner */}
+              {step.warn && (
+                <div className="flex items-start gap-2 rounded-lg px-3 py-2 mb-2"
+                  style={{
+                    background: step.status === 'error' ? 'var(--color-danger-ghost)' : 'var(--color-warning-ghost)',
+                    border: `1px solid ${step.status === 'error' ? 'var(--color-danger)' : 'var(--color-warning)'}30`,
+                    fontSize: 'var(--text-xs)',
+                    color: step.status === 'error' ? 'var(--color-danger-fg)' : 'var(--color-warning-fg)',
+                  }}>
+                  <Icon name="alertTriangle" size={14} className="shrink-0 mt-0.5" />
+                  {step.warn}
+                </div>
+              )}
+
+              {/* Meta grid */}
+              <div className="grid grid-cols-4 gap-2 rounded-lg px-3.5 py-2.5 four-col" style={{ background: 'var(--color-bg)' }}>
+                {[['Mesin', step.machine], ['Material', step.material], ['SDM', step.sdm]].map(([k, v]) => (
+                  <div key={k as string}>
+                    <div className="section-label mb-0.5">{k}</div>
+                    <div style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>{String(v)}</div>
+                  </div>
+                ))}
+                <div>
+                  <div className="section-label mb-0.5">Qty</div>
+                  {step.status === 'pending' ? (
+                    <div className="flex items-center gap-1.5">
+                      <input className="input font-mono" type="number" value={qty}
+                        onChange={e => setOverrides(p => ({ ...p, [key]: +e.target.value }))}
+                        style={{ width: 80, padding: '4px 8px', fontSize: 'var(--text-xs)' }} />
+                        <button className="btn btn-ghost btn-sm"
+                          onClick={() => doCommand(r.nota, 'retry', String(qty))}>
+                          <Icon name="save" size={13} />
+                        </button>
+                    </div>
+                  ) : (
+                    <span className="font-mono font-semibold" style={{ fontSize: 'var(--text-sm)' }}>
+                      {step.qty.toLocaleString()}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {(step.status === 'active' || step.status === 'error') && (
+                <div className="flex gap-2 mt-2.5">
+                  <button className="btn btn-success btn-sm"
+                    onClick={() => doCommand(r.nota, 'retry')}>
+                    <Icon name="refresh" size={13} /> Simpan Ulang
+                  </button>
+                  <button className="btn btn-secondary btn-sm"
+                    onClick={() => doCommand(r.nota, 'skip')}>
+                    <Icon name="skip" size={13} /> Lewati Permanen
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        )
+      })}
+      </div>
+      </div>
+      )}
+    </div>
+    )
   }
 
   if (!live) {
@@ -1336,153 +2220,35 @@ const PageKmma = ({ entries, statuses, details, live, sendCommand, results, time
           {timerStale ? 'menunggu KMMA…' : 'proses ulang tiap 3 menit'}
         </span>
       </div>
-      {racks.map(r => {
-        const isOpen = open === r.nota
-        return (
-        <div key={r.nota} className="card overflow-hidden">
-          {/* Rak nota: Pelanggan | NOTA | Bahan | qty | Operator */}
-          <button onClick={() => setOpenNota(isOpen ? null : r.nota)}
-            className="w-full text-left cursor-pointer transition-colors hover:bg-white/[0.02]">
-            <div className="flex items-center gap-x-5 gap-y-2 flex-wrap px-5 py-3.5">
-              <div className="min-w-0" style={{ flex: '2 1 180px' }}>
-                <div className="section-label mb-0.5">Pelanggan</div>
-                <div className="font-bold truncate" title={r.customer}
-                  style={{ fontSize: 'var(--text-base)', color: 'var(--color-text)' }}>{r.customer}</div>
-              </div>
-              <div className="min-w-0" style={{ flex: '1 1 150px' }}>
-                <div className="section-label mb-0.5">Nota</div>
-                <div className="font-mono font-semibold truncate"
-                  style={{ fontSize: 'var(--text-sm)', color: 'var(--color-accent)' }}>{r.nota}</div>
-              </div>
-              <div className="min-w-0" style={{ flex: '1 1 150px' }}>
-                <div className="section-label mb-0.5">Bahan</div>
-                <div className="truncate" title={r.bahan}
-                  style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>{r.bahan}</div>
-              </div>
-              <div>
-                <div className="section-label mb-0.5">Qty</div>
-                <div className="font-mono font-semibold" style={{ fontSize: 'var(--text-sm)' }}>{r.qty.toLocaleString()}</div>
-              </div>
-              <div>
-                <div className="section-label mb-0.5">Operator</div>
-                <div style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>{r.operator}</div>
-              </div>
-              <div className="ml-auto flex items-center gap-2.5 shrink-0">
-                <Badge label={r.statusLabel} status={r.status} />
-                <Icon name="chevronDown" size={16}
-                  style={{ color: 'var(--color-text-muted)', transform: isOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.2s' } as any} />
-              </div>
-            </div>
-          </button>
-
-          {/* Dropdown: Alur Produksi */}
-          {isOpen && (
-          <div className="px-6 py-5" style={{ borderTop: '1px solid var(--color-border)' }}>
-            <SectionHeader label="Alur Produksi" action={
-              r.statusLabel === 'MANUAL' ? (
-                <button className="btn btn-secondary btn-sm" onClick={() => doCommand(r.nota, 'skip')}>
-                  <Icon name="skip" size={13} /> Lewati Permanen
-                </button>
-              ) : undefined
-            } />
-            <div className="flex flex-col">
-              {r.steps.map((step, i) => {
-                const isLast = i === r.steps.length - 1
-                const pct = step.status === 'done' ? '100%' : step.status === 'active' ? '50%' : '0%'
-                const key = `${r.nota}-${i}`
-                const qty = overrides[key] ?? step.qty
-
-            return (
-              <div key={i} className="flex gap-4">
-                {/* Connector column */}
-                <div className="flex flex-col items-center shrink-0">
-                  <StepDot s={step.status} />
-                  {!isLast && (
-                    <div className="timeline-connector flex-1" style={{ minHeight: 48 }}>
-                      <div className="timeline-connector-fill" style={{ height: pct }} />
-                    </div>
-                  )}
-                </div>
-
-                {/* Step content */}
-                <div className="flex-1 pb-5 last:pb-0 -mt-0.5">
-                  <div className="flex items-center gap-2.5 mb-2">
-                    <span className="font-bold" style={{
-                      fontSize: 'var(--text-md)',
-                      color: step.status === 'pending' ? 'var(--color-text-muted)' : 'var(--color-text)',
-                    }}>{step.name}</span>
-                    {step.status === 'active' && (
-                      <span className="rounded-full font-bold"
-                        style={{ fontSize: 10, background: 'var(--color-accent-ghost)', color: 'var(--color-accent)', padding: '2px 7px' }}>
-                        SEDANG BERJALAN
-                      </span>
-                    )}
-                  </div>
-
-                  {/* Warning / error banner */}
-                  {step.warn && (
-                    <div className="flex items-start gap-2 rounded-lg px-3 py-2 mb-2"
-                      style={{
-                        background: step.status === 'error' ? 'var(--color-danger-ghost)' : 'var(--color-warning-ghost)',
-                        border: `1px solid ${step.status === 'error' ? 'var(--color-danger)' : 'var(--color-warning)'}30`,
-                        fontSize: 'var(--text-xs)',
-                        color: step.status === 'error' ? 'var(--color-danger-fg)' : 'var(--color-warning-fg)',
-                      }}>
-                      <Icon name="alertTriangle" size={14} className="shrink-0 mt-0.5" />
-                      {step.warn}
-                    </div>
-                  )}
-
-                  {/* Meta grid */}
-                  <div className="grid grid-cols-4 gap-2 rounded-lg px-3.5 py-2.5 four-col" style={{ background: 'var(--color-bg)' }}>
-                    {[['Mesin', step.machine], ['Material', step.material], ['SDM', step.sdm]].map(([k, v]) => (
-                      <div key={k as string}>
-                        <div className="section-label mb-0.5">{k}</div>
-                        <div style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>{String(v)}</div>
-                      </div>
-                    ))}
-                    <div>
-                      <div className="section-label mb-0.5">Qty</div>
-                      {step.status === 'pending' ? (
-                        <div className="flex items-center gap-1.5">
-                          <input className="input font-mono" type="number" value={qty}
-                            onChange={e => setOverrides(p => ({ ...p, [key]: +e.target.value }))}
-                            style={{ width: 80, padding: '4px 8px', fontSize: 'var(--text-xs)' }} />
-                            <button className="btn btn-ghost btn-sm"
-                              onClick={() => doCommand(r.nota, 'retry', String(qty))}>
-                              <Icon name="save" size={13} />
-                            </button>
-                        </div>
-                      ) : (
-                        <span className="font-mono font-semibold" style={{ fontSize: 'var(--text-sm)' }}>
-                          {step.qty.toLocaleString()}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-
-                  {(step.status === 'active' || step.status === 'error') && (
-                    <div className="flex gap-2 mt-2.5">
-                      <button className="btn btn-success btn-sm"
-                        onClick={() => doCommand(r.nota, 'retry')}>
-                        <Icon name="refresh" size={13} /> Simpan Ulang
-                      </button>
-                      <button className="btn btn-secondary btn-sm"
-                        onClick={() => doCommand(r.nota, 'skip')}>
-                        <Icon name="skip" size={13} /> Lewati Permanen
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )
-          })}
-          </div>
-          </div>
-          )}
+      {/* Seksi Aktif — antrean berjalan, selalu bentang */}
+      <div className="flex flex-col gap-2.5">
+        <div className="flex items-center gap-2 px-1">
+          <StatusDot status="accent" live={live} />
+          <span className="section-label">Aktif</span>
+          <span className="rounded-full px-1.5 font-bold" style={{ background: 'var(--color-border)', fontSize: 10 }}>{aktif.length}</span>
         </div>
-        )
-      })}
+        {aktif.length === 0 && (
+          <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-dim)' }}>tidak ada antrean aktif</div>
+        )}
+        {aktif.map(rackCard)}
+      </div>
+      {/* Seksi Menunggu Aksi — perlu campur tangan, bisa dilipat */}
+      <div className="flex flex-col gap-2.5">
+        <button onClick={() => setTungguOpen(o => !(o ?? (menunggu.length <= 5)))}
+          className="flex items-center gap-2 px-1 w-full text-left cursor-pointer">
+          <StatusDot status="warning" live={live} />
+          <span className="section-label">Menunggu Aksi</span>
+          <span className="rounded-full px-1.5 font-bold" style={{ background: 'var(--color-border)', fontSize: 10 }}>{menunggu.length}</span>
+          <span className="ml-auto flex items-center" style={{ color: 'var(--color-text-muted)' }}>
+            <Icon name="chevronDown" size={16}
+              style={{ transform: menungguOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.2s' } as any} />
+          </span>
+        </button>
+        {menungguOpen && menunggu.length === 0 && (
+          <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-dim)' }}>tidak ada yang menunggu aksi</div>
+        )}
+        {menungguOpen && menunggu.map(rackCard)}
+      </div>
     </div>
   )
 }
@@ -2500,11 +3266,12 @@ export default function App() {
         {/* Page content */}
         <main className="flex-1 overflow-y-auto page-content" style={{ padding: 'var(--spacing-page)' }}>
           <div key={page} className="animate-fade-rise" style={{ minHeight: '100%' }}>
-            {page === 'ringkasan'  && <PageRingkasan connected={connected} logs={hub.logs} entriesAll={hub.entriesAll} statuses={hub.statuses} modules={hub.modules} live={connected} sendCommand={hub.sendCommand} results={hub.results} kmaRoutes={hub.kma.routes} />}
+            {page === 'ringkasan'  && <PageRingkasan connected={connected} logs={hub.logs} entriesAll={hub.entriesAll} entries={hub.entries} statuses={hub.statuses} verified={hub.verified} modules={hub.modules} live={connected} sendCommand={hub.sendCommand} results={hub.results} kmaRoutes={hub.kma.routes} weSeen={hub.weSeen} wePrinted={hub.wePrinted} weVerified={hub.weVerified} weAuto={hub.weAuto} outputFiles={hub.outputFiles} onGo={(p) => setPage(p)} />}
             {page === 'nshlite'   && <PageNshLite connected={connected} sendCommand={hub.sendCommand} results={hub.results} outputFiles={hub.outputFiles} />}
             {page === 'kma'       && <PageKma connected={connected} routes={hub.kma.routes} printers={hub.kma.printers} rules={hub.kma.rules} stats={hub.kma.stats} sendCommand={hub.sendCommand} results={hub.results} />}
+            {page === 'we'        && <PageWe live={connected} sendCommand={hub.sendCommand} results={hub.results} weSeen={hub.weSeen} wePrinted={hub.wePrinted} weVerified={hub.weVerified} weAuto={hub.weAuto} hubUrl={hubUrl} weRefresh={hub.weRefresh} />}
             {page === 'wma'       && <PageWma entriesAll={hub.entriesAll} statuses={hub.statuses} verified={hub.verified} live={connected} sendCommand={hub.sendCommand} results={hub.results} />}
-            {page === 'kmma'      && <PageKmma entries={hub.entries} statuses={hub.statuses} details={hub.details} live={connected} sendCommand={hub.sendCommand} results={hub.results} timer={hub.kmmaTimer} />}
+            {page === 'kmma'      && <PageKmma entries={hub.entries} statuses={hub.statuses} details={hub.details} verified={hub.verified} live={connected} sendCommand={hub.sendCommand} results={hub.results} timer={hub.kmmaTimer} />}
             {page === 'log'       && <PageLog logs={hub.logs} live={connected} />}
             {page === 'pengaturan'&& <PagePengaturan hubUrl={hubUrl} logCap={logCap} onApply={applySettings} />}
             {page === 'database'  && <PageDatabase hubUrl={hubUrl} />}
