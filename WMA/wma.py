@@ -130,13 +130,13 @@ def _build_r_bahan_wma():
     if _CANONICAL_WMA:
         canon_terms = sorted({k for k in _CANONICAL_WMA.keys()}, key=len, reverse=True)
         canon_pat = "|".join(re.escape(t) for t in canon_terms)
-        typo_extra = r"Krom[oe]|Crom[oe]|Chromo|Vinyl|Vyinil|Vynil|Rajawali|Pindo|Jasmine|Ivory|Transparant|Hologram|Gold|Silver"
+        typo_extra = r"Krom[oe]|Crom[oe]|Chromo|Vinyl|Vyinil|Vynil|Rajawali|Pindo|Jasmine|Ivory|Transpar[ae]nt|Transparan|Hologram|Gold|Silver"
         return re.compile(rf"({extra}|(?:Kertas\s+)?(?:{typo_extra})|{canon_pat})", re.I)
     return re.compile(
         r"(Ap\d+gr|Ac\d+gr|(?:Stiker|Sticker)\s+\w+|HVS|Concord|BC\s+\w+|Master|BNTU"
         r"|NewToop\s*\d+\s*mic|Toop\s*\d+\s*mic|Art\s*Paper|Art\s*Carton|ArtPaper|ArtCarton"
         r"|(?:Kertas\s+)?[KC]rom[oe]"
-        r"|Vinyl|Vyinil|Rajawali|Pindo|Jasmine|Ivory|Transparant|Hologram|Gold|Silver)",
+        r"|Vinyl|Vyinil|Rajawali|Pindo|Jasmine|Ivory|Transpar[ae]nt|Transparan|Hologram|Gold|Silver)",
         re.I,
     )
 
@@ -962,8 +962,12 @@ def main():
                     ts_now = datetime.datetime.now().strftime("%H:%M:%S")
                     print(f"  {err(f'[{ts_now}] sumber: GAGAL-skip ({_API_LAST_ERR}) — tunggu pemicu/timeout...')}")
                     continue
-                # hash mencakup status (perubahan status tanpa file baru WAJIB sync)
-                current_hash = json.dumps([(r.get("filename", ""), r.get("status", "")) for r in rows], sort_keys=True)
+                # hash mencakup status + operator + mesin (perubahan metadata
+                # TANPA file baru — mis. tandai Printed di WE — WAJIB sync;
+                # dulu hanya filename+status sehingga ganti operator tak terdeteksi)
+                current_hash = json.dumps([(r.get("filename", ""), r.get("status", ""),
+                                            r.get("operator", ""), r.get("machine_name", ""))
+                                           for r in rows], sort_keys=True)
 
                 if current_hash != last_hash:
                     last_hash = current_hash

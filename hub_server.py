@@ -722,7 +722,7 @@ _WE_R_BAHAN = re.compile(
     r"(Ap\d+gr|Ac\d+gr|(?:Stiker|Sticker)\s+\w+|HVS|Concord|BC\s+\w+|Master|BNTU"
     r"|NewToop\s*\d*\s*mic|Toop\s*\d*\s*mic|Art\s*Paper|Art\s*Carton|ArtPaper|ArtCarton"
     r"|(?:Kertas\s+)?[KC]rom[oe]|Vinyl|Vyinil|Vynil|Rajawali|Pindo|Jasmine|Ivory"
-    r"|Transparant|Hologram|Gold|Silver)", re.I)
+    r"|Transpar[ae]nt|Transparan|Hologram|Gold|Silver)", re.I)
 
 
 def _we_norm_date(v=None):
@@ -1598,9 +1598,43 @@ def _we_scan_once(today=None, year_root=None):
                 continue
     except Exception:
         pass
+    # Anti-churn: jangan tulis ulang baris yg tak menambah info. Tanpa ini,
+    # tiap tick menandai ulang semua printed dgn printed_ts=now -> sig berubah
+    # -> we_update + fetch WMA tiap 5 dtk selamanya (spam + log 'no changes').
+    # Dilewati bila: sudah ada + output sama + operator/mesin baru kosong atau
+    # sama (nilai kosong/placeholder tak pernah menimpa, cermin aturan DB).
     try:
         if db is not None and printed_rows:
-            db.we_printed_mark(iso, printed_rows)
+            try:
+                _old_pm = {}
+                for _r in (we_cache.get("printed") or []):
+                    try:
+                        _fn0 = ((_r or {}).get("filename") or "").strip()
+                        if _fn0:
+                            _old_pm[_fn0] = _r
+                    except Exception:
+                        continue
+                _fresh = []
+                for _n in printed_rows:
+                    try:
+                        _fn1 = ((_n or {}).get("filename") or "").strip()
+                        _o = _old_pm.get(_fn1) if _fn1 else None
+                        if _o is not None:
+                            _same_out = ((_o.get("output_name") or "") == (_n.get("output_name") or ""))
+                            _nop = (_n.get("operator") or "")
+                            _nmc = (_n.get("machine") or "")
+                            _same_op = (not _nop) or (_nop == (_o.get("operator") or ""))
+                            _same_mc = (not _nmc) or (_nmc in ("Impose", "Manual")) or (_nmc == (_o.get("machine") or ""))
+                            if _same_out and _same_op and _same_mc:
+                                continue
+                    except Exception:
+                        pass
+                    _fresh.append(_n)
+                printed_rows = _fresh
+            except Exception:
+                pass
+            if printed_rows:
+                db.we_printed_mark(iso, printed_rows)
     except Exception:
         pass
     _we_refresh_cache(iso, db)

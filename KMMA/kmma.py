@@ -119,13 +119,13 @@ def _build_r_bahan():
         # canonical sudah cover vinyl/vyinil via TYPO_MAP, tapi regex harus tangkap ambos
         canon_pat = "|".join(re.escape(t) for t in canon_terms)
         # tambah varian typo yang ada di TYPO_MAP: cromo/vyinil dkk agar regex tetap tangkap raw mentah
-        typo_extra = r"Krom[oe]|Crom[oe]|Chromo|Vinyl|Vyinil|Vynil|Rajawali|Pindo|Jasmine|Ivory|Transparant|Hologram|Gold|Silver"
+        typo_extra = r"Krom[oe]|Crom[oe]|Chromo|Vinyl|Vyinil|Vynil|Rajawali|Pindo|Jasmine|Ivory|Transpar[ae]nt|Transparan|Hologram|Gold|Silver"
         return re.compile(rf"({extra}|(?:Kertas\s+)?(?:{typo_extra})|{canon_pat})", re.I)
     return re.compile(
         r"(Ap\d+gr|Ac\d+gr|(?:Stiker|Sticker)\s+\w+|HVS|Concord|BC\s+\w+|Master|BNTU"
         r"|NewToop\s*\d+\s*mic|Toop\s*\d+\s*mic|Art\s*Paper|Art\s*Carton|ArtPaper|ArtCarton"
         r"|(?:Kertas\s+)?[KC]rom[oe]"
-        r"|Vinyl|Vyinil|Rajawali|Pindo|Jasmine|Ivory|Transparant|Hologram|Gold|Silver)",
+        r"|Vinyl|Vyinil|Rajawali|Pindo|Jasmine|Ivory|Transpar[ae]nt|Transparan|Hologram|Gold|Silver)",
         re.I,
     )
 
@@ -352,10 +352,12 @@ def match_bahan(filename_bahan, km_material_name):
             return True
     # daftar bahan sinkron CANONICAL + typo ; urut panjang agar "stiker hvs" prioritas
     for name in ["stikerhvs", "stiker", "sticker", "concord", "concorde", "hvs", "idcard", "idcard", "newtoop", "toop",
-                  "artpaper", "artcarton", "kromo", "cromo", "chromo",
-                  "vinyl", "vyinil", "vynil", "vinil",
-                  "rajawali", "pindo", "jasmine", "ivory", "transparant", "hologram", "gold", "silver",
-                  "bc", "master", "bntu"]:
+                   "artpaper", "artcarton", "kromo", "cromo", "chromo",
+                   "vinyl", "vyinil", "vynil", "vinil",
+                   "rajawali", "pindo", "jasmine", "ivory",
+                   "transparant", "transparent", "transparan",
+                   "hologram", "gold", "silver",
+                   "bc", "master", "bntu"]:
         if name in fb:
             variants = {"stiker": "sticker", "sticker": "stiker",
                         "concorde": "concord", "concord": "concorde",
@@ -366,6 +368,10 @@ def match_bahan(filename_bahan, km_material_name):
             km_check = variants.get(name, name)
             if name in km or km_check in km:
                 return True
+            # keluarga transpar*: ejaan ID/EN/transparan semua setara
+            if name in ("transparant", "transparent", "transparan"):
+                if any(v in km for v in ("transparant", "transparent", "transparan")):
+                    return True
             # via CANONICAL normalisasi tambahan
             if _CANONICAL_KMMA:
                 try:
