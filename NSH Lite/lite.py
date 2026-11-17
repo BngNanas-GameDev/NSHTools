@@ -210,6 +210,10 @@ def process_one(fn, bridge, outdir, udadir):
             _log(Y, "[SKIP]", _short(name), f"-> {sk}")
             _SKIPPED.add(name)
         return False
+    # --- gate flag: file normal butuh auto_impose ON, kisscut butuh copy_kisscut ON.
+    # Keduanya independen: impose OFF tidak menghentikan copy kisscut (dan sebaliknya).
+    if not is_kc and not _AUTO_IMPOSE:
+        return False  # impose otomatis OFF: file normal dibiarkan di Input (diam, tanpa tandai)
     # --- cek ukuran halaman beda (lewati untuk kisscut: tak di-impose) ---
     ok_sizes, sizes = (True, "") if is_kc else _check_page_sizes(fn)
     if not ok_sizes:
@@ -232,10 +236,6 @@ def process_one(fn, bridge, outdir, udadir):
     first = _SEEN.get(str(Path(fn)).lower())
     if first and (_time.time() - first) < COOLDOWN_BEFORE:
         return False  # masih cooldown, skip tapi jangan log
-    # --- gate flag: file normal butuh auto_impose ON, kisscut butuh copy_kisscut ON.
-    # Keduanya independen: impose OFF tidak menghentikan copy kisscut (dan sebaliknya).
-    if not is_kc and not _AUTO_IMPOSE:
-        return False  # impose otomatis OFF: file normal dibiarkan di Input (diam, tanpa tandai)
     if is_kc:
         if not _COPY_KISSCUT:
             # copy kisscut/diecut OFF: biarkan file di INPUT (jangan copy,

@@ -363,11 +363,11 @@ const LiveClock = () => {
   const mm = now.getMinutes().toString().padStart(2,'0')
   const ss = now.getSeconds().toString().padStart(2,'0')
   return (
-    <div className="text-right">
-      <div className="font-mono font-semibold tracking-wider" style={{ fontSize: 'var(--text-md)', color: 'var(--color-text)' }}>
+    <div className="text-right" style={{ minWidth: 92, fontVariantNumeric: 'tabular-nums' }}>
+      <div className="font-mono font-semibold tracking-wider" style={{ fontSize: 'var(--text-md)', color: 'var(--color-text)', lineHeight: 1.25 }}>
         {hh}:{mm}:{ss}
       </div>
-      <div style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>
+      <div style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)', lineHeight: 1.3 }}>
         {DAY[now.getDay()]}, {now.getDate()} {MON[now.getMonth()]} {now.getFullYear()}
       </div>
     </div>
@@ -496,7 +496,7 @@ const PageRingkasan = ({ connected, logs, entriesAll, entries = [], statuses, ve
       : { label: `AUTO ${qaTgl}`, status: 'success' as StatusLevel }
   // 6 ubin — tanpa Database (ikuti filter sidebar ~3047: non-admin buang database)
   const qaTiles: { id: Page; icon: string; label: string; count: number; sub: string; color: string }[] = [
-    { id: 'nshlite', icon: 'layers', label: 'NSH Lite', count: qaLiteCount, sub: 'File OUTPUT', color: qaLiteCount > 0 ? 'var(--color-accent)' : 'var(--color-text-dim)' },
+    { id: 'nshlite', icon: 'layers', label: 'NSH Lite', count: qaLiteCount, sub: 'File output', color: qaLiteCount > 0 ? 'var(--color-accent)' : 'var(--color-text-dim)' },
     { id: 'kma', icon: 'router', label: 'KMA', count: qaKmaPending, sub: 'Menunggu routing', color: qaKmaPending > 0 ? 'var(--color-warning)' : 'var(--color-text-dim)' },
     { id: 'we', icon: 'eye', label: 'WisdomEye', count: qaWePending, sub: 'Menunggu cetak', color: qaWePending > 0 ? 'var(--color-accent)' : 'var(--color-text-dim)' },
     { id: 'wma', icon: 'workflow', label: 'WMA', count: qaWmaMid, sub: 'Menunggu aksi', color: qaWmaMid > 0 ? 'var(--color-warning)' : 'var(--color-text-dim)' },
@@ -520,12 +520,12 @@ const PageRingkasan = ({ connected, logs, entriesAll, entries = [], statuses, ve
       {/* Blok Akses Cepat: navigasi saja, tanpa aksi tulis */}
       <div className="card p-5">
         <SectionHeader label="Akses Cepat" action={
-          <div className="flex items-center gap-1.5 min-w-0">
+          <div className="flex items-center gap-2 min-w-0 justify-end">
             <span className="font-mono truncate" title={weAuto?.monitoring || ''}
-              style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', maxWidth: 220 }}>
+              style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', maxWidth: 'clamp(140px, 30vw, 320px)' }}>
               {weAuto?.monitoring || 'Belum ada folder MONITORING'}
             </span>
-            <Badge label={qaPill.label} status={qaPill.status} />
+            <span className="shrink-0 flex"><Badge label={qaPill.label} status={qaPill.status} /></span>
           </div>
         } />
         <div className="grid gap-3 modul-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
@@ -690,7 +690,7 @@ function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil 
       )}
       <div className="flex flex-col gap-3 px-5 py-4">
       <div style={{ fontSize: 'var(--text-label)', color: 'var(--color-text-muted)' }}>
-        {loading ? 'Memuat…' : `${files.length} file PDF di OUTPUT siap kirim`}
+        {loading ? 'Memuat…' : files.length === 0 ? 'Belum ada file hasil impose' : `${files.length} file PDF di OUTPUT siap kirim`}
       </div>
       <div className="flex flex-col gap-1.5 overflow-y-auto" style={{ maxHeight: 380 }}>
         {files.length > 0 && (
@@ -712,8 +712,9 @@ function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil 
           </label>
         ))}
         {files.length === 0 && !loading && (
-          <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-dim)' }}>
-            {connected ? 'Output kosong' : 'Hub offline'}
+          <div className="rounded-lg px-3 py-7 text-center"
+            style={{ background: 'var(--color-bg)', border: '1px dashed var(--color-border)', fontSize: 'var(--text-xs)', color: 'var(--color-text-dim)' }}>
+            {connected ? 'Output kosong — file hasil impose akan muncul di sini.' : 'Hub offline'}
           </div>
         )}
       </div>
@@ -748,11 +749,13 @@ function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil 
             </button>
           </div>
         </div>
-      ) : (
+      ) : files.length > 0 ? (
         // Petunjuk ramping saat belum ada pilihan agar layout tidak lompat
         <div style={{ fontSize: 10, color: 'var(--color-text-dim)', padding: '2px 0' }}>Pilih file untuk memindah batch…</div>
+      ) : null}
+      {files.length > 0 && (
+        <div style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>ke folder DEVELOP / RICOH (setelan KMA) • tercatat + Selesai di .54</div>
       )}
-      <div style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>ke folder DEVELOP / RICOH (setelan KMA) • tercatat + Selesai di .54</div>
       </div>
       {viewOpen && viewNames.length > 0 && (
         <ViewModal names={viewNames} idx={Math.min(viewIdx, viewNames.length - 1)}
@@ -1208,19 +1211,19 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
               const mCount = (st: string) => routes.filter(r => (r.machine ?? '') === (p.machine ?? '') && r.status === st).length
               return (
               <div key={i} className={`card card-accent-${lvl} px-4 py-3.5`}>
-                <div className="flex items-center justify-between mb-2">
-                  <div className="flex items-center gap-2">
+                <div className="flex items-center justify-between mb-2 gap-2">
+                  <div className="flex items-center gap-2 min-w-0 overflow-hidden">
                     <Icon name="printer" size={16} style={{ color: 'var(--color-text-secondary)' } as any} />
-                    <span className="font-bold font-mono" style={{ fontSize: 'var(--text-base)' }}>{p.ip}</span>
-                    <span className="section-label">{isRicoh ? 'WATCHER' : (p.machine || '')}</span>
+                    <span className="font-bold font-mono whitespace-nowrap" style={{ fontSize: 'var(--text-base)' }}>{p.ip}</span>
+                    <span className="section-label whitespace-nowrap truncate" style={{ maxWidth: 86 }}>{isRicoh ? 'WATCHER' : (p.machine || '')}</span>
                     {p.active && p.ip !== '192.168.10.158' && (
-                      <span className="rounded font-bold"
+                      <span className="rounded font-bold whitespace-nowrap shrink-0"
                         style={{ fontSize: 10, background: 'var(--color-success-ghost)', color: 'var(--color-success-fg)', padding: '2px 6px' }}>
                         AKTIF
                       </span>
                     )}
                   </div>
-                  <Badge label={ready ? 'SIAP' : unknown ? 'OFF' : 'MATI'} status={lvl} />
+                  <span className="shrink-0"><Badge label={ready ? 'SIAP' : unknown ? 'OFF' : 'MATI'} status={lvl} /></span>
                 </div>
                 <div className="flex gap-4">
                   {isRicoh ? (
@@ -1266,12 +1269,12 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
               )}
               {files.map((f) => (
                 <tr key={f.key}>
-                  <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent-fg)' }}>{f.file}</span></td>
+                  <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent-fg)', wordBreak: 'break-word' }}>{f.file}</span></td>
                   <td><CategoryBadge label={f.category} /></td>
-                  <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>→ {f.dest}</span></td>
-                  <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>{f.ts}</span></td>
-                  <td><Badge label={f.label} status={f.level} /></td>
-                  <td><span className="font-mono font-semibold" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent-fg)' }}>{f.machine ?? '—'}</span></td>
+                  <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>→ {f.dest}</span></td>
+                  <td><span className="font-mono" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>{f.ts}</span></td>
+                  <td style={{ whiteSpace: 'nowrap' }}><Badge label={f.label} status={f.level} /></td>
+                  <td><span className="font-mono font-semibold" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent-fg)', whiteSpace: 'nowrap' }}>{f.machine ?? '—'}</span></td>
                 </tr>
               ))}
             </tbody>
@@ -1538,6 +1541,8 @@ const PageWe = ({ live, sendCommand, results, weSeen = [], wePrinted = [], weVer
         } catch { gagal++ }
       }
       pushToast(gagal ? `${ok} dihapus tandanya, ${gagal} gagal` : `${ok} dihapus dari daftar — file di disk tetap ada`, gagal ? 'danger' : 'success')
+      // kosongkan pilihan: file sudah hilang dari daftar — jangan tinggalkan sisa seleksi
+      setSel(new Set())
       setConfirmBatchHapus(false)
       await weRefresh()
     } finally {
@@ -1564,7 +1569,7 @@ const PageWe = ({ live, sendCommand, results, weSeen = [], wePrinted = [], weVer
     return (
       <div key={f.filename} onClick={() => toggle(f.filename)}
         className="animate-fade-rise rounded-lg px-3.5 py-2.5"
-        style={{ animationDelay: `${Math.min(i * 30, 300)}ms`, cursor: 'pointer', background: pal.bg, border: `1px solid ${pal.bd}`, boxShadow: checked ? `0 0 0 2px ${pal.bd}` : undefined, opacity: pal.ver ? 0.6 : 1 }}>
+        style={{ animationDelay: `${Math.min(i * 30, 300)}ms`, cursor: 'pointer', background: pal.bg, border: `1px solid ${pal.bd}`, boxShadow: checked ? `0 0 0 2px ${pal.bd}` : undefined, opacity: pal.ver ? 0.78 : 1 }}>
         <div className="flex items-center gap-2 mb-1">
           <input type="checkbox" checked={checked} onChange={() => toggle(f.filename)} onClick={e => e.stopPropagation()} title="Pilih baris ini" />
           <span className="font-mono font-semibold truncate flex-1" title={f.filename}
@@ -1582,7 +1587,7 @@ const PageWe = ({ live, sendCommand, results, weSeen = [], wePrinted = [], weVer
             {f.customer}
           </div>
         ) : null}
-        <div className="flex items-center gap-2" style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>
+        <div className="flex items-center gap-2" style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>
           <span>Mesin: <span className="font-semibold" style={{ color: 'var(--color-text-secondary)' }}>{mach}</span></span>
           <span>•</span>
           <span>Operator: <span className="font-semibold" style={{ color: 'var(--color-text-secondary)' }}>{opr}</span></span>
@@ -1646,7 +1651,7 @@ const PageWe = ({ live, sendCommand, results, weSeen = [], wePrinted = [], weVer
           <span className="section-label">SEEN</span>
           <span className="rounded-full px-1.5 font-bold" style={{ background: 'var(--color-border)', fontSize: 10 }}>{q ? `${rows.length}/${weSeen.length}` : pendingCount}</span>
         </div>
-        <div style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>Menunggu cetak — terbaru dulu (waktu masuk) • {wePrinted.length} printed dari {weSeen.length} terlihat{weUpdatedAt ? ` • data ${new Date(weUpdatedAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : ''}</div>
+        <div style={{ fontSize: 10, color: 'var(--color-text-muted)', lineHeight: 1.5 }}>Menunggu cetak — terbaru dulu (waktu masuk) • {wePrinted.length} printed dari {weSeen.length} terlihat{weUpdatedAt ? ` • data ${new Date(weUpdatedAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : ''}</div>
         <div className="relative">
           <Icon name="search" size={13} style={{ color: 'var(--color-text-muted)', position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)' } as any} />
           <input className="input" placeholder="Cari file / nota / pelanggan…" value={q} onChange={e => setQ(e.target.value)} style={{ paddingLeft: 28, fontSize: 'var(--text-xs)' }} />
@@ -3190,7 +3195,7 @@ export default function App() {
             </div>
             <div className="font-mono overflow-hidden text-ellipsis whitespace-nowrap"
               style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>
-              {hubUrl}
+              {hubUrl.split('?')[0]}
             </div>
           </div>
         )}
@@ -3252,6 +3257,7 @@ export default function App() {
               </span>
             </div>
             <LiveClock />
+            <div className="hidden md:block shrink-0" style={{ width: 1, height: 26, background: 'var(--color-border)' }} />
             <div className="flex items-center gap-2">
               <span className="hidden md:inline font-semibold" style={{fontSize:'var(--text-sm)', color:'var(--color-text)'}}>{getAuthUser()||'user'}</span>
               <span className="hidden md:inline rounded-full px-1.5 py-0.5 font-bold uppercase" style={{fontSize:10, background:getAuthRole()==='admin'?'var(--color-violet-ghost)':'var(--color-muted-ghost)', color:getAuthRole()==='admin'?'var(--color-violet-fg)':'var(--color-muted-fg)'}}>{getAuthRole()||'user'}</span>

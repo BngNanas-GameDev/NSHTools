@@ -1070,7 +1070,9 @@ def _we_snapshot():
     """Snapshot WE utk WS init + we_update + GET /api/we/state (cap 500).
 
     seen_count = pending (belum printed); seen_total_count = riwayat.
-    List seen/printed dikirim penuh (UI butuh semua baris utk pill + tombol)."""
+    List seen/printed dikirim penuh (UI butuh semua baris utk pill + tombol).
+    List verified TIDAK dicap: UI mencocokkan skey per-baris, cap bikin baris
+    terverifikasi di bawah cap tidak berubah hijau (tetap oranye)."""
     try:
         seen = we_cache.get("seen") or []
         printed = we_cache.get("printed") or []
@@ -1083,7 +1085,7 @@ def _we_snapshot():
                 "verified_count": len(ver),
                 "seen": list(seen)[:WE_LIST_CAP],
                 "printed": list(printed)[:WE_LIST_CAP],
-                "verified": list(ver)[:WE_LIST_CAP]}
+                "verified": list(ver)}
     except Exception:
         return {"date": "", "monitoring": "", "mode": "wait", "override": False,
                 "seen_count": 0, "printed_count": 0, "verified_count": 0,
@@ -2209,7 +2211,7 @@ def _we_http_state(date_str):
             "seen_total_count": len(seen), "printed_count": len(printed),
             "verified_count": len(ver),
             "seen": seen[:WE_LIST_CAP], "printed": printed[:WE_LIST_CAP],
-            "verified": ver[:WE_LIST_CAP]}
+            "verified": ver}
 
 
 def _we_query_files(state, date="", limit=20, offset=0, search=""):
