@@ -434,15 +434,16 @@ FOLDER_FILES = {
 }
 FOLDER_KEYS = {
     "lite": ["input_folder", "output_folder", "uda_folder"],
-    "kma": ["input_folder", "return_folder", "uda_folder", "ricoh_folder"],
+    "kma": ["input_folder", "return_folder", "uda_folder", "ricoh_folder",
+            "dev1_folder", "dev2_folder"],
 }
 # Kunci on/off (bukan path) khusus lite: "1" = ON, "0" = OFF. Default ON
 # bila kunci belum ada (perilaku lama = otomatis jalan).
-LITE_FLAGS = ["auto_impose", "copy_kisscut"]
+LITE_FLAGS = ["auto_impose", "copy_kisscut", "dual_develop"]
 # boleh kosong (= fitur mati; watcher RICOH off bila kosong)
 FOLDER_OPTIONAL = {
     "lite": [],
-    "kma": ["ricoh_folder"],
+    "kma": ["ricoh_folder", "dev1_folder", "dev2_folder"],
 }
 FOLDER_ACTIONS = ("get_folders", "set_folders")
 OUTPUT_ACTIONS = ("list_output", "move_output")
@@ -450,6 +451,22 @@ OUTPUT_ACTIONS = ("list_output", "move_output")
 
 def _folders_path(module):
     return BASE_DIR / FOLDER_FILES[module]
+
+
+def _write_folders_file(module, data):
+    """Tulis config modul (file + DB bila bisa). Return True/False."""
+    try:
+        p = _folders_path(module)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        return False
+    try:
+        sys.path.insert(0, str(BASE_DIR / "Database"))
+        import db as nshdb
+        nshdb.config_set(module, data)
+    except Exception:
+        pass
+    return True
 
 
 def _norm_flag(v):
@@ -475,7 +492,12 @@ def _read_folders_file(module):
     out = {k: str(data.get(k, "")) for k in FOLDER_KEYS[module]}
     if module == "lite":
         for k in LITE_FLAGS:
-            out[k] = _norm_flag(data.get(k, "1"))
+            # default ON utk flag lama; dual_develop default OFF (fitur opt-in)
+            dflt = "0" if k == "dual_develop" else "1"
+            out[k] = _norm_flag(data.get(k, dflt))
+    elif module == "kma":
+        # dual_develop dicerminkan ke config kma agar halaman KMA tahu mode
+        out["dual_develop"] = _norm_flag(data.get("dual_develop", "0"))
     return out
 
 
@@ -537,6 +559,32 @@ def handle_folders_command(action, module, folders=None):
     except Exception:
         pass
     add_log("HUB", f"folders {module} disimpan — restart modul agar berlaku")
+    # Mode Dual DEVELOP: nyalakan -> pastikan folder INPUT1/INPUT2 (kma) ada.
+    # Matikan -> biarkan folder tetap (tidak menghapus data), hanya flag yang off.
+    try:
+        if module == "lite" and "dual_develop" in flag_vals:
+            _dual = (flag_vals.get("dual_develop") == "1")
+            kcfg = _read_folders_file("kma")
+            ind = (kcfg.get("input_folder") or "").strip()
+            base = os.path.dirname(ind) if ind else ""
+            d1 = (kcfg.get("dev1_folder") or (os.path.join(base, "DEVELOP1") if base else "")).strip()
+            d2 = (kcfg.get("dev2_folder") or (os.path.join(base, "DEVELOP2") if base else "")).strip()
+            kcfg["dual_develop"] = "1" if _dual else "0"
+            if _dual and d1 and d2:
+                for _d in (d1, d2):
+                    try:
+                        os.makedirs(_d, exist_ok=True)
+                    except Exception:
+                        pass
+                kcfg["dev1_folder"] = d1
+                kcfg["dev2_folder"] = d2
+                _write_folders_file("kma", kcfg)
+                add_log("HUB", f"DUAL DEVELOP ON — INPUT1={d1} | INPUT2={d2}")
+            else:
+                _write_folders_file("kma", kcfg)
+                add_log("HUB", "DUAL DEVELOP OFF — mode normal (auto-detect printer)")
+    except Exception:
+        pass
     # WE Phase 2: set_folders manual (lite/kma) = override ON (auto-path hanya log)
     try:
         _we_set_override(True, reason=f"set_folders {module} manual")
@@ -552,6 +600,11 @@ def _resolve_machine(dest):
     """Mesin untuk catatan move: DEVELOP 1/2 ikut printer aktif, RICOH tetap."""
     if dest == "ricoh":
         return "Ricoh"
+    # mode Dual: tujuan eksplisit dev1/dev2 -> mesin terkunci
+    if dest == "dev1":
+        return "Develop 1"
+    if dest == "dev2":
+        return "Develop 2"
     for p in kma_cache.get("printers", []) or []:
         if p.get("active"):
             ip = p.get("ip", "")
@@ -2297,7 +2350,9 @@ def handle_output_command(action, msg):
                 return False, "pilih operator dulu (Nanas/Eric/Rahmadi)", []
             kma_cfg = _read_folders_file("kma")
             destmap = {"develop": kma_cfg.get("input_folder", ""),
-                       "ricoh": kma_cfg.get("ricoh_folder", "")}
+                       "ricoh": kma_cfg.get("ricoh_folder", ""),
+                       "dev1": kma_cfg.get("dev1_folder", ""),
+                       "dev2": kma_cfg.get("dev2_folder", "")}
             raw_dst = (destmap.get(dest, "") or "").strip()
             if not raw_dst:
                 return False, f"tujuan {dest or '?'} belum dikonfigurasi", []

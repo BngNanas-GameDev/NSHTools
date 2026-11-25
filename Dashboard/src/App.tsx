@@ -157,6 +157,7 @@ const PATHS: Record<string, string> = {
   user:          'M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
   clock:         'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2',
   power:         'M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10',
+  bolt:          'M13 2L3 14h9l-1 8 10-12h-9l1-8z',
   database:      'M3 12a9 4 0 0 0 9 4 9 4 0 0 0 9-4M3 12v6a9 4 0 0 0 9 4 9 4 0 0 0 9-4v-6M3 8a9 4 0 0 1 9-4 9 4 0 0 1 9 4 9 4 0 0 1-9 4 9 4 0 0 1-9-4z',
   table:         'M3 3h18v18H3zM3 9h18M3 15h18M9 3v18M15 3v18',
 }
@@ -585,7 +586,7 @@ function fmtSize(n?: number): string {
 
 // Watcher file OUTPUT lite: pilih batch -> kirim ke DEVELOP / RICOH (via hub).
 // Dipakai sebagai blok Hasil Impose tab NSH Lite.
-function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil Impose', subtitle, onPreview }: {
+function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil Impose', subtitle, onPreview, dual = false }: {
   connected: boolean
   sendCommand: (action: string, opts?: SendCommandOpts) => string | null
   results: CommandResult[]
@@ -593,6 +594,7 @@ function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil 
   title?: string
   subtitle?: string
   onPreview?: (file: OutputFile) => void
+  dual?: boolean
 }) {
   const [sel, setSel] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(false)
@@ -639,7 +641,7 @@ function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil 
     try { localStorage.setItem('nsh-operator', op) } catch { /* abaikan */ }
   }
 
-  const doMove = (dest: 'develop' | 'ricoh') => {
+  const doMove = (dest: 'develop' | 'ricoh' | 'dev1' | 'dev2') => {
     if (sel.size === 0) { pushToast('Pilih file dulu', 'warning'); return }
     if (!operator) { pushToast('Pilih operator dulu (Nanas/Eric/Rahmadi)', 'warning'); return }
     if (!connected) { pushToast('Hub offline — perintah tidak dikirim', 'warning'); return }
@@ -740,6 +742,18 @@ function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil 
             <button className="btn btn-secondary btn-sm" onClick={() => doMove('ricoh')}>
               <Icon name="send" size={13} /> RICOH
             </button>
+            {dual && (
+              <>
+                <button className="btn btn-secondary btn-sm" title="Kirim ke Develop 1 (192.168.10.157)"
+                  onClick={() => doMove('dev1')}>
+                  <Icon name="send" size={13} /> DEV 1
+                </button>
+                <button className="btn btn-secondary btn-sm" title="Kirim ke Develop 2 (192.168.10.158)"
+                  onClick={() => doMove('dev2')}>
+                  <Icon name="send" size={13} /> DEV 2
+                </button>
+              </>
+            )}
             <button className="btn btn-secondary btn-sm" onClick={openView}>
               <Icon name="eye" size={13} /> VIEW
             </button>
@@ -752,7 +766,9 @@ function OutputWatcher({ connected, sendCommand, results, files, title = 'Hasil 
         // Petunjuk ramping saat belum ada pilihan agar layout tidak lompat
         <div style={{ fontSize: 10, color: 'var(--color-text-dim)', padding: '2px 0' }}>Pilih file untuk memindah batch…</div>
       )}
-      <div style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>ke folder DEVELOP / RICOH (setelan KMA) • tercatat + Selesai di .54</div>
+      <div style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>
+        ke folder {dual ? 'DEVELOP / RICOH / DEVELOP 1 / DEVELOP 2' : 'DEVELOP / RICOH'} (setelan KMA) • tercatat + Selesai di .54
+      </div>
       </div>
       {viewOpen && viewNames.length > 0 && (
         <ViewModal names={viewNames} idx={Math.min(viewIdx, viewNames.length - 1)}
@@ -1010,7 +1026,8 @@ const PageNshLite = ({ connected, sendCommand, results, outputFiles }: {
 }) => {
   const folders = useModuleFolders('lite', connected, sendCommand, results)
   const [previewFile, setPreviewFile] = useState<OutputFile | null>(null)
-  const flagOn = (k: string) => (folders.values[k] ?? '1') !== '0'
+  const flagOn = (k: string) => (folders.values[k] ?? (k === 'dual_develop' ? '0' : '1')) !== '0'
+  const dualOn = (folders.values['dual_develop'] ?? '0') !== '0'
   const setFlag = (k: string, on: boolean) => {
     const next = { ...folders.values, [k]: on ? '1' : '0' }
     folders.setValues(next)
@@ -1057,6 +1074,26 @@ const PageNshLite = ({ connected, sendCommand, results, outputFiles }: {
           OFF = file dibiarkan di INPUT (tidak di-impose / tidak di-copy) • Lite restart otomatis ±30 dtk
         </div>
       </div>
+      {/* Mode Dual DEVELOP — tombol manual Develop 1 (.157) / Develop 2 (.158) */}
+      <div className="card px-5 py-4">
+        <SectionHeader label="Mode Dual DEVELOP" action={
+          <button className={`btn btn-sm ${dualOn ? 'btn-primary' : 'btn-secondary'}`}
+            onClick={() => setFlag('dual_develop', !dualOn)}
+            title="Aktifkan tombol Develop 1 / Develop 2 di Hasil Impose">
+            <Icon name="bolt" size={13} /> DUAL: {dualOn ? 'ON' : 'OFF'}
+          </button>
+        } />
+        <div className="flex items-center gap-2 flex-wrap" style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
+          <span className="chip" style={{ opacity: dualOn ? 1 : 0.45 }}>Develop 1 → 157</span>
+          <span className="chip" style={{ opacity: dualOn ? 1 : 0.45 }}>Develop 2 → 158</span>
+          <span style={{ color: 'var(--color-text-dim)', fontSize: 10 }}>
+            {dualOn ? 'Tombol Develop 1/2 aktif di batch Hasil Impose' : 'Mode normal — routing otomatis (auto-detect printer)'}
+          </span>
+        </div>
+        <div style={{ fontSize: 10, color: 'var(--color-text-dim)', marginTop: 6 }}>
+          DUAL = saat RICOH mati & dua DEVELOP nyala — pindahkan hasil impose langsung ke mesin pilihan.
+        </div>
+      </div>
       {/* Path folder (read-only, otomatis WE) */}
       <PathView
         fields={[
@@ -1068,7 +1105,7 @@ const PageNshLite = ({ connected, sendCommand, results, outputFiles }: {
       />
       <div className="grid gap-4" style={{ gridTemplateColumns: '1fr 360px' }}>
         <OutputWatcher connected={connected} sendCommand={sendCommand} results={results} files={outputFiles}
-          title="Hasil Impose" subtitle="File di OUTPUT siap kirim ke DEVELOP / RICOH" onPreview={setPreviewFile} />
+          title="Hasil Impose" subtitle="File di OUTPUT siap kirim ke DEVELOP / RICOH" onPreview={setPreviewFile} dual={dualOn} />
         <PreviewPanel file={previewFile} />
       </div>
     </div>
@@ -1181,17 +1218,24 @@ const PageKma = ({ connected, routes, printers, rules, stats, sendCommand, resul
   )
 
   const files = [...routes].reverse().map((r, i) => ({ ...r, ...kmaStatus(r.status), key: `${r.file}||${r.ts}||${i}` }))
+  // Mode Dual: path INPUT1/INPUT2 (dev1/dev2) — dari config kma
+  const dualOn = (folders.values['dual_develop'] ?? '0') !== '0'
+  const dev1Path = folders.values['dev1_folder'] || ''
+  const dev2Path = folders.values['dev2_folder'] || ''
 
   return (
     <div className="flex flex-col gap-4">
       <PathView
         fields={[
-          { key: 'input_folder', label: 'INPUT' },
+          dualOn
+            ? { key: 'dev1_folder', label: 'INPUT1' }
+            : { key: 'input_folder', label: 'INPUT' },
+          ...(dualOn ? [{ key: 'dev2_folder', label: 'INPUT2' }] : []),
           { key: 'return_folder', label: 'RETURN' },
           { key: 'uda_folder', label: 'UDA' },
           { key: 'ricoh_folder', label: 'RICOH' },
         ]}
-        values={folders.values}
+        values={dualOn && !dev1Path ? { ...folders.values, dev1_folder: '(belum diset)' } : (dualOn && !dev2Path ? { ...folders.values, dev2_folder: '(belum diset)' } : folders.values)}
       />
       {/* Status printer — di atas Daftar File, 3 blok bersebelahan */}
       <div className="card p-5">

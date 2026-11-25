@@ -109,6 +109,18 @@ def _machine():
     return cur or "?"
 
 
+def _machine_for(ip=None):
+    """Label mesin untuk IP tertentu (mode Dual). None -> _machine() lama."""
+    if not ip:
+        return _machine()
+    s = str(ip).strip("\\")
+    if s == PRINTERS[0]:
+        return "DEVELOP 1"
+    if s == PRINTERS[1]:
+        return "DEVELOP 2"
+    return s or "?"
+
+
 def _ev(fname, category, dest, status, msg="", machine=None):
     """Catat event routing (dedupe per file+status+dest) → memori + DB harian.
     DB-first: tetap dicatat walau tanpa --hub, agar restart tak nol.
@@ -178,10 +190,19 @@ def push_kma():
     printers = []
     for i, ip in enumerate(PRINTERS):
         st = _PRINTER_STATE.get(ip)
+        # active: mode normal = HOT_SERVER; mode dual = kedua printer aktif
+        # (folder INPUT1/INPUT2 masing-masing terkunci ke .157/.158)
+        act = (HOT_SERVER.strip("\\") == ip)
+        if not act:
+            try:
+                act = any(PINNED.get(os.path.realpath(str(d))) == ip
+                          for d in (PINNED_INPUT_DIRS or []))
+            except Exception:
+                act = False
         printers.append({"ip": ip, "role": "",
                          "machine": "DEVELOP 1" if i == 0 else "DEVELOP 2",
                          "status": "siap" if st else ("mati" if st is False else "?"),
-                         "active": HOT_SERVER.strip("\\") == ip})
+                         "active": bool(act)})
     # RICOH watcher: reader lokal — selalu ON selama router jalan
     # (mati hanya bila foldernya dikonfigurasi tapi hilang)
     _ricoh = (_FOLDERS.get("ricoh") or "").strip()
@@ -344,11 +365,55 @@ FOLDER_ALIASES_158 = {
 }
 
 
-def _folder(name):
-    """Nama folder aktual di server aktif (alias khusus .158)."""
-    if HOT_SERVER.endswith(".158"):
+def _folder(name, ip=None):
+    """Nama folder aktual di server aktif (alias khusus .158).
+
+    ip=None -> pakai HOT_SERVER (perilaku lama, tak berubah).
+    ip diberikan -> alias menurut IP tsb (dipakai mode Dual DEVELOP)."""
+    srv = (ip if ip else HOT_SERVER).strip("\\")
+    if srv.endswith(".158"):
         return FOLDER_ALIASES_158.get(name, name)
     return name
+
+
+# ── Mode Dual DEVELOP (opsional; default MATI = perilaku lama tak berubah) ──
+# Folder input khusus: file di sini DIPAKSA ke satu printer (tidak auto-detect).
+#   DEVELOP1 -> 192.168.10.157   DEVELOP2 -> 192.168.10.158
+PINNED = {}  # realpath(folder) -> ip  (diisi dari config saat start)
+PINNED_INPUT_DIRS = []  # daftar Path folder INPUT1/INPUT2 (diisi saat start)
+
+
+def _pinned_dirs():
+    """(dev1_dir|None, dev2_dir|None) dari config. None bila belum diset."""
+    try:
+        cfg = load_cfg()
+    except Exception:
+        cfg = {}
+    out = []
+    for key in ("dev1_folder", "dev2_folder"):
+        v = (cfg.get(key) or "").strip() if isinstance(cfg, dict) else ""
+        out.append(Path(v) if v else None)
+    return out[0], out[1]
+
+
+def _pin_for(src: Path):
+    """IP terkunci bila file berasal dari folder DEVELOP1/2, else None.
+
+    PINNED memetakan realpath FOLDER -> ip, jadi pencarian pakai FOLDER INDUK
+    file (bukan realpath file itu sendiri — itu bug yang bikin file DEVELOP2
+    rontok ke .157)."""
+    try:
+        rp = os.path.realpath(str(src))
+    except Exception:
+        return None
+    ip = PINNED.get(rp)
+    if ip:
+        return ip
+    try:
+        parent = os.path.realpath(os.path.dirname(rp))
+    except Exception:
+        return None
+    return PINNED.get(parent)
 
 
 def check_server():
@@ -575,8 +640,15 @@ def _log_quiet(key, color, tag, msg, detail=""):
     return True
 
 
-def route_one(fn: Path, indir: Path, retdir: Path, udadir: Path):
+def route_one(fn: Path, indir: Path, retdir: Path, udadir: Path, pin_ip=None):
+    """Route satu file.
+
+    pin_ip=None -> perilaku lama (auto-detect HOT_SERVER, fallback .157/.158).
+    pin_ip="192.168.10.157"/".158" -> mode Dual DEVELOP: paksa printer tsb,
+    tanpa auto-detect & tanpa fallback."""
     name = fn.name
+    if pin_ip is None:
+        pin_ip = _pin_for(fn)   # folder DEVELOP1/2 -> terkunci otomatis
     preset = llm_teacher_preset(name) or {}
     bahan = resolve_bahan(name, preset.get("bahan") or guess_bahan(name) or "")
     if not bahan and "master" in name.lower():
@@ -591,19 +663,21 @@ def route_one(fn: Path, indir: Path, retdir: Path, udadir: Path):
     is_booklet = str(preset.get("repeat", "")).startswith("booklet")
     duplex = preset.get("duplex", "1s")
     side = "2S" if (is_booklet or duplex in ("2s", "dr")) else "1S"
-    folder = _folder(pair[1] if side == "2S" else pair[0])
+    folder = _folder(pair[1] if side == "2S" else pair[0], pin_ip)
     if not folder:
         dst = _safe_move(fn, retdir)
         _log(Y, "[KMA-E07]", _short(f"{name} -> RETURN"), f"{bahan} tidak ada folder {side}")
         if _ev(name, bahan, "RETURN", "return", f"{bahan} tidak ada folder {side}"):
             _bump("ret")
         return False
+    # Server tujuan: pin (dual) atau HOT_SERVER (normal, tak berubah)
+    srv = (f"\\\\{pin_ip}" if pin_ip else HOT_SERVER)
     try:
         # 1. Pastikan file ADA di hot folder (nama asli):
         #    - habis dimakan mesin -> COPY ulang (cetak ulang jalan)
         #    - copy-an sesi ini masih ada -> TIMPA versi terbaru (koreksi jalan)
         #    - milik sesi lain/job lain -> WAIT (jangan timpa job orang)
-        dst = Path(HOT_SERVER) / folder / fn.name
+        dst = Path(srv) / folder / fn.name
         if name in _COPIED and _exists(dst):
             _overwrite(fn, dst)
         elif _exists(dst):
@@ -611,7 +685,7 @@ def route_one(fn: Path, indir: Path, retdir: Path, udadir: Path):
             _ev(name, bahan, folder, "wait", "nama sama di hot folder")
             return False
         else:
-            _copy_exact(fn, Path(HOT_SERVER) / folder)
+            _copy_exact(fn, Path(srv) / folder)
             _COPIED.add(name)
     except FileExistsError:
         _log(Y, "[ WAIT ]", _short(name), f"{folder} masih ada nama sama, coba lagi")
@@ -644,7 +718,7 @@ def route_one(fn: Path, indir: Path, retdir: Path, udadir: Path):
             _ev(name, bahan, folder, "error", f"arsip gagal: {str(e)[:60]}")
         return False
     _log(G, "[ OK ]", _short(f"{name} -> {folder} (asli->Uda)"), ringkas(name))
-    if _ev(name, bahan, folder, "ok", "asli->Uda"):
+    if _ev(name, bahan, folder, "ok", "asli->Uda", machine=_machine_for(pin_ip)):
         _bump("ok")
     return True
 
@@ -673,6 +747,40 @@ def scan_once(indir: Path, retdir: Path, udadir: Path):
             pass
         except Exception as e:
             _log(R, "[ ERR ]", _short(fn.name), str(e)[:80])
+    # ── Mode Dual DEVELOP: scan folder INPUT1/INPUT2 (terkunci ke .157/.158) ──
+    # Additive: hanya jalan bila folder dev1/dev2 dikonfigurasi. Mode normal
+    # (tanpa folder ini) TIDAK tersentuh sama sekali.
+    for d in (PINNED_INPUT_DIRS or []):
+        try:
+            if not d or not d.exists():
+                continue
+        except OSError:
+            continue
+        # IP diambil langsung dari folder (bukan via _pin_for(file)) — lebih pasti
+        try:
+            _ip = PINNED.get(os.path.realpath(str(d)))
+        except Exception:
+            _ip = None
+        if not _ip:
+            _ip = _pin_for(d)
+        if not _ip:
+            continue  # folder ini tak terkunci (harusnya tak terjadi)
+        for fn in _list_pdfs(d):
+            if not _exists(fn):
+                continue
+            if _time.time() - _COOLDOWN.get(fn.name, 0) < COOLDOWN_S:
+                continue
+            try:
+                route_one(fn, d, retdir, udadir, pin_ip=_ip)
+            except PermissionError:
+                last = _COOLDOWN.get(fn.name, 0)
+                _COOLDOWN[fn.name] = _time.time()
+                if _time.time() - last >= COOLDOWN_S:
+                    _log(Y, "[ LOCK ]", _short(fn.name), "terkunci, coba lagi")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                _log(R, "[ ERR ]", _short(fn.name), str(e)[:80])
 
 
 def sweep_done(udadir: Path):
@@ -797,6 +905,28 @@ def watch_loop():
         except OSError as e:
             _log(R, f"[{code}]", str(d), f"folder tak bisa dibuat/ditulis: {e}")
             return
+    # ── Mode Dual DEVELOP: siapkan folder INPUT1/INPUT2 (bila dikonfigurasi) ──
+    global PINNED, PINNED_INPUT_DIRS
+    PINNED = {}
+    PINNED_INPUT_DIRS = []
+    try:
+        _d1, _d2 = _pinned_dirs()
+        for _d, _ip in ((_d1, PRINTERS[0]), (_d2, PRINTERS[1])):
+            if not _d:
+                continue
+            try:
+                _d.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                _log(Y, "[ DUAL ]", str(_d), f"folder tak bisa dibuat: {e}")
+                continue
+            try:
+                PINNED[os.path.realpath(str(_d))] = _ip
+                PINNED_INPUT_DIRS.append(_d)
+                _FOLDERS["dev1" if _ip == PRINTERS[0] else "dev2"] = str(_d)
+            except Exception:
+                pass
+    except Exception:
+        pass
     if not check_server():
         return
     print(f"  Router aktif")
@@ -805,10 +935,18 @@ def watch_loop():
     print(f"    Uda    : {C}{udadir}{RST}")
     print(f"    Server : {C}{HOT_SERVER}{RST}")
     print(f"    RICOH  : {C}{ricohdir if ricohdir else '(watcher mati)'}{RST}")
+    for _d in PINNED_INPUT_DIRS:
+        _ip = PINNED.get(os.path.realpath(str(_d)), "?")
+        print(f"    {_machine_for(_ip):9s}: {C}{_d}{RST}  {D}(terkunci {_ip}){RST}")
     print(f"  Legenda: {G}[ OK ] hot folder{RST}  {Y}[ RET ] RETURN[KMA-E06/E07]{RST}  {C}[ DONE ] Done->Uda{RST}  {R}[KMA-E01/E02/E03/E04/E05/E08/E09]{RST}  {D}| Ctrl+C stop{RST}")
     print(f"  Pemicu: aksi file di INPUT (event, bukan polling) + cek printer")
     print(f"  ------------------------------------------------------")
     threading.Thread(target=_dir_watcher, args=(indir,), daemon=True).start()
+    for _d in PINNED_INPUT_DIRS:
+        try:
+            threading.Thread(target=_dir_watcher, args=(_d,), daemon=True).start()
+        except Exception:
+            pass
     if ricohdir:
         _ricoh_seen_init()
         threading.Thread(target=_dir_watcher, args=(ricohdir, _RICOH_WAKE), daemon=True).start()
